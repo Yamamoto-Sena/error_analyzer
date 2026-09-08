@@ -1,8 +1,12 @@
 @import "tailwindcss";
 
+/* .dark クラスの有無で明示的にライト/ダークを切り替える（OS設定に依存させない） */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @layer base {
   body {
-    @apply bg-slate-950 text-slate-100 antialiased selection:bg-cyan-500 selection:text-white;
+    @apply bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 antialiased selection:bg-cyan-500 selection:text-white;
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    transition: background-color 0.2s ease, color 0.2s ease;
   }
 }

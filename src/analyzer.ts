@@ -9,6 +9,71 @@ export interface AnalysisResult {
   learningTitle: string;
   learningContent: string;
   preventionTips: string[];
+  /** 実際にこの解析結果を生成したエンジン/モデル名（例: "gemini-3.8-flash-002" や "ローカル解析エンジン"） */
+  modelUsed?: string;
+  /** ユーザーが本来選択・指定していたモデル名（Gemini解析時のみ） */
+  modelRequested?: string;
+  /** 混雑やRPD(1日の上限)超過等により、指定モデルではなく別モデルに自動フォールバックしたか */
+  usedFallbackModel?: boolean;
+  /** フォールバック時にクォータ超過(RPD等)で使用できなかったモデル名の一覧 */
+  quotaExceededModels?: string[];
+  /** 修正箇所に関連する公式ドキュメントへのリンク（判別できた場合のみ） */
+  officialDocLink?: OfficialDocLink;
+}
+
+export interface OfficialDocLink {
+  label: string;
+  url: string;
+}
+
+// エラー種別・ログ内容から関連する公式ドキュメントを推定する
+export function getOfficialDocLink(errorType: string, contextText: string = ""): OfficialDocLink | null {
+  const haystack = `${errorType}\n${contextText}`;
+
+  if (/EADDRINUSE|Port\s+\d+\s+is already in use/i.test(haystack)) {
+    return {
+      label: "Node.js 公式: エラーコード一覧（EADDRINUSE ほか）",
+      url: "https://nodejs.org/api/errors.html#common-system-errors",
+    };
+  }
+  if (/ModuleNotFoundError|Cannot find module|MODULE_NOT_FOUND|failed to resolve import/i.test(haystack)) {
+    return {
+      label: "Node.js 公式: モジュール解決の仕組み",
+      url: "https://nodejs.org/api/modules.html#all-together",
+    };
+  }
+  if (/AttributeError/i.test(haystack)) {
+    return {
+      label: "Python 公式ドキュメント: 組み込み例外 AttributeError",
+      url: "https://docs.python.org/ja/3/library/exceptions.html#AttributeError",
+    };
+  }
+  if (/cannot read propert|TypeError/i.test(haystack)) {
+    return {
+      label: "MDN Web Docs: TypeError リファレンス",
+      url: "https://developer.mozilla.org/ja/docs/Web/JavaScript/Reference/Global_Objects/TypeError",
+    };
+  }
+  if (/SyntaxError|Unexpected token/i.test(haystack)) {
+    return {
+      label: "MDN Web Docs: SyntaxError リファレンス",
+      url: "https://developer.mozilla.org/ja/docs/Web/JavaScript/Reference/Global_Objects/SyntaxError",
+    };
+  }
+  if (/ReferenceError|is not defined/i.test(haystack)) {
+    return {
+      label: "MDN Web Docs: ReferenceError リファレンス",
+      url: "https://developer.mozilla.org/ja/docs/Web/JavaScript/Reference/Global_Objects/ReferenceError",
+    };
+  }
+  if (/CORS|Failed to fetch|NetworkError|ECONNREFUSED/i.test(haystack)) {
+    return {
+      label: "MDN Web Docs: オリジン間リソース共有（CORS）ガイド",
+      url: "https://developer.mozilla.org/ja/docs/Web/HTTP/CORS",
+    };
+  }
+
+  return null;
 }
 
 // ログからファイルパスと行番号を抽出する正規表現ヘルパー
@@ -51,8 +116,8 @@ function extractLocation(log: string): { file: string; line: string } {
   return { file: "設定・起動プロセス (vite.config.ts / src-tauri)", line: "1" };
 }
 
-// 入力されたエラーログを動的に解析するエンジン
-export function analyzeErrorLog(rawLog: string): AnalysisResult {
+// 入力されたエラーログを動的に解析するエンジン（内部実装）
+function analyzeErrorLogCore(rawLog: string): AnalysisResult {
   const log = rawLog.trim();
   const location = extractLocation(log);
 
@@ -281,4 +346,11 @@ npm install ${pkgName}
       "入力値の型とバリデーションを強化する"
     ],
   };
+}
+
+// 公開API: ルールベース解析を実行し、関連する公式ドキュメントへのリンクを付与して返す
+export function analyzeErrorLog(rawLog: string): AnalysisResult {
+  const result = analyzeErrorLogCore(rawLog);
+  result.officialDocLink = getOfficialDocLink(result.errorType, rawLog) ?? undefined;
+  return result;
 }

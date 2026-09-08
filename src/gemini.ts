@@ -1,16 +1,33 @@
-import { AnalysisResult } from "./analyzer";
+import { AnalysisResult, getOfficialDocLink } from "./analyzer";
+
+// エラー画面のスクリーンショット等、Geminiに渡す画像データ（base64・MIMEタイプ）
+export interface GeminiImagePart {
+  mimeType: string;
+  data: string; // base64エンコード済み（"data:image/...;base64,"のプレフィックスは含まない）
+}
 
 // Gemini API を呼び出す関数
 export async function analyzeWithGemini(
   log: string,
   apiKey: string,
-  modelName: string = "gemini-flash-latest"
+  modelName: string = "gemini-3.5-flash-lite",
+  images: GeminiImagePart[] = []
 ): Promise<AnalysisResult> {
+  const hasImages = images.length > 0;
   const prompt = `あなたは新人エンジニアを指導する親切で極めて優秀なシニアテックリードです。
-以下のエラーログを深く読み解き、新人エンジニアが根本から理解・再発防止できるように、必ず指定されたJSONフォーマットのみで回答してください。Markdownのバッククォート（\`\`\`json）も含めず、純粋なJSONオブジェクトのみを出力してください。
+以下の情報（エラーログ・スタックトレース、および/またはユーザーが自分の言葉で書いた症状・状況の説明）を深く読み解き、新人エンジニアが根本から理解・再発防止できるように、必ず指定されたJSONフォーマットのみで回答してください。Markdownのバッククォート（\`\`\`json）も含めず、純粋なJSONオブジェクトのみを出力してください。
+明確な例外メッセージやスタックトレースがなく、ユーザーによる自然文の症状説明のみが与えられた場合でも、記述内容から最も可能性の高い原因・エラー種別を推測し、断定を避けつつも具体的な仮説として提示してください。
 
-【エラーログ】
-${log}
+【入力内容】
+${log.trim() ? log : "(構造化されたログはありません。添付された画像や自然文の説明のみを参照して解析してください)"}
+${
+  hasImages
+    ? `
+【添付画像について】
+このリクエストにはエラー画面やターミナルのスクリーンショット画像が添付されています。画像内に写っているエラーメッセージ・スタックトレースの文字を正確に読み取り、上記の内容と同様のルールで解析してください。テキストと画像の内容が両方存在する場合は、両者を統合して矛盾なく判断してください。
+`
+    : ""
+}
 
 【極めて重要な解析ルール】
 1. 発生箇所（filePath / lineNumber）の正確な特定:
@@ -44,34 +61,75 @@ ${log}
   ]
 }`;
 
-  // Google AI Studio の公式有効モデル候補（指定モデルを最優先、次に代表的モデルで自動試行）
+  // Google AI Studio の公式有効モデル候補（指定モデルを最優先、次に現行の代表的モデルで自動試行）
+  // 注: gemini-1.5-flash/pro, gemini-2.0-flash は廃止済みのため候補から除外
   const candidateModels = Array.from(
-    new Set([modelName, "gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"])
+    new Set([modelName, "gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"])
   );
 
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  // 503(UNAVAILABLE) や 429のうち「一時的な混雑・レート制限」は、
+  // 別モデルに切り替える前に同一モデルへ軽くリトライする
+  const RETRY_DELAYS_MS = [1000, 2000];
+
+  // RPD(1日あたりの上限)などのクォータ超過でスキップしたモデルを記録（診断用）
+  const quotaExceededModels: string[] = [];
   let lastError: Error | null = null;
 
   for (const model of candidateModels) {
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [{ text: prompt }],
-            },
-          ],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.2,
+      let response: Response;
+      let errorBodyText: string | null = null;
+      let attempt = 0;
+
+      while (true) {
+        response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
           },
-        }),
-      });
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  { text: prompt },
+                  ...images.map((img) => ({
+                    inline_data: { mime_type: img.mimeType, data: img.data },
+                  })),
+                ],
+              },
+            ],
+            generationConfig: {
+              responseMimeType: "application/json",
+              temperature: 0.2,
+            },
+          }),
+        });
+
+        if (response.status === 429 || response.status === 503) {
+          errorBodyText = await response.text();
+          // "RESOURCE_EXHAUSTED" かつ 1日/月単位のクォータに言及している場合は
+          // 待っても無駄なRPD超過とみなし、即座に次の候補モデルへ切り替える
+          const isQuotaExceeded =
+            response.status === 429 && /RESOURCE_EXHAUSTED|quota/i.test(errorBodyText) && /per[\s_]?day|daily|PerDay/i.test(errorBodyText);
+
+          if (isQuotaExceeded) {
+            quotaExceededModels.push(model);
+            break;
+          }
+
+          // それ以外の429/503は一時的な混雑・レート制限とみなし軽くリトライ
+          if (attempt < RETRY_DELAYS_MS.length) {
+            await sleep(RETRY_DELAYS_MS[attempt]);
+            attempt++;
+            errorBodyText = null;
+            continue;
+          }
+        }
+        break;
+      }
 
       if (response.status === 404) {
         // モデルが見つからない場合は次の候補を試行
@@ -79,11 +137,13 @@ ${log}
       }
 
       if (!response.ok) {
-        const errorBody = await response.text();
+        const errorBody = errorBodyText ?? (await response.text());
         throw new Error(`Gemini API エラー (${response.status}): ${errorBody}`);
       }
 
       const data = await response.json();
+      // 実際に応答したモデルを確認するためのログ（リクエストしたモデル名 vs 実際に返ってきたバージョン）
+      console.log(`[Gemini] requested="${modelName}" tried="${model}" actualModelVersion="${data.modelVersion ?? "(不明)"}"`);
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
       if (!text) {
@@ -93,8 +153,9 @@ ${log}
       // JSON パース
       const cleanedText = text.trim().replace(/^```json\s*/i, "").replace(/\s*```$/i, "");
       const parsed = JSON.parse(cleanedText);
+      const errorType = parsed.errorType || "Exception";
       return {
-        errorType: parsed.errorType || "Exception",
+        errorType,
         summary: parsed.summary || "エラーが検出されました。",
         rootCause: parsed.rootCause || "詳細な原因を特定中。",
         filePath: parsed.filePath || "src/index.ts",
@@ -105,6 +166,14 @@ ${log}
         preventionTips: Array.isArray(parsed.preventionTips)
           ? parsed.preventionTips
           : ["入力値の検証を行う", "テストを実行する"],
+        // Googleが返す実際のモデルバージョン（取得できない場合は実際にリクエストしたモデル名で代用）
+        modelUsed: data.modelVersion || model,
+        // ユーザーが選択した本来のモデル名（modelUsedと食い違う＝自動フォールバックが発生した証拠）
+        modelRequested: modelName,
+        usedFallbackModel: model !== modelName,
+        quotaExceededModels: quotaExceededModels.length > 0 ? [...quotaExceededModels] : undefined,
+        // 修正箇所に関連する公式ドキュメント（判別できた場合のみ）
+        officialDocLink: getOfficialDocLink(errorType, log) ?? undefined,
       };
     } catch (err) {
       lastError = err as Error;
