@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debug-buddy"
+version = "0.1.0"
+description = "AI-Powered Debugging & Error Log Analysis Assistant for Engineers"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Debug Buddy Team" }
+]
+dependencies = [
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "pydantic>=2.7.0",
+    "python-dotenv>=1.0.0",
+    "google-genai>=0.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+]
+
+[project.scripts]
+debug-buddy = "debug_buddy.main:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
