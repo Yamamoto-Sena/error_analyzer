@@ -1,3 +1,7 @@
+// 修正案(diff)を実ファイルへ安全に適用するための純粋ロジック。
+// この段階ではまだTauriコマンドとして公開していない（`cargo test`で検証するためだけの宣言）。
+mod fix_apply;
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {
