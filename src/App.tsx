@@ -36,10 +36,43 @@ import {
   ListChecks,
   Circle,
   ClipboardList,
+  FolderOpen,
+  Save,
 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { analyzeErrorLog, AnalysisResult } from "./analyzer";
 import { analyzeWithGemini } from "./gemini";
+
+// 実ファイルへ安全適用できるかどうかの判定結果(Rust側 check_fix_applicability の戻り値)
+interface FixApplyCheck {
+  applicable: boolean;
+  reason: string | null;
+  resolvedPath: string | null;
+}
+
+// なぜ実ファイルへ自動適用できないのかを、人が読める一言に変換する
+// (reasonの値はsrc-tauri/src/fix_apply.rsのUnapplicableReason::as_strと対応させている)
+function describeUnapplicableReason(reason: string | null): string {
+  switch (reason) {
+    case "root-not-found":
+      return "選択したプロジェクトフォルダが見つかりません。";
+    case "path-escapes-root":
+      return "このファイルはプロジェクトフォルダの外にあるため、安全のため自動適用できません。";
+    case "file-not-found":
+      return "このファイルはプロジェクトフォルダ内に見つからないため、自動適用できません。";
+    case "not-a-file":
+      return "対象がファイルではないため、自動適用できません。";
+    case "diff-no-match":
+      return "修正案の内容が実際のファイルの中身と一致しないため、安全のため自動適用できません（手動での確認をおすすめします）。";
+    case "diff-ambiguous-match":
+      return "修正案が複数箇所に一致してしまい、どこを直すべきか一意に特定できないため自動適用できません。";
+    case "no-hunks":
+      return "この修正案は自動適用に対応していない形式のため、自動適用できません。";
+    default:
+      return "このファイルは自動適用の対象外です。";
+  }
+}
 
 // エラー種別ごとに一貫した色を割り当てるためのカラーパレット
 const HISTORY_COLOR_PALETTE = [
@@ -282,6 +315,20 @@ export default function App() {
   const [isApplied, setIsApplied] = useState<boolean>(false);
   const [toast, setToast] = useState<{ message: string; type: "success" | "info" | "warning" } | null>(null);
 
+  // 実ファイルへの安全適用（プロジェクトフォルダ選択・可否判定・確認モーダル・実適用/実ロールバック）
+  // ※あくまで追加機能。上のプレビュー用state(isApplying/isApplied)とは独立させており、
+  //   projectRootが未設定/対象外のケースでは、これまで通りプレビューのみの動作にフォールバックする。
+  const [projectRoot, setProjectRoot] = useState<string | null>(null);
+  const [isPickingRoot, setIsPickingRoot] = useState<boolean>(false);
+  const [applyCheck, setApplyCheck] = useState<FixApplyCheck | null>(null);
+  const [isCheckingApply, setIsCheckingApply] = useState<boolean>(false);
+  const [showRealApplyConfirm, setShowRealApplyConfirm] = useState<boolean>(false);
+  const [isRealApplying, setIsRealApplying] = useState<boolean>(false);
+  const [isRollingBackReal, setIsRollingBackReal] = useState<boolean>(false);
+  const [realApplyResult, setRealApplyResult] = useState<{ backupId: string; appliedPath: string } | null>(
+    null
+  );
+
   // 初期ロード時に localStorage から APIキー・履歴・モデル選択・テーマを復元
   useEffect(() => {
     const savedKey = localStorage.getItem("debug_buddy_gemini_key") || "";
@@ -300,6 +347,11 @@ export default function App() {
     const savedModel = localStorage.getItem("debug_buddy_gemini_model");
     if (savedModel) {
       setSelectedModel(savedModel);
+    }
+
+    const savedProjectRoot = localStorage.getItem("debug_buddy_project_root");
+    if (savedProjectRoot) {
+      setProjectRoot(savedProjectRoot);
     }
 
     const savedTheme = localStorage.getItem("debug_buddy_theme") as "light" | "dark" | null;
@@ -328,6 +380,40 @@ export default function App() {
       setCheckedItems([]);
     }
   }, [analysis]);
+
+  // プロジェクトフォルダが選択されていて、かつコード修正(fixType!=="task")の場合のみ、
+  // 「実ファイルへ安全に適用できるか」を裏で自動判定する（実際の書き込みは一切行わない読み取り専用の問い合わせ）。
+  // Tauriアプリの外（ブラウザ単体プレビュー等）では invoke が使えないため、失敗時は静かに
+  // 「未対応」として扱い、これまで通りのプレビューのみの表示にフォールバックする。
+  useEffect(() => {
+    let cancelled = false;
+    setRealApplyResult(null);
+    setApplyCheck(null);
+
+    if (!analysis || analysis.fixType === "task" || !projectRoot) {
+      return;
+    }
+
+    setIsCheckingApply(true);
+    invoke<FixApplyCheck>("check_fix_applicability", {
+      root: projectRoot,
+      filePath: analysis.filePath,
+      diffCode: analysis.diffCode,
+    })
+      .then((result) => {
+        if (!cancelled) setApplyCheck(result);
+      })
+      .catch(() => {
+        if (!cancelled) setApplyCheck(null);
+      })
+      .finally(() => {
+        if (!cancelled) setIsCheckingApply(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [analysis, projectRoot]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
 
@@ -583,6 +669,77 @@ export default function App() {
     }, 700);
   };
 
+  // プロジェクトフォルダをネイティブのダイアログで選ぶ（Tauriアプリ内でのみ動作）
+  const handlePickProjectRoot = async () => {
+    setIsPickingRoot(true);
+    try {
+      // ダイアログがウィンドウの裏に隠れる等でOSからの応答が返ってこない場合でも、
+      // ボタンが「選択中...」のまま永久に固まって再操作不能にならないよう、
+      // 一定時間で必ず諦めて操作可能な状態に戻す（保険）。
+      const picked = await Promise.race([
+        invoke<string | null>("pick_project_root"),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("PICK_PROJECT_ROOT_TIMEOUT")), 120_000)
+        ),
+      ]);
+      if (picked) {
+        setProjectRoot(picked);
+        localStorage.setItem("debug_buddy_project_root", picked);
+        showToast(`プロジェクトフォルダを設定しました: ${picked}`, "success");
+      }
+    } catch (err) {
+      const message =
+        err instanceof Error && err.message === "PICK_PROJECT_ROOT_TIMEOUT"
+          ? "フォルダ選択ダイアログの応答がありませんでした。ウィンドウの裏に隠れていないか確認するか、もう一度お試しください。"
+          : "フォルダ選択に失敗しました（この機能はTauriアプリ内でのみ利用できます）";
+      showToast(message, "warning");
+    } finally {
+      setIsPickingRoot(false);
+    }
+  };
+
+  const handleClearProjectRoot = () => {
+    setProjectRoot(null);
+    localStorage.removeItem("debug_buddy_project_root");
+    showToast("プロジェクトフォルダの設定を解除しました", "info");
+  };
+
+  // 実ファイルへの適用（確認モーダルでのOK後に実行される）。
+  // check_fix_applicabilityの結果に関わらず、書き込み直前にRust側で必ず再検証される。
+  const handleRealApplyConfirmed = async () => {
+    if (!analysis || !projectRoot) return;
+    setShowRealApplyConfirm(false);
+    setIsRealApplying(true);
+    try {
+      const result = await invoke<{ backupId: string; appliedPath: string }>("apply_fix", {
+        root: projectRoot,
+        filePath: analysis.filePath,
+        diffCode: analysis.diffCode,
+      });
+      setRealApplyResult(result);
+      showToast(`✅ 実際に書き換えました: ${result.appliedPath}`, "success");
+    } catch (err) {
+      showToast(`実ファイルへの適用に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+    } finally {
+      setIsRealApplying(false);
+    }
+  };
+
+  // 実ファイルのロールバック（バックアップから復元する本物のロールバック）
+  const handleRealRollback = async () => {
+    if (!projectRoot || !realApplyResult) return;
+    setIsRollingBackReal(true);
+    try {
+      await invoke("rollback_fix", { root: projectRoot, backupId: realApplyResult.backupId });
+      showToast("バックアップから元のファイル内容に復元しました", "info");
+      setRealApplyResult(null);
+    } catch (err) {
+      showToast(`ロールバックに失敗しました: ${String(err).slice(0, 100)}`, "warning");
+    } finally {
+      setIsRollingBackReal(false);
+    }
+  };
+
   // チェックリストの各項目のON/OFFを切り替える
   const toggleChecklistItem = (index: number) => {
     setCheckedItems((prev) => prev.map((checked, i) => (i === index ? !checked : checked)));
@@ -779,6 +936,36 @@ export default function App() {
             <span>Gemini AI:</span>
             <span className="font-semibold">{apiKey ? "Active" : "APIキー設定"}</span>
           </button>
+
+          {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定） */}
+          <button
+            onClick={handlePickProjectRoot}
+            disabled={isPickingRoot}
+            title={
+              projectRoot
+                ? `プロジェクトフォルダ: ${projectRoot}（クリックで変更）`
+                : "プロジェクトフォルダを選択すると、実ファイルへの安全な自動適用が使えます"
+            }
+            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer disabled:opacity-60 max-w-[220px] ${
+              projectRoot
+                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
+                : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700"
+            }`}
+          >
+            <FolderOpen className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">
+              {projectRoot ? projectRoot.split(/[\\/]/).pop() : "プロジェクトフォルダ未選択"}
+            </span>
+          </button>
+          {projectRoot && (
+            <button
+              onClick={handleClearProjectRoot}
+              title="プロジェクトフォルダの設定を解除"
+              className="flex items-center justify-center p-1.5 rounded-lg text-slate-400 hover:text-rose-500 dark:hover:text-rose-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
 
           {/* 履歴モーダルボタン（見つけやすいよう強調表示） */}
           <button
@@ -1332,6 +1519,78 @@ export default function App() {
                         </button>
                       )}
                     </div>
+
+                    {/* 実ファイルへの安全な適用（追加機能）。プロジェクトフォルダ選択・可否判定・
+                        実適用/実ロールバックは、上のプレビュー機能とは独立して動作する。
+                        projectRoot未選択・判定不可のケースでは、これまで通りプレビューのみで
+                        何も壊れないようにフォールバックする。 */}
+                    {analysis.fixType !== "task" && (
+                      <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/25 space-y-3">
+                        <h4 className="text-xs font-semibold text-amber-700 dark:text-amber-300 uppercase tracking-wider flex items-center space-x-1.5">
+                          <Save className="w-3.5 h-3.5" />
+                          <span>実ファイルへの適用（オプション）</span>
+                        </h4>
+
+                        {!projectRoot ? (
+                          <div className="flex items-center justify-between gap-3 flex-wrap">
+                            <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                              プロジェクトフォルダを選択すると、安全性を確認したうえで実際のファイルへ書き込めます（対応できないケースはこれまで通りプレビューのみになります）。
+                            </p>
+                            <button
+                              onClick={handlePickProjectRoot}
+                              disabled={isPickingRoot}
+                              className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold flex items-center space-x-1.5 transition cursor-pointer"
+                            >
+                              <FolderOpen className="w-3.5 h-3.5" />
+                              <span>{isPickingRoot ? "選択中..." : "フォルダを選択"}</span>
+                            </button>
+                          </div>
+                        ) : isCheckingApply ? (
+                          <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center space-x-1.5">
+                            <span className="w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin shrink-0" />
+                            <span>安全に適用できるか確認中...</span>
+                          </p>
+                        ) : realApplyResult ? (
+                          <div className="flex items-center justify-between gap-3 flex-wrap">
+                            <p className="text-xs text-emerald-700 dark:text-emerald-300 flex items-center space-x-1.5">
+                              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                              <span>
+                                実際に書き換えました:{" "}
+                                <code className="text-slate-600 dark:text-slate-300">{realApplyResult.appliedPath}</code>
+                              </span>
+                            </p>
+                            <button
+                              onClick={handleRealRollback}
+                              disabled={isRollingBackReal}
+                              className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-amber-700 dark:text-amber-300 border border-amber-500/30 disabled:opacity-50 flex items-center space-x-1.5 transition cursor-pointer"
+                            >
+                              <Undo2 className="w-3.5 h-3.5" />
+                              <span>{isRollingBackReal ? "復元中..." : "実ファイルを元に戻す"}</span>
+                            </button>
+                          </div>
+                        ) : applyCheck?.applicable ? (
+                          <div className="flex items-center justify-between gap-3 flex-wrap">
+                            <p className="text-xs text-slate-600 dark:text-slate-300">
+                              <code className="text-slate-500 dark:text-slate-400">{applyCheck.resolvedPath}</code>{" "}
+                              に安全に適用できることを確認しました。
+                            </p>
+                            <button
+                              onClick={() => setShowRealApplyConfirm(true)}
+                              disabled={isRealApplying}
+                              className="shrink-0 text-xs px-3.5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold flex items-center space-x-1.5 shadow transition cursor-pointer active:scale-95"
+                            >
+                              <Save className="w-3.5 h-3.5" />
+                              <span>{isRealApplying ? "適用中..." : "実ファイルに適用する"}</span>
+                            </button>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center space-x-1.5">
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400 shrink-0" />
+                            <span>{describeUnapplicableReason(applyCheck?.reason ?? null)}</span>
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1365,6 +1624,51 @@ export default function App() {
           </div>
         </section>
       </main>
+
+      {/* 実ファイル適用の最終確認モーダル。破壊的操作（バックアップは取るが実ファイルを書き換える）
+          のため、ボタン一発ではなく必ずこの確認を経てから apply_fix を呼び出す。 */}
+      {showRealApplyConfirm && analysis && applyCheck?.resolvedPath && (
+        <div className="fixed inset-0 z-50 bg-slate-950/50 dark:bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <Save className="w-5 h-5 text-amber-600 dark:text-amber-400" />
+                <h3 className="font-bold text-sm text-slate-900 dark:text-white">実ファイルへの適用の確認</h3>
+              </div>
+              <button
+                onClick={() => setShowRealApplyConfirm(false)}
+                className="text-slate-400 hover:text-slate-900 dark:hover:text-white transition p-1"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+              以下のファイルを実際に書き換えます。書き換え前の内容は自動でバックアップされ、あとから「元に戻す」でいつでも復元できます。
+            </p>
+
+            <div className="rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 p-3">
+              <code className="text-xs text-slate-700 dark:text-slate-300 break-all">{applyCheck.resolvedPath}</code>
+            </div>
+
+            <div className="flex items-center justify-end space-x-2 pt-2">
+              <button
+                onClick={() => setShowRealApplyConfirm(false)}
+                className="px-3.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition cursor-pointer"
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={handleRealApplyConfirmed}
+                className="px-4 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-xs font-semibold text-slate-950 flex items-center space-x-1.5 transition cursor-pointer"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>バックアップを取って適用する</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 4. APIキー設定モーダル */}
       {showKeyModal && (

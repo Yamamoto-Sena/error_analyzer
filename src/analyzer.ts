@@ -188,12 +188,12 @@ taskkill /F /IM tauri-app.exe /T
       diffCode: `--- a/${location.file}
 +++ b/${location.file}
 @@ -${location.line},3 +${location.line},5 @@
-- print("User ID: " + ${targetVar}.${attrName})
-+ # 修正案: Noneチェック（ガード節）を追加して安全に参照する
-+ if ${targetVar} is not None:
-+     print("User ID: " + str(${targetVar}.${attrName}))
-+ else:
-+     print("ユーザー情報が見つかりませんでした")`,
+-    print("User ID: " + ${targetVar}.${attrName})
++    # 修正案: Noneチェック（ガード節）を追加して安全に参照する
++    if ${targetVar} is not None:
++        print("User ID: " + str(${targetVar}.${attrName}))
++    else:
++        print("ユーザー情報が見つかりませんでした")`,
       learningTitle: "💡 学習ポイント: Pythonにおける NoneType とガード節（Null Check）",
       learningContent: "Pythonの関数やSQLAlchemyなどのORM（.first()）は、対象データが存在しない場合に None を返します。None は特定の値を持たない特殊なオブジェクトであるため、そのまま '.${attrName}' のように属性アクセスするとクラッシュします。必ず事前に 'if obj is not None:' で安全性を担保しましょう。",
       preventionTips: [
@@ -255,8 +255,8 @@ npm install ${pkgName}
       diffCode: `--- a/${location.file}
 +++ b/${location.file}
 @@ -${location.line},3 +${location.line},3 @@
-- const result = data.${propName};
-+ const result = data?.${propName} ?? "初期値";`,
+-const result = data.${propName};
++const result = data?.${propName} ?? "初期値";`,
       learningTitle: "💡 学習ポイント: オプショナルチェーン (?.) と Null合体 (??)",
       learningContent: "TypeScript/JavaScriptでは `data?.${propName}` のように安全なアクセス演算子を使うことで、undefined/null時に例外を投げず安全に処理を継続できます。",
       preventionTips: [
@@ -278,8 +278,8 @@ npm install ${pkgName}
       diffCode: `--- a/${location.file}
 +++ b/${location.file}
 @@ -${location.line},3 +${location.line},3 @@
-- return ( <div> <span>未完了</span>
-+ return ( <div> <span>修正完了</span> </div> );`,
+-return ( <div> <span>未完了</span>
++return ( <div> <span>修正完了</span> </div> );`,
       learningTitle: "💡 学習ポイント: エディタの構文ハイライトとLinterの活用",
       learningContent: "構文エラーはESLintやPrettierなどのフォーマッターを導入することで、保存時に自動検知・自動修正できます。",
       preventionTips: [
@@ -329,8 +329,8 @@ npm install ${pkgName}
       diffCode: `--- a/${location.file}
 +++ b/${location.file}
 @@ -${location.line},3 +${location.line},3 @@
-- const res = await fetch("http://localhost:3000/api");
-+ const res = await fetch(import.meta.env.VITE_API_URL || "/api");`,
+-const res = await fetch("http://localhost:3000/api");
++const res = await fetch(import.meta.env.VITE_API_URL || "/api");`,
       learningTitle: "💡 学習ポイント: オリジン間リソース共有 (CORS) と接続先管理",
       learningContent: "フロントエンドとバックエンドのオリジン（プロトコル・ドメイン・ポート）が異なる場合、バックエンド側でAccess-Control-Allow-Originヘッダーの許可が必要です。",
       preventionTips: [
@@ -352,8 +352,8 @@ npm install ${pkgName}
     diffCode: `--- a/${location.file}
 +++ b/${location.file}
 @@ -${location.line},3 +${location.line},3 @@
-- try { dangerousOperation(); }
-+ try { dangerousOperation(); } catch (error) { console.error("詳細ログ:", error); }`,
+-try { dangerousOperation(); }
++try { dangerousOperation(); } catch (error) { console.error("詳細ログ:", error); }`,
     learningTitle: "💡 学習ポイント: エラーハンドリングと例外の局所化",
     learningContent: "エラーが発生する可能性のある境界処理（ファイル読み書き、通信、JSONパース等）は `try...catch` で安全に捕捉し、ユーザーフレンドリーなメッセージに変換しましょう。",
     preventionTips: [

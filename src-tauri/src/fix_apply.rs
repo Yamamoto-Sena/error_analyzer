@@ -120,6 +120,11 @@ pub fn parse_hunks(diff_code: &str) -> Vec<Hunk> {
         };
 
         if let Some(rest) = raw_line.strip_prefix('+') {
+            // 標準的なUnified Diff（`diff -u` / `git diff` / Geminiの実際の出力）は
+            // 印の直後がそのままコードの内容（本来のインデントを含む）になる。
+            // 印の後ろの空白を勝手に1つ取り除くと、本来のインデントを1文字削ってしまい
+            // 実ファイルとの照合を誤らせるため、ここでは一切加工しない。
+            // (このアプリ自身が生成する側のdiffテンプレートを、この標準形式に合わせている)
             hunk.new_lines.push(rest.to_string());
         } else if let Some(rest) = raw_line.strip_prefix('-') {
             hunk.old_lines.push(rest.to_string());
@@ -399,5 +404,48 @@ mod tests {
         let err = compute_fix(tmp.path(), "app.py", diff).unwrap_err();
 
         assert_eq!(err, UnapplicableReason::DiffNoMatch);
+    }
+
+    #[test]
+    fn matches_standard_diff_style_preserving_real_indentation_exactly() {
+        // 標準的なUnified Diff（`diff -u` / `git diff` / Geminiが実際に生成する形式）は
+        // 印のすぐ後に本来のインデントを含むコード内容が続く（飾りのスペースは無い）。
+        // 印の直後の文字を勝手に取り除いてはいけない（本来の4スペースインデントを
+        // 削ってしまうと実ファイルと一致しなくなる）ことを確認する。
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.path().join("demo.js"),
+            "function loadUser(user) {\n    return user.name;\n}\n",
+        )
+        .unwrap();
+        let diff =
+            "--- a/demo.js\n+++ b/demo.js\n@@ -1,3 +1,3 @@\n function loadUser(user) {\n-    return user.name;\n+    return user?.name;\n }\n";
+
+        let result = compute_fix(tmp.path(), "demo.js", diff).unwrap();
+
+        assert_eq!(
+            result.new_content,
+            "function loadUser(user) {\n    return user?.name;\n}\n"
+        );
+    }
+
+    #[test]
+    fn matches_this_apps_own_diff_templates_after_removing_the_decorative_space() {
+        // src/analyzer.ts のテンプレートは、印の直後に本来のインデントがそのまま続く
+        // 標準形式に合わせて書かれている（飾りのスペースは入れない）。
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.path().join("api_controller.py"),
+            "def handle_request(request_id):\n    response = get_user_profile(request_id)\n    print(\"User ID: \" + response.user_id)\n",
+        )
+        .unwrap();
+        let diff = "--- a/api_controller.py\n+++ b/api_controller.py\n@@ -3,1 +3,5 @@\n-    print(\"User ID: \" + response.user_id)\n+    if response is not None:\n+        print(\"User ID: \" + str(response.user_id))\n+    else:\n+        print(\"not found\")\n";
+
+        let result = compute_fix(tmp.path(), "api_controller.py", diff).unwrap();
+
+        assert_eq!(
+            result.new_content,
+            "def handle_request(request_id):\n    response = get_user_profile(request_id)\n    if response is not None:\n        print(\"User ID: \" + str(response.user_id))\n    else:\n        print(\"not found\")\n"
+        );
     }
 }

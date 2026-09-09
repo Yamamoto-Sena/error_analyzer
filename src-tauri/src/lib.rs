@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fix_apply::{compute_fix, resolve_within_root};
+use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -124,6 +125,12 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
 /// （フロントエンドに公開する操作を「フォルダを選ぶ」の1つだけに絞るための設計）。
 #[tauri::command]
 fn pick_project_root(app: tauri::AppHandle) -> Option<String> {
+    // ダイアログがメインウィンドウの後ろに隠れて開いてしまい、応答を待ったまま
+    // フリーズしたように見える問題を防ぐため、ダイアログを開く前に必ず前面へ出す。
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_focus();
+    }
+
     let picked = app.dialog().file().blocking_pick_folder()?;
     let path = picked.into_path().ok()?;
     fs::canonicalize(&path)
