@@ -317,7 +317,7 @@ export default function App() {
   }, [theme]);
 
   // 解析結果が変わるたび（新規解析・履歴読込・再検証）に検証チェックリストを作り直す。
-  // 「コードに自動適用する」を押していなくても確認できるよう、isApplied には依存させない。
+  // 「コードに適用する（プレビュー）」を押していなくても確認できるよう、isApplied には依存させない。
   useEffect(() => {
     if (analysis) {
       const checklist = buildVerificationChecklist(analysis);
@@ -557,14 +557,17 @@ export default function App() {
     }
   };
 
-  // コードに自動適用
+  // コードに自動適用（プレビュー）
+  // NOTE: 現バージョンは実ファイルへの書き込みを行わない「プレビュー」機能。
+  // Tauri側に実I/O・バックアップ・ロールバックのコマンドが実装されるまでは、
+  // ユーザーに誤解を与えないよう文言は必ず「プレビュー」であることを明示する。
   const handleApplyFix = () => {
     if (!analysis) return;
     if (isApplied) {
       setIsApplied(false);
       setVerificationResult(null);
       setVerifyLogInput("");
-      showToast(`修正をロールバック（${analysis.filePath} を復元）しました`, "info");
+      showToast(`プレビューを取り消しました（${analysis.filePath} は変更されていません）`, "info");
       return;
     }
 
@@ -573,7 +576,10 @@ export default function App() {
       setIsApplying(false);
       setIsApplied(true);
       setVerificationResult(null);
-      showToast(`✅ ${analysis.filePath} に修正を適用しました（バックアップ保存済）`, "success");
+      showToast(
+        `📝 ${analysis.filePath} への適用をプレビュー表示しました（※実ファイルは書き換えていません。反映するには上の差分を「差分をコピー」してご自身のエディタで適用してください）`,
+        "info"
+      );
     }, 700);
   };
 
@@ -1161,6 +1167,13 @@ export default function App() {
                       </button>
                     </div>
 
+                    {analysis.fixType !== "task" && (
+                      <p className="text-[11px] text-slate-400 dark:text-slate-500 flex items-center space-x-1.5">
+                        <AlertCircle className="w-3 h-3 shrink-0" />
+                        <span>現在のバージョンでは実ファイルへの自動書き込みは行いません。「コードに適用する」はプレビュー表示のみで、反映するには差分をコピーしてご自身のエディタに貼り付けてください。</span>
+                      </p>
+                    )}
+
                     {analysis.fixType === "task" ? (
                       <TaskStepsView steps={analysis.taskSteps && analysis.taskSteps.length > 0 ? analysis.taskSteps : [analysis.diffCode]} />
                     ) : (
@@ -1171,14 +1184,16 @@ export default function App() {
                       <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-700 dark:text-emerald-300 flex items-center justify-between">
                         <span className="flex items-center space-x-1.5">
                           <CheckCircle2 className="w-4 h-4 text-emerald-500 dark:text-emerald-400 shrink-0" />
-                          <span>修正が適用されました（バックアップ: <code className="text-slate-600 dark:text-slate-300">{analysis.filePath}.bak</code>）</span>
+                          <span>
+                            修正内容をプレビュー表示中です（<code className="text-slate-600 dark:text-slate-300">{analysis.filePath}</code> 自体はまだ書き換えられていません）
+                          </span>
                         </span>
-                        <span className="text-[10px] text-emerald-600 dark:text-emerald-400/80">再テスト推奨</span>
+                        <span className="text-[10px] text-emerald-600 dark:text-emerald-400/80">上の差分を手動で反映してください</span>
                       </div>
                     )}
 
                     {/* 修正案の検証: 実際に対応できたかをチェックし、未解消なら新たな修正案を提案する。
-                        「コードに自動適用する」を押していなくても（タスク対応の場合や、まだ適用前でも）確認できるよう常時表示する。 */}
+                        「コードに適用する（プレビュー）」を押していなくても（タスク対応の場合や、まだ適用前でも）確認できるよう常時表示する。 */}
                     <div className="p-4 rounded-xl bg-sky-500/10 border border-sky-500/25 space-y-3">
                         <h4 className="text-xs font-semibold text-sky-700 dark:text-sky-300 uppercase tracking-wider flex items-center space-x-1.5">
                           <ShieldCheck className="w-3.5 h-3.5" />
@@ -1301,17 +1316,17 @@ export default function App() {
                           {isApplying ? (
                             <>
                               <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-                              <span>ファイルに書き込み中...</span>
+                              <span>プレビュー生成中...</span>
                             </>
                           ) : isApplied ? (
                             <>
                               <Undo2 className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400" />
-                              <span>修正を取り消す (ロールバック)</span>
+                              <span>プレビューを取り消す</span>
                             </>
                           ) : (
                             <>
                               <CheckCircle2 className="w-3.5 h-3.5" />
-                              <span>コードに自動適用する</span>
+                              <span>コードに適用する（プレビュー）</span>
                             </>
                           )}
                         </button>
