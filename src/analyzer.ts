@@ -6,6 +6,10 @@ export interface AnalysisResult {
   filePath: string;
   lineNumber: string;
   diffCode: string;
+  /** 修正手段の種類。"code": コードの差分で直せる / "task": コマンド実行・再起動・ケーブル抜き差し等、手順による対応が必要（省略時は "code" 扱い） */
+  fixType?: "code" | "task";
+  /** fixType が "task" の場合に、解決のために実施すべき手順を1つずつ格納する（code の場合は空配列 or 省略） */
+  taskSteps?: string[];
   learningTitle: string;
   learningContent: string;
   preventionTips: string[];
@@ -132,6 +136,12 @@ function analyzeErrorLogCore(rawLog: string): AnalysisResult {
       rootCause: `Viteなどの開発サーバーは起動時に指定されたポート（${portNum}番）を確保（バインド）しますが、前回のプロセスが正しく終了せずバックグラウンドに残っているか、別ウィンドウで二重起動しているため起動に失敗しました。また、Tauriはフロントエンドの起動（beforeDevCommand）が失敗したことを検知して全体の起動を中断（ELIFECYCLE code 1）しています。`,
       filePath: "vite.config.ts / バックグラウンドプロセス",
       lineNumber: "15〜18行目 (server.port)",
+      fixType: "task",
+      taskSteps: [
+        `【解決策1・推奨】ポートを占有している古いプロセスを終了する\nPowerShell の場合:\nGet-Process -Name "node", "tauri-app" -ErrorAction SilentlyContinue | Stop-Process -Force\n\nコマンドプロンプト (cmd) の場合:\ntaskkill /F /IM node.exe /T\ntaskkill /F /IM tauri-app.exe /T`,
+        `【解決策2】空いている別のポートを自動使用する設定に変更する\nvite.config.ts の server.strictPort を false に変更してください（true だと競合時に即エラー終了、false なら空きポート（${Number(portNum) + 1}等）を自動探索します）。`,
+        `上記いずれかを実施後、開発サーバーを再起動してポート ${portNum} で正常に起動するか確認する`,
+      ],
       diffCode: `# 解決策1: ポートを占有している古いプロセスを終了する（推奨）
 # [PowerShell の場合]:
 Get-Process -Name "node", "tauri-app" -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -205,6 +215,12 @@ taskkill /F /IM tauri-app.exe /T
       rootCause: `プロジェクトに必要なライブラリがインストールされていないか、import文の相対パス（./ や ../）が間違っています。`,
       filePath: location.file,
       lineNumber: `${location.line}行目`,
+      fixType: "task",
+      taskSteps: [
+        `ターミナルで不足しているパッケージをインストールする\npnpm add ${pkgName}\n# または\nnpm install ${pkgName}`,
+        `import文の相対パス（./ や ../）やパッケージ名のスペルミスがないか、${location.file} を確認する`,
+        `インストール完了後、開発サーバーを再起動してエラーが解消したか確認する`,
+      ],
       diffCode: `# ターミナルで不足しているパッケージをインストールしてください
 pnpm add ${pkgName}
 # または

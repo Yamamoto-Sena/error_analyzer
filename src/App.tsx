@@ -33,6 +33,9 @@ import {
   ShieldCheck,
   Search,
   MessageSquareText,
+  ListChecks,
+  Circle,
+  ClipboardList,
 } from "lucide-react";
 import "./App.css";
 import { analyzeErrorLog, AnalysisResult } from "./analyzer";
@@ -100,14 +103,17 @@ function expandSearchQuery(rawQuery: string): string[] {
 
 // 選択可能な Gemini モデル一覧（現行の Flash 系ラインナップ）
 const AVAILABLE_MODELS: { value: string; label: string }[] = [
+  { value: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash-Lite（既定・軽量高速）" },
   { value: "gemini-flash-latest", label: "Gemini Flash（最新版・自動追従）" },
   { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
   { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash" },
   { value: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
   { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
-  { value: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash-Lite（軽量・高速）" },
   { value: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash-Lite" },
 ];
+
+// アプリの既定（初期表示）モデル
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 
 // 初心者向けサンプルログ群
 const SAMPLE_LOGS = {
@@ -183,6 +189,45 @@ function DiffView({ diffCode }: { diffCode: string }) {
   );
 }
 
+// 操作者自身に確認してもらう検証チェックリストを解析結果から生成する。
+// 「エラーは解消した」の自己申告だけに頼らず、具体的な確認観点を提示して精度を上げる。
+// コード修正（fixType: "code"）と手順対応（fixType: "task"）で文言を出し分ける。
+function buildVerificationChecklist(analysis: AnalysisResult): string[] {
+  const isTask = analysis.fixType === "task";
+  const items = [
+    isTask
+      ? `上記の手順（タスク）をすべて実施した`
+      : `修正を適用したコードで、エラーが発生していた操作・処理をもう一度実行した`,
+    `ターミナル/コンソール/ログに「${analysis.errorType}」と同じエラーが出力されていないことを確認した`,
+    isTask
+      ? `関連する機能（${analysis.filePath}）が正常に動作することを確認した`
+      : `修正対象のファイル（${analysis.filePath}）を含む周辺の機能が正常に動作することを確認した`,
+  ];
+  if (analysis.preventionTips.length > 0) {
+    items.push(`再発防止策「${analysis.preventionTips[0]}」を踏まえて動作確認した`);
+  }
+  return items;
+}
+
+// コードの差分ではなく、手順（コマンド実行・再起動・ケーブル抜き差し等）で解決するタイプの修正案を
+// 番号付きのタスクリストとして表示するサブコンポーネント
+function TaskStepsView({ steps }: { steps: string[] }) {
+  return (
+    <div className="rounded-lg bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 divide-y divide-slate-100 dark:divide-slate-900/60 overflow-hidden">
+      {steps.map((step, idx) => (
+        <div key={idx} className="flex items-start space-x-3 p-3.5">
+          <span className="shrink-0 w-5 h-5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-300 text-[11px] font-bold flex items-center justify-center mt-0.5">
+            {idx + 1}
+          </span>
+          <pre className="flex-1 whitespace-pre-wrap break-words font-mono text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
+            {step}
+          </pre>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const [logInput, setLogInput] = useState<string>("");
   // ログが手元にない場合でも解析できるよう、自由記述の症状・状況説明を別枠で受け付ける
@@ -199,6 +244,9 @@ export default function App() {
     status: "resolved" | "still-failing" | "new-error";
     message: string;
   } | null>(null);
+  // 「エラーは解消した」ボタンを押す前に操作者自身へ確認してもらうチェックリスト
+  const [verificationChecklist, setVerificationChecklist] = useState<string[]>([]);
+  const [checkedItems, setCheckedItems] = useState<boolean[]>([]);
 
   // APIキー管理
   const [apiKey, setApiKey] = useState<string>("");
@@ -206,7 +254,7 @@ export default function App() {
   const [tempApiKey, setTempApiKey] = useState<string>("");
 
   // 使用するGeminiモデルの選択
-  const [selectedModel, setSelectedModel] = useState<string>("gemini-flash-latest");
+  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODEL);
 
   // テーマ管理（ライト / ダーク）
   const [theme, setTheme] = useState<"light" | "dark">("dark");
@@ -267,6 +315,19 @@ export default function App() {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("debug_buddy_theme", theme);
   }, [theme]);
+
+  // 解析結果が変わるたび（新規解析・履歴読込・再検証）に検証チェックリストを作り直す。
+  // 「コードに自動適用する」を押していなくても確認できるよう、isApplied には依存させない。
+  useEffect(() => {
+    if (analysis) {
+      const checklist = buildVerificationChecklist(analysis);
+      setVerificationChecklist(checklist);
+      setCheckedItems(new Array(checklist.length).fill(false));
+    } else {
+      setVerificationChecklist([]);
+      setCheckedItems([]);
+    }
+  }, [analysis]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
 
@@ -482,8 +543,12 @@ export default function App() {
   // コピー機能
   const handleCopyDiff = async () => {
     if (!analysis) return;
+    const textToCopy =
+      analysis.fixType === "task" && analysis.taskSteps && analysis.taskSteps.length > 0
+        ? analysis.taskSteps.map((step, idx) => `${idx + 1}. ${step}`).join("\n\n")
+        : analysis.diffCode;
     try {
-      await navigator.clipboard.writeText(analysis.diffCode);
+      await navigator.clipboard.writeText(textToCopy);
       setCopied(true);
       showToast("差分コードをクリップボードにコピーしました！", "success");
       setTimeout(() => setCopied(false), 2000);
@@ -512,9 +577,23 @@ export default function App() {
     }, 700);
   };
 
+  // チェックリストの各項目のON/OFFを切り替える
+  const toggleChecklistItem = (index: number) => {
+    setCheckedItems((prev) => prev.map((checked, i) => (i === index ? !checked : checked)));
+  };
+
   // 修正案が適用済みで、かつエラーが解消したことをユーザーが確認した場合
   const handleMarkResolved = () => {
     if (!analysis) return;
+    if (verificationChecklist.length > 0 && !checkedItems.every(Boolean)) {
+      showToast(
+        analysis.fixType === "task"
+          ? "すべての実施確認にチェックを入れてから完了報告してください"
+          : "すべての確認項目にチェックを入れてから完了報告してください",
+        "warning"
+      );
+      return;
+    }
     setVerificationResult({
       status: "resolved",
       message: "✅ 修正が正しく適用され、エラーは解消しました。お疲れ様でした！",
@@ -585,6 +664,9 @@ export default function App() {
     setHasResult(true);
     setActiveTab("cause");
     setShowHistoryModal(false);
+    setIsApplied(false);
+    setVerificationResult(null);
+    setVerifyLogInput("");
     showToast(`履歴「${item.result.errorType}」を読み込みました`, "info");
   };
 
@@ -1052,7 +1134,15 @@ export default function App() {
                 {activeTab === "diff" && (
                   <div className="space-y-3">
                     <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-                      <span>修正差分プレビュー (Unified Diff) - {analysis.filePath}</span>
+                      <span className="flex items-center space-x-1.5">
+                        {analysis.fixType === "task" ? (
+                          <ClipboardList className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400 shrink-0" />
+                        ) : null}
+                        <span>
+                          {analysis.fixType === "task" ? "解決のためのタスク" : "修正差分プレビュー (Unified Diff)"} -{" "}
+                          {analysis.filePath}
+                        </span>
+                      </span>
                       <button
                         onClick={handleCopyDiff}
                         className="flex items-center space-x-1.5 py-1 px-2.5 rounded bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white transition cursor-pointer"
@@ -1065,15 +1155,19 @@ export default function App() {
                         ) : (
                           <>
                             <Copy className="w-3.5 h-3.5" />
-                            <span>差分をコピー</span>
+                            <span>{analysis.fixType === "task" ? "手順をコピー" : "差分をコピー"}</span>
                           </>
                         )}
                       </button>
                     </div>
 
-                    <DiffView diffCode={analysis.diffCode} />
+                    {analysis.fixType === "task" ? (
+                      <TaskStepsView steps={analysis.taskSteps && analysis.taskSteps.length > 0 ? analysis.taskSteps : [analysis.diffCode]} />
+                    ) : (
+                      <DiffView diffCode={analysis.diffCode} />
+                    )}
 
-                    {isApplied && (
+                    {analysis.fixType !== "task" && isApplied && (
                       <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-700 dark:text-emerald-300 flex items-center justify-between">
                         <span className="flex items-center space-x-1.5">
                           <CheckCircle2 className="w-4 h-4 text-emerald-500 dark:text-emerald-400 shrink-0" />
@@ -1083,16 +1177,56 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* 修正案の検証: 実際に対応できたかをチェックし、未解消なら新たな修正案を提案する */}
-                    {isApplied && (
-                      <div className="p-4 rounded-xl bg-sky-500/10 border border-sky-500/25 space-y-3">
+                    {/* 修正案の検証: 実際に対応できたかをチェックし、未解消なら新たな修正案を提案する。
+                        「コードに自動適用する」を押していなくても（タスク対応の場合や、まだ適用前でも）確認できるよう常時表示する。 */}
+                    <div className="p-4 rounded-xl bg-sky-500/10 border border-sky-500/25 space-y-3">
                         <h4 className="text-xs font-semibold text-sky-700 dark:text-sky-300 uppercase tracking-wider flex items-center space-x-1.5">
                           <ShieldCheck className="w-3.5 h-3.5" />
                           <span>修正案で対応できたか検証する</span>
                         </h4>
                         <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-                          修正を適用した状態で同じ操作を再実行してください。エラーが解消していれば下のボタンで完了報告、まだ同じ（または別の）エラーが出る場合は、その新しいログを貼り付けて再解析できます。
+                          {analysis.fixType === "task"
+                            ? "上記の手順を実施した状態で同じ操作を再実行してください。エラーが解消していれば下のボタンで完了報告、まだ同じ（または別の）エラーが出る場合は、その新しいログを貼り付けて再解析できます。"
+                            : "修正を適用した状態で同じ操作を再実行してください。エラーが解消していれば下のボタンで完了報告、まだ同じ（または別の）エラーが出る場合は、その新しいログを貼り付けて再解析できます。"}
                         </p>
+
+                        {/* 操作者自身に確認してもらう検証チェックリスト（自己申告の精度を上げるため、全項目チェックしないと完了報告できない） */}
+                        {verificationChecklist.length > 0 && (
+                          <div className="rounded-lg border border-sky-500/25 bg-white dark:bg-slate-950/60 divide-y divide-sky-500/10">
+                            <div className="px-3 py-2 flex items-center justify-between">
+                              <span className="text-[11px] font-semibold text-sky-700 dark:text-sky-300 uppercase tracking-wider flex items-center space-x-1.5">
+                                <ListChecks className="w-3.5 h-3.5" />
+                                <span>{analysis.fixType === "task" ? "実施確認リスト" : "確認チェックリスト"}</span>
+                              </span>
+                              <span className="text-[10px] text-slate-400 dark:text-slate-500">
+                                {checkedItems.filter(Boolean).length} / {verificationChecklist.length} 完了
+                              </span>
+                            </div>
+                            {verificationChecklist.map((item, idx) => (
+                              <button
+                                key={idx}
+                                type="button"
+                                onClick={() => toggleChecklistItem(idx)}
+                                className="w-full flex items-start space-x-2 px-3 py-2 text-left hover:bg-sky-500/5 transition cursor-pointer"
+                              >
+                                {checkedItems[idx] ? (
+                                  <CheckCircle2 className="w-4 h-4 text-emerald-500 dark:text-emerald-400 mt-0.5 shrink-0" />
+                                ) : (
+                                  <Circle className="w-4 h-4 text-slate-300 dark:text-slate-600 mt-0.5 shrink-0" />
+                                )}
+                                <span
+                                  className={`text-xs leading-relaxed ${
+                                    checkedItems[idx]
+                                      ? "text-slate-400 dark:text-slate-500 line-through"
+                                      : "text-slate-700 dark:text-slate-300"
+                                  }`}
+                                >
+                                  {item}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
 
                         <textarea
                           value={verifyLogInput}
@@ -1105,7 +1239,15 @@ export default function App() {
                         <div className="flex items-center justify-end space-x-2">
                           <button
                             onClick={handleMarkResolved}
-                            className="text-xs px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
+                            disabled={verificationChecklist.length > 0 && !checkedItems.every(Boolean)}
+                            title={
+                              verificationChecklist.length > 0 && !checkedItems.every(Boolean)
+                                ? analysis.fixType === "task"
+                                  ? "実施確認リストの全項目にチェックを入れてください"
+                                  : "確認チェックリストの全項目にチェックを入れてください"
+                                : undefined
+                            }
+                            className="text-xs px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
                           >
                             <CheckCircle2 className="w-3.5 h-3.5" />
                             <span>エラーは解消した</span>
@@ -1137,8 +1279,7 @@ export default function App() {
                             {verificationResult.message}
                           </div>
                         )}
-                      </div>
-                    )}
+                    </div>
 
                     <div className="flex items-center justify-end space-x-2 pt-2">
                       <button
@@ -1147,32 +1288,34 @@ export default function App() {
                       >
                         スキップ
                       </button>
-                      <button
-                        onClick={handleApplyFix}
-                        disabled={isApplying}
-                        className={`text-xs px-4 py-2 rounded-lg font-semibold flex items-center space-x-1.5 shadow transition cursor-pointer active:scale-95 ${
-                          isApplied
-                            ? "bg-slate-100 dark:bg-slate-800 text-amber-700 dark:text-amber-300 hover:bg-slate-200 dark:hover:bg-slate-700 border border-amber-500/30"
-                            : "bg-emerald-500 hover:bg-emerald-400 text-slate-950"
-                        }`}
-                      >
-                        {isApplying ? (
-                          <>
-                            <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-                            <span>ファイルに書き込み中...</span>
-                          </>
-                        ) : isApplied ? (
-                          <>
-                            <Undo2 className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400" />
-                            <span>修正を取り消す (ロールバック)</span>
-                          </>
-                        ) : (
-                          <>
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            <span>コードに自動適用する</span>
-                          </>
-                        )}
-                      </button>
+                      {analysis.fixType !== "task" && (
+                        <button
+                          onClick={handleApplyFix}
+                          disabled={isApplying}
+                          className={`text-xs px-4 py-2 rounded-lg font-semibold flex items-center space-x-1.5 shadow transition cursor-pointer active:scale-95 ${
+                            isApplied
+                              ? "bg-slate-100 dark:bg-slate-800 text-amber-700 dark:text-amber-300 hover:bg-slate-200 dark:hover:bg-slate-700 border border-amber-500/30"
+                              : "bg-emerald-500 hover:bg-emerald-400 text-slate-950"
+                          }`}
+                        >
+                          {isApplying ? (
+                            <>
+                              <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
+                              <span>ファイルに書き込み中...</span>
+                            </>
+                          ) : isApplied ? (
+                            <>
+                              <Undo2 className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400" />
+                              <span>修正を取り消す (ロールバック)</span>
+                            </>
+                          ) : (
+                            <>
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              <span>コードに自動適用する</span>
+                            </>
+                          )}
+                        </button>
+                      )}
                     </div>
                   </div>
                 )}

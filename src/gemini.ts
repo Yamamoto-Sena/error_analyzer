@@ -41,6 +41,10 @@ ${
 3. 開発環境やインフラエラーの判別:
    - ポート競合（Port already in use / EADDRINUSE）、ビルド失敗、TauriのbeforeDevCommandエラー等の場合は、プロセスの重複や設定不備を指摘し、diffCodeには実行すべきターミナルコマンド（taskkillやStop-Process等）を具体的に記載してください。
 
+3.5. 修正手段が「コードの差分」か「手順・作業」かの判別（fixType）:
+   - コードを1〜数行書き換えるだけで直せる場合（TypeError, SyntaxError, ReferenceError, AttributeError 等の多くのロジックバグ）は fixType を "code" とし、diffCode に Unified Diff 形式の修正前後を記載してください。
+   - コードの変更ではなく、コマンド実行（依存パッケージのインストール、プロセスの強制終了等）、アプリやサーバーの再起動、LANケーブル/USBの抜き差し、設定ファイルのGUI操作、外部サービス側の障害対応待ちなど、**人手による手順の実施が解決策そのものである場合**は fixType を "task" とし、taskSteps に実施すべき手順を1つずつ具体的な文字列として配列で記載してください（各手順にコマンドが必要な場合はその文字列内に含めてください）。判断に迷う場合は "code" としてください。
+
 4. 初心者の自立を促す「学習メモ」と「再発防止策」:
    - なぜこのバグが起きるのか（NoneType / Nullの性質、安全なアクセス構文など）の理論的背景を「learningContent」に書き、具体的な防止策（Nullチェック、型ヒント、Optional型の活用等）を提示してください。
 
@@ -51,7 +55,9 @@ ${
   "rootCause": "データの状態遷移を含めた根本原因の丁寧な解説（どこで何が起きてどの値が原因で落ちたか）",
   "filePath": "例外が発生した真のファイルパス（例: /app/src/controllers/api_controller.py）",
   "lineNumber": "発生行番号（例: 15行目）",
-  "diffCode": "修正前後のUnified Diff（--- a/... +++ b/... @@ ... @@ -修正前 +修正後）または解決コマンド",
+  "diffCode": "fixTypeが\\"code\\"の場合の修正前後のUnified Diff（--- a/... +++ b/... @@ ... @@ -修正前 +修正後）。\\"task\\"の場合も参考情報として実行コマンド等を記載してよい",
+  "fixType": "\\"code\\"（コードの差分で直せる）または \\"task\\"（コマンド実行・再起動・ケーブル抜き差し等、手順による対応が必要）のいずれか",
+  "taskSteps": ["fixTypeが\\"task\\"の場合に実施すべき具体的な手順を1つずつ配列で記載。\\"code\\"の場合は空配列 [] にする"],
   "learningTitle": "💡 新人エンジニア向け学習タイトル",
   "learningContent": "このエラーの背後にある言語仕様や技術的概念の解説",
   "preventionTips": [
@@ -161,6 +167,8 @@ ${
         filePath: parsed.filePath || "src/index.ts",
         lineNumber: parsed.lineNumber || "1行目",
         diffCode: parsed.diffCode || "--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n- old\n+ new",
+        fixType: parsed.fixType === "task" ? "task" : "code",
+        taskSteps: Array.isArray(parsed.taskSteps) ? parsed.taskSteps.filter((s: unknown) => typeof s === "string" && s.trim()) : [],
         learningTitle: parsed.learningTitle || "💡 学習ポイント",
         learningContent: parsed.learningContent || "エラーハンドリングを適切に行いましょう。",
         preventionTips: Array.isArray(parsed.preventionTips)
