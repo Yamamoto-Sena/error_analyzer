@@ -1,13 +1,9 @@
 //! 修正案(diff)を実ファイルに安全に適用できるか判定し、実際に適用するための
 //! 純粋なロジック（ファイルI/Oはあるが、Tauriの実行時・コマンド機構には一切依存しない）。
 //!
-//! ここではまだ Tauri コマンドとしての公開（フロントエンドからの呼び出し）は行わない。
-//! ロジック単体の正しさを `cargo test` で検証することが、このファイルの唯一の目的。
-//! フロントエンドとの接続（invoke経由の呼び出し）は別ステップで `lib.rs` 側に追加する。
-//!
-//! NOTE: 現時点ではどこからも呼ばれていないため `dead_code` 警告が出る。
-//! Step 2でTauriコマンドとして接続したら、この抑制は不要になるので削除する。
-#![allow(dead_code)]
+//! ここでは Tauri コマンドとしての公開（`#[tauri::command]`）は行わない。
+//! バックアップの作成・ダイアログ表示などTauri固有の処理は `lib.rs` 側が担い、
+//! このファイルは「安全に適用できるか」「適用した結果どうなるか」の計算だけに専念する。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -217,6 +213,39 @@ pub fn apply_hunks_to_text(original: &str, hunks: &[Hunk]) -> Result<String, Una
     Ok(new_text)
 }
 
+/// 「安全に適用できるか」の判定と「適用した場合の新しい内容」の計算を1回にまとめた結果。
+/// バックアップの作成や実際の書き込みは呼び出し側（`lib.rs`）の責務とする。
+#[derive(Debug)]
+pub struct AppliedFix {
+    /// `root` 配下であることを確認済みの、対象ファイルの正規化された絶対パス
+    pub resolved_path: PathBuf,
+    /// 適用前の元の内容（バックアップ用）
+    pub original_content: String,
+    /// 適用後の新しい内容（書き込み用）
+    pub new_content: String,
+}
+
+/// `resolve_within_root` → ファイル読み込み → `parse_hunks` → `apply_hunks_to_text` を
+/// まとめて行う。読み取りのみで、実際のファイル書き込みは行わない
+/// （「適用できるかどうかの判定」と「実際に適用する」の両方から共通して呼び出される）。
+pub fn compute_fix(
+    root: &Path,
+    file_path: &str,
+    diff_code: &str,
+) -> Result<AppliedFix, UnapplicableReason> {
+    let resolved_path = resolve_within_root(root, file_path)?;
+    let original_content =
+        fs::read_to_string(&resolved_path).map_err(|_| UnapplicableReason::FileNotFound)?;
+    let hunks = parse_hunks(diff_code);
+    let new_content = apply_hunks_to_text(&original_content, &hunks)?;
+
+    Ok(AppliedFix {
+        resolved_path,
+        original_content,
+        new_content,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +372,32 @@ mod tests {
         let applied = apply_hunks_to_text(original, &hunks).unwrap();
 
         assert_eq!(applied, "a\r\nnew\r\nb\r\n");
+    }
+
+    #[test]
+    fn compute_fix_succeeds_end_to_end() {
+        let tmp = TempDir::new();
+        fs::write(tmp.path().join("app.py"), "line1\nold_value\nline3\n").unwrap();
+        let diff = "@@ -1,3 +1,3 @@\nline1\n-old_value\n+new_value\nline3\n";
+
+        let result = compute_fix(tmp.path(), "app.py", diff).unwrap();
+
+        assert_eq!(result.original_content, "line1\nold_value\nline3\n");
+        assert_eq!(result.new_content, "line1\nnew_value\nline3\n");
+        assert_eq!(
+            result.resolved_path,
+            fs::canonicalize(tmp.path().join("app.py")).unwrap()
+        );
+    }
+
+    #[test]
+    fn compute_fix_refuses_when_file_content_does_not_match_diff() {
+        let tmp = TempDir::new();
+        fs::write(tmp.path().join("app.py"), "totally different content\n").unwrap();
+        let diff = "@@ -1,1 +1,1 @@\n-old_value\n+new_value\n";
+
+        let err = compute_fix(tmp.path(), "app.py", diff).unwrap_err();
+
+        assert_eq!(err, UnapplicableReason::DiffNoMatch);
     }
 }

@@ -20,6 +20,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+# プロジェクトフォルダ選択ダイアログのみに使用（フロントエンドからはJS版プラグインを介さず、
+# 自作コマンド経由でのみ呼び出す。詳細はsrc/lib.rsのpick_project_rootを参照）。
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
