@@ -233,6 +233,19 @@ function buildVerificationChecklist(analysis: AnalysisResult): string[] {
 // コードの差分ではなく、手順（コマンド実行・再起動・ケーブル抜き差し等）で解決するタイプの修正案を
 // 番号付きのタスクリストとして表示するサブコンポーネント
 function TaskStepsView({ steps }: { steps: string[] }) {
+  // ステップごとに個別コピーできるようにする（どのステップがコピーされたかだけ2秒間表示）
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+
+  const handleCopyStep = async (step: string, idx: number) => {
+    try {
+      await navigator.clipboard.writeText(step);
+      setCopiedIdx(idx);
+      setTimeout(() => setCopiedIdx((cur) => (cur === idx ? null : cur)), 2000);
+    } catch {
+      // クリップボードAPIが使えない環境では何もしない（ボタン表示自体は変化しない）
+    }
+  };
+
   return (
     <div className="rounded-lg bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 divide-y divide-slate-100 dark:divide-slate-900/60 overflow-hidden">
       {steps.map((step, idx) => (
@@ -243,6 +256,18 @@ function TaskStepsView({ steps }: { steps: string[] }) {
           <pre className="flex-1 whitespace-pre-wrap break-words font-mono text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
             {step}
           </pre>
+          <button
+            type="button"
+            onClick={() => handleCopyStep(step, idx)}
+            title="この手順だけをコピー"
+            className="shrink-0 p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition cursor-pointer"
+          >
+            {copiedIdx === idx ? (
+              <Check className="w-3.5 h-3.5 text-emerald-500 dark:text-emerald-400" />
+            ) : (
+              <Copy className="w-3.5 h-3.5" />
+            )}
+          </button>
         </div>
       ))}
     </div>
@@ -317,6 +342,12 @@ export default function App() {
   const [realApplyResult, setRealApplyResult] = useState<{ backupId: string; appliedPath: string } | null>(
     null
   );
+  // 過去のバックアップ履歴（複数世代）を一覧表示し、任意の時点へ戻せるようにする機能
+  const [showBackupHistory, setShowBackupHistory] = useState<boolean>(false);
+  const [isLoadingBackupHistory, setIsLoadingBackupHistory] = useState<boolean>(false);
+  const [backupHistory, setBackupHistory] = useState<
+    { id: string; relativePath: string; createdAtUnixMs: number }[]
+  >([]);
 
   // APIキーの読み込み（OSキーチェーン優先、Tauri外や旧バージョンからの移行はlocalStorageにフォールバック）。
   // 他の初期化（履歴・モデル選択・テーマ等）は同期的なlocalStorage読み込みのみなので、
@@ -414,6 +445,8 @@ export default function App() {
     let cancelled = false;
     setRealApplyResult(null);
     setApplyCheck(null);
+    setBackupHistory([]);
+    setShowBackupHistory(false);
 
     if (!analysis || analysis.fixType === "task" || !projectRoot) {
       return;
@@ -529,14 +562,10 @@ export default function App() {
     showToast(`サンプル（${key}）を挿入しました`, "info");
   };
 
-  // エラー画面のスクリーンショット等の画像を選択して添付する
-  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = ""; // 同じファイルを選び直せるようにリセット
-    if (!file) return;
-
+  // エラー画面のスクリーンショット等の画像ファイルを添付する（ファイル選択・クリップボード貼り付け共通処理）
+  const processImageFile = (file: File, source: "select" | "paste") => {
     if (!file.type.startsWith("image/")) {
-      showToast("画像ファイル（PNG/JPEGなど）を選択してください", "warning");
+      if (source === "select") showToast("画像ファイル（PNG/JPEGなど）を選択してください", "warning");
       return;
     }
     if (file.size > MAX_IMAGE_BYTES) {
@@ -552,15 +581,50 @@ export default function App() {
         mimeType: file.type,
         base64,
         previewUrl: dataUrl,
-        fileName: file.name,
+        fileName: file.name || "clipboard-image.png",
       });
-      showToast(`画像「${file.name}」を添付しました`, "info");
+      showToast(
+        source === "paste" ? "クリップボードの画像を添付しました" : `画像「${file.name}」を添付しました`,
+        "info"
+      );
     };
     reader.onerror = () => showToast("画像の読み込みに失敗しました", "warning");
     reader.readAsDataURL(file);
   };
 
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // 同じファイルを選び直せるようにリセット
+    if (!file) return;
+    processImageFile(file, "select");
+  };
+
   const handleRemoveImage = () => setAttachedImage(null);
+
+  // テキストエリアへのペースト時、クリップボードに画像（スクリーンショット等）が
+  // 含まれていれば自動で添付する。通常のテキスト貼り付けは妨げない。
+  const handlePasteImage = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          e.preventDefault();
+          processImageFile(file, "paste");
+        }
+        return;
+      }
+    }
+  };
+
+  // Ctrl+Enter (macOSはCmd+Enter) で解析を実行するショートカット
+  const handleAnalyzeShortcut = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      if (!isAnalyzing) void handleAnalyze();
+    }
+  };
 
   // 解析実行（Gemini API または ローカル解析エンジンのハイブリッド）
   const handleAnalyze = async () => {
@@ -778,6 +842,8 @@ export default function App() {
       });
       setRealApplyResult(result);
       showToast(`✅ 実際に書き換えました: ${result.appliedPath}`, "success");
+      // バックアップ履歴を表示中であれば、今回作成された分も含めて最新化する
+      if (showBackupHistory) void loadBackupHistory();
     } catch (err) {
       showToast(`実ファイルへの適用に失敗しました: ${String(err).slice(0, 100)}`, "warning");
     } finally {
@@ -785,19 +851,54 @@ export default function App() {
     }
   };
 
-  // 実ファイルのロールバック（バックアップから復元する本物のロールバック）
-  const handleRealRollback = async () => {
-    if (!projectRoot || !realApplyResult) return;
+  // 指定したバックアップ世代(backupId)から実ファイルを復元する共通処理。
+  // 直近のロールバック（handleRealRollback）と、過去世代を選んでのロールバック
+  // （backupHistoryからの選択）の両方から呼び出す。
+  const handleRollbackToBackup = async (backupId: string) => {
+    if (!projectRoot) return;
     setIsRollingBackReal(true);
     try {
-      await invoke("rollback_fix", { root: projectRoot, backupId: realApplyResult.backupId });
+      await invoke("rollback_fix", { root: projectRoot, backupId });
       showToast("バックアップから元のファイル内容に復元しました", "info");
-      setRealApplyResult(null);
+      if (realApplyResult?.backupId === backupId) setRealApplyResult(null);
+      // バックアップ履歴を表示中であれば最新の状態に更新する
+      if (showBackupHistory) void loadBackupHistory();
     } catch (err) {
       showToast(`ロールバックに失敗しました: ${String(err).slice(0, 100)}`, "warning");
     } finally {
       setIsRollingBackReal(false);
     }
+  };
+
+  // 実ファイルのロールバック（直近に自分が適用した分を戻す、これまで通りのボタン）
+  const handleRealRollback = () => {
+    if (!realApplyResult) return;
+    void handleRollbackToBackup(realApplyResult.backupId);
+  };
+
+  // このファイルの過去のバックアップ一覧を取得する（読み取り専用）
+  const loadBackupHistory = async () => {
+    if (!projectRoot || !analysis) return;
+    setIsLoadingBackupHistory(true);
+    try {
+      const list = await invoke<{ id: string; relativePath: string; createdAtUnixMs: number }[]>(
+        "list_backups_for_file",
+        { root: projectRoot, filePath: analysis.filePath }
+      );
+      setBackupHistory(list);
+    } catch (err) {
+      showToast(`バックアップ履歴の取得に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      setBackupHistory([]);
+    } finally {
+      setIsLoadingBackupHistory(false);
+    }
+  };
+
+  // バックアップ履歴の開閉。開くタイミングで一覧を取得する（毎回の再描画では取得しない）
+  const handleToggleBackupHistory = () => {
+    const next = !showBackupHistory;
+    setShowBackupHistory(next);
+    if (next) void loadBackupHistory();
   };
 
   // チェックリストの各項目のON/OFFを切り替える
@@ -1140,7 +1241,9 @@ export default function App() {
             <textarea
               value={logInput}
               onChange={(e) => setLogInput(e.target.value)}
-              placeholder="ターミナルやコンソールに出力された任意のエラーログをペーストしてください..."
+              onPaste={handlePasteImage}
+              onKeyDown={handleAnalyzeShortcut}
+              placeholder="ターミナルやコンソールに出力された任意のエラーログをペーストしてください...（画像を貼り付けると自動で添付されます / Ctrl+Enterで解析実行）"
               rows={14}
               className="w-full bg-transparent p-4 font-mono text-xs text-slate-800 dark:text-slate-200 resize-none outline-none leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-600"
             />
@@ -1166,7 +1269,9 @@ export default function App() {
           <textarea
             value={descriptionInput}
             onChange={(e) => setDescriptionInput(e.target.value)}
-            placeholder="例:「保存ボタンを押すとアプリが固まる」「ログイン後に画面が真っ白になる」など、ログが手元になくても状況を自由に記述できます。"
+            onPaste={handlePasteImage}
+            onKeyDown={handleAnalyzeShortcut}
+            placeholder="例:「保存ボタンを押すとアプリが固まる」「ログイン後に画面が真っ白になる」など、ログが手元になくても状況を自由に記述できます。（Ctrl+Enterで解析実行）"
             rows={3}
             className="w-full rounded-xl border border-slate-300 dark:border-slate-800 bg-white dark:bg-slate-900/80 shadow-inner focus-within:border-cyan-500/60 focus:border-cyan-500/60 focus:ring-1 focus:ring-cyan-500/50 transition p-3 font-mono text-xs text-slate-800 dark:text-slate-200 resize-none outline-none leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-600"
           />
@@ -1658,6 +1763,58 @@ export default function App() {
                             <AlertTriangle className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400 shrink-0" />
                             <span>{describeUnapplicableReason(applyCheck?.reason ?? null)}</span>
                           </p>
+                        )}
+
+                        {/* 過去のバックアップ履歴（複数世代）。直近1件だけでなく、任意の時点まで
+                            戻せるように一覧表示する。取得は開いたときだけ行う（読み取り専用）。 */}
+                        {projectRoot && (
+                          <div className="pt-3 mt-1 border-t border-amber-500/20 space-y-2">
+                            <button
+                              type="button"
+                              onClick={handleToggleBackupHistory}
+                              className="text-xs flex items-center space-x-1.5 text-amber-700 dark:text-amber-300 hover:text-amber-900 dark:hover:text-amber-100 transition cursor-pointer"
+                            >
+                              <History className="w-3.5 h-3.5" />
+                              <span>{showBackupHistory ? "過去のバックアップ履歴を閉じる" : "過去のバックアップ履歴を見る"}</span>
+                              {showBackupHistory ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                            </button>
+
+                            {showBackupHistory &&
+                              (isLoadingBackupHistory ? (
+                                <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center space-x-1.5">
+                                  <span className="w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin shrink-0" />
+                                  <span>読み込み中...</span>
+                                </p>
+                              ) : backupHistory.length === 0 ? (
+                                <p className="text-xs text-slate-400 dark:text-slate-500">このファイルのバックアップはまだありません。</p>
+                              ) : (
+                                <div className="rounded-lg border border-amber-500/20 bg-white dark:bg-slate-950/60 divide-y divide-amber-500/10 max-h-56 overflow-y-auto">
+                                  {backupHistory.map((entry, idx) => (
+                                    <div key={entry.id} className="flex items-center justify-between gap-3 px-3 py-2">
+                                      <span className="text-xs text-slate-600 dark:text-slate-300 flex items-center space-x-1.5 min-w-0">
+                                        <Clock className="w-3.5 h-3.5 shrink-0 text-slate-400 dark:text-slate-500" />
+                                        <span className="truncate">
+                                          {new Date(entry.createdAtUnixMs).toLocaleString("ja-JP")}
+                                        </span>
+                                        {idx === 0 && (
+                                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-300">
+                                            最新
+                                          </span>
+                                        )}
+                                      </span>
+                                      <button
+                                        onClick={() => handleRollbackToBackup(entry.id)}
+                                        disabled={isRollingBackReal}
+                                        className="shrink-0 text-[11px] px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-amber-700 dark:text-amber-300 border border-amber-500/30 disabled:opacity-50 flex items-center space-x-1 transition cursor-pointer"
+                                      >
+                                        <Undo2 className="w-3 h-3" />
+                                        <span>この時点に戻す</span>
+                                      </button>
+                                    </div>
+                                  ))}
+                                </div>
+                              ))}
+                          </div>
                         )}
                       </div>
                     )}

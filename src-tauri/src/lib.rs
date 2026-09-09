@@ -266,6 +266,53 @@ fn clear_all_backups(root: String) -> Result<(), String> {
     Ok(())
 }
 
+/// バックアップ一覧の1件をフロントエンドへ返す形（camelCaseで公開する）。
+/// マニフェスト本体の `BackupEntry`（内部ストレージ形式）とは別に定義することで、
+/// 既存の manifest.json のフィールド名（snake_case）を変更せずに済ませている。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupListEntry {
+    id: String,
+    relative_path: String,
+    created_at_unix_ms: u128,
+}
+
+impl From<&BackupEntry> for BackupListEntry {
+    fn from(e: &BackupEntry) -> Self {
+        BackupListEntry {
+            id: e.id.clone(),
+            relative_path: e.relative_path.clone(),
+            created_at_unix_ms: e.created_at_unix_ms,
+        }
+    }
+}
+
+/// 指定ファイルに対する過去のバックアップ一覧を、作成日時が新しい順で返す（読み取り専用）。
+/// これまで `rollback_fix` は直近1件しか画面から選べなかったため、
+/// 任意の世代を選んで戻せるように一覧取得コマンドを追加した。
+#[tauri::command]
+fn list_backups_for_file(root: String, file_path: String) -> Result<Vec<BackupListEntry>, String> {
+    let root_path = Path::new(&root);
+
+    // check_fix_applicability / apply_fix と同じ経路でパスを安全に解決することで、
+    // 相対パス/絶対パス・大文字小文字・スラッシュの向きなどの表記ゆれを吸収する
+    let resolved = resolve_within_root(root_path, &file_path)
+        .map_err(|reason| format!("対象ファイルの安全確認に失敗しました ({})", reason.as_str()))?;
+    let relative_path = relative_path_string(root_path, &resolved)?;
+
+    let entries = read_manifest(root_path)?;
+    let mut matched: Vec<BackupListEntry> = entries
+        .iter()
+        .filter(|e| e.relative_path == relative_path)
+        .map(BackupListEntry::from)
+        .collect();
+    // manifestには常に作成順（古い→新しい）で追記されるため、単純に反転すれば新しい順になる。
+    // created_at_unix_ms(ミリ秒)でのソートは、高速なテスト実行等で複数件が同一ミリ秒に
+    // なり得ることを考えると不安定なため、挿入順の反転による決定的な方法をあえて採る。
+    matched.reverse();
+    Ok(matched)
+}
+
 /// `apply_fix` が作成したバックアップから、対象ファイルの内容を復元する。
 /// バックアップファイル自体は削除しない（監査証跡・多重ロールバックの安全のため）。
 #[tauri::command]
@@ -429,6 +476,39 @@ mod tests {
     }
 
     #[test]
+    fn list_backups_for_file_returns_matching_entries_newest_first() {
+        let tmp = TempDir::new();
+        let root = tmp.0.to_string_lossy().to_string();
+        fs::write(tmp.0.join("sample.py"), "line1\nold_value\nline3\n").unwrap();
+        fs::write(tmp.0.join("other.py"), "a\n").unwrap();
+
+        let diff1 = "@@ -1,3 +1,3 @@\nline1\n-old_value\n+new_value\nline3\n".to_string();
+        let applied1 = apply_fix(root.clone(), "sample.py".to_string(), diff1).unwrap();
+
+        let diff2 = "@@ -1,3 +1,3 @@\nline1\n-new_value\n+newer_value\nline3\n".to_string();
+        let applied2 = apply_fix(root.clone(), "sample.py".to_string(), diff2).unwrap();
+
+        let list = list_backups_for_file(root, "sample.py".to_string()).unwrap();
+
+        assert_eq!(list.len(), 2);
+        // 新しい順（2回目に作られたバックアップが先頭）
+        assert_eq!(list[0].id, applied2.backup_id);
+        assert_eq!(list[1].id, applied1.backup_id);
+        assert!(list.iter().all(|e| e.relative_path == "sample.py"));
+    }
+
+    #[test]
+    fn list_backups_for_file_returns_empty_when_no_backups_exist_for_that_file() {
+        let tmp = TempDir::new();
+        let root = tmp.0.to_string_lossy().to_string();
+        fs::write(tmp.0.join("untouched.py"), "a\n").unwrap();
+
+        let list = list_backups_for_file(root, "untouched.py".to_string()).unwrap();
+
+        assert!(list.is_empty());
+    }
+
+    #[test]
     fn apply_fix_refuses_and_writes_nothing_when_diff_does_not_match() {
         let tmp = TempDir::new();
         let root = tmp.0.to_string_lossy().to_string();
@@ -459,7 +539,8 @@ pub fn run() {
             check_fix_applicability,
             apply_fix,
             rollback_fix,
-            clear_all_backups
+            clear_all_backups,
+            list_backups_for_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
