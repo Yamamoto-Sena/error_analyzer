@@ -23,6 +23,8 @@ export interface AnalysisResult {
   quotaExceededModels?: string[];
   /** 修正箇所に関連する公式ドキュメントへのリンク（判別できた場合のみ） */
   officialDocLink?: OfficialDocLink;
+  /** Gemini解析時、送信前にログ中の機密情報らしき箇所をマスクした件数（0件/未使用時は省略） */
+  maskedSecretsCount?: number;
 }
 
 export interface OfficialDocLink {
@@ -74,6 +76,54 @@ export function getOfficialDocLink(errorType: string, contextText: string = ""):
     return {
       label: "MDN Web Docs: オリジン間リソース共有（CORS）ガイド",
       url: "https://developer.mozilla.org/ja/docs/Web/HTTP/CORS",
+    };
+  }
+  if (/ERESOLVE/i.test(haystack)) {
+    return {
+      label: "npm 公式ドキュメント: --legacy-peer-deps オプション",
+      url: "https://docs.npmjs.com/cli/v10/using-npm/config#legacy-peer-deps",
+    };
+  }
+  if (/EACCES|permission denied/i.test(haystack)) {
+    return {
+      label: "Node.js 公式: エラーコード一覧（EACCES ほか）",
+      url: "https://nodejs.org/api/errors.html#common-system-errors",
+    };
+  }
+  if (/docker/i.test(haystack)) {
+    return {
+      label: "Docker 公式ドキュメント: system prune（不要リソースの削除）",
+      url: "https://docs.docker.com/engine/reference/commandline/system_prune/",
+    };
+  }
+  if (/CONFLICT \(content\)|Automatic merge failed|would be overwritten by merge|stash them/i.test(haystack)) {
+    return {
+      label: "Git 公式ドキュメント: git merge",
+      url: "https://git-scm.com/docs/git-merge",
+    };
+  }
+  if (/error TS\d{4,5}:/i.test(haystack)) {
+    return {
+      label: "TypeScript 公式ハンドブック",
+      url: "https://www.typescriptlang.org/docs/handbook/intro.html",
+    };
+  }
+  if (/heap out of memory|Allocation failed/i.test(haystack)) {
+    return {
+      label: "Node.js 公式: --max-old-space-size オプション",
+      url: "https://nodejs.org/api/cli.html#--max-old-space-sizesize-in-mib",
+    };
+  }
+  if (/NullPointerException/i.test(haystack)) {
+    return {
+      label: "Oracle Java 公式ドキュメント: NullPointerException",
+      url: "https://docs.oracle.com/javase/8/docs/api/java/lang/NullPointerException.html",
+    };
+  }
+  if (/JSON/i.test(haystack) && /Unexpected token|Unexpected end|not valid JSON/i.test(haystack)) {
+    return {
+      label: "MDN Web Docs: JSON.parse() リファレンス",
+      url: "https://developer.mozilla.org/ja/docs/Web/JavaScript/Reference/Global_Objects/JSON/parse",
     };
   }
 
@@ -267,6 +317,37 @@ npm install ${pkgName}
     };
   }
 
+  // 3.6. JSON.parse 構文解析エラー
+  // ("Unexpected token ... in JSON" は下記4.の汎用SyntaxError判定にもマッチしてしまうため、
+  //  JSON特有の原因（APIがHTML/空文字を返した等）をより的確に案内できるよう、汎用判定より先に判定する)
+  if (/Unexpected token .* in JSON/i.test(log) || /Unexpected end of JSON input/i.test(log) || /is not valid JSON/i.test(log)) {
+    return {
+      errorType: "JSON.parse: JSON構文解析エラー",
+      summary: "JSON形式として不正な文字列をパース（解析）しようとしました。",
+      rootCause: "APIレスポンスが期待通りのJSONではなかった（HTMLのエラーページが返ってきた、空文字だった等）か、設定ファイル・JSON文字列自体にカンマの過不足や引用符の閉じ忘れがあります。",
+      filePath: location.file,
+      lineNumber: `${location.line}行目`,
+      diffCode: `--- a/${location.file}
++++ b/${location.file}
+@@ -${location.line},3 +${location.line},5 @@
+-const data = JSON.parse(responseText);
++let data;
++try {
++  data = JSON.parse(responseText);
++} catch (e) {
++  console.error("JSONパースに失敗した実際のレスポンス:", responseText);
++  throw e;
++}`,
+      learningTitle: "💡 学習ポイント: JSON.parseの前にレスポンス内容を疑う",
+      learningContent: "JSON.parseのエラーは『渡された文字列がそもそもJSONとして壊れている』ことを意味します。APIがエラー時にHTMLやプレーンテキストを返すケースは多いので、パース前に実際のレスポンス内容をログ出力して確認するのが近道です。",
+      preventionTips: [
+        "fetch後にresponse.okを確認してからJSON.parseする",
+        "パース処理はtry/catchで囲み、失敗時に元の文字列をログ出力する",
+        "APIサーバー側のエラーレスポンス形式を統一する",
+      ],
+    };
+  }
+
   // 4. SyntaxError / 構文エラー
   if (/SyntaxError/i.test(log) || /Unexpected token/i.test(log)) {
     return {
@@ -341,7 +422,240 @@ npm install ${pkgName}
     };
   }
 
-  // 7. 汎用フォールバック（未知のエラーログ）
+  // 7. npm/pnpm 依存関係解決エラー (ERESOLVE / peer dependency conflict)
+  if (/ERESOLVE/i.test(log)) {
+    const peerMatch = log.match(/peer\s+(\S+@\S+)/i);
+    const peerName = peerMatch ? peerMatch[1] : "依存パッケージ";
+
+    return {
+      errorType: "ERESOLVE: npm 依存関係の競合",
+      summary: `インストールしようとしたパッケージが要求するバージョンと、既存の依存関係（特に '${peerName}'）のバージョンが競合しています。`,
+      rootCause: "npmはデフォルトでは依存関係のバージョンが厳密に一致しない場合、自動解決をせずにインストールを中断します（peer dependencyの衝突）。",
+      filePath: "package.json",
+      lineNumber: "dependencies / devDependencies",
+      fixType: "task",
+      taskSteps: [
+        "package.json の該当パッケージのバージョン指定を、エラーメッセージが要求するバージョン範囲に合わせて更新する",
+        "一時的な回避策として --legacy-peer-deps オプションを付けて再インストールする\nnpm install --legacy-peer-deps",
+        "pnpmを使用している場合は pnpm install を実行し、pnpm-lock.yaml 上の解決結果を確認する",
+      ],
+      diffCode: `# 一時的な回避策（根本解決ではないため注意）
+npm install --legacy-peer-deps
+
+# 根本的には package.json の該当パッケージのバージョンを
+# エラーメッセージが要求するバージョン範囲に合わせて修正してください`,
+      learningTitle: "💡 学習ポイント: npmの peer dependency（ピア依存関係）",
+      learningContent: "peer dependencyとは「このパッケージを使うなら、ホスト側にこのバージョンのライブラリも入れておいてね」という間接的な依存関係です。npm 7以降はこの整合性を厳密にチェックするため、バージョンが噛み合わないとインストール自体が失敗します。",
+      preventionTips: [
+        "package.json の依存バージョンはできるだけ最新の安定版に揃える",
+        "--legacy-peer-deps は一時しのぎと割り切り、根本的にはバージョンを揃える",
+        "pnpm/yarnなど別のパッケージマネージャーでは挙動が異なる点に注意する",
+      ],
+    };
+  }
+
+  // 8. EACCES / Permission denied（権限不足）
+  if (/EACCES/i.test(log) || /permission denied/i.test(log)) {
+    return {
+      errorType: "EACCES: 権限不足エラー",
+      summary: "ファイルまたはディレクトリへのアクセス権限が不足しているため、処理が拒否されました。",
+      rootCause: "対象のファイル・フォルダの所有者や権限設定（パーミッション）が、現在実行しているユーザーの書き込み・実行を許可していません。グローバルインストールや保護されたディレクトリへの書き込み時によく発生します。",
+      filePath: location.file,
+      lineNumber: `${location.line}行目`,
+      fixType: "task",
+      taskSteps: [
+        "【Windows】管理者としてPowerShell/コマンドプロンプトを起動して再実行する",
+        "【macOS/Linux】対象フォルダの所有者を自分に変更する\nsudo chown -R $(whoami) 対象のフォルダパス",
+        "npmのグローバルインストール権限エラーの場合は、nvm等でNode.jsをユーザー権限にインストールし直すことも検討する",
+      ],
+      diffCode: `# [Windows] 管理者権限のPowerShellで再実行するか、
+# 対象フォルダのプロパティ→セキュリティタブで書き込み権限を確認してください
+
+# [macOS/Linux]
+sudo chown -R $(whoami) 対象のフォルダパス`,
+      learningTitle: "💡 学習ポイント: ファイルパーミッションとOSのアクセス制御",
+      learningContent: "OSは各ファイル・フォルダに「誰が読み書き実行できるか」という権限情報を持っています。特にシステムディレクトリ等グローバルな場所への書き込みは、意図しない破壊を防ぐため通常のユーザー権限では拒否されます。",
+      preventionTips: [
+        "むやみに sudo / 管理者権限を使わず、まず権限不足の理由を確認する",
+        "npmのグローバルインストール先をユーザーディレクトリ配下に変更しておくと権限エラーを避けやすい",
+        "プロジェクトのファイルは可能な限り自分の権限で完結する場所に置く",
+      ],
+    };
+  }
+
+  // 9. Docker関連エラー（デーモン未起動 / ディスク容量不足）
+  if (/Cannot connect to the Docker daemon/i.test(log) || /docker daemon/i.test(log) || /no space left on device/i.test(log)) {
+    const isDiskFull = /no space left on device/i.test(log);
+
+    return {
+      errorType: isDiskFull ? "Docker: ディスク容量不足エラー" : "Docker: デーモン未起動エラー",
+      summary: isDiskFull
+        ? "Dockerが使用しているディスク容量が上限に達しており、イメージ・コンテナの処理が失敗しています。"
+        : "Docker Desktop（またはDockerデーモン）が起動していないため、Dockerコマンドが実行できません。",
+      rootCause: isDiskFull
+        ? "使わなくなった古いDockerイメージ・コンテナ・ビルドキャッシュ・ボリュームがディスク上に蓄積し、Dockerに割り当てられた容量を圧迫しています。"
+        : "Dockerクライアント（CLI）はデーモン（バックグラウンドの実行プロセス）と通信して動作しますが、Docker Desktopが未起動、またはクラッシュしているためデーモンに接続できません。",
+      filePath: "Docker Desktop / dockerd",
+      lineNumber: "-",
+      fixType: "task",
+      taskSteps: isDiskFull
+        ? [
+            "不要なコンテナ・イメージ・ビルドキャッシュをまとめて削除する（実行前に必要なコンテナが無いか確認）\ndocker system prune -a --volumes",
+            "削除後、ディスク使用状況を確認する\ndocker system df",
+          ]
+        : [
+            "Docker Desktopアプリケーションを起動する（タスクトレイに常駐しているか確認）",
+            "起動後、数十秒待ってから再度Dockerコマンドを実行する",
+            "それでも解決しない場合はPCを再起動する",
+          ],
+      diffCode: isDiskFull
+        ? `# 不要なDockerリソースを一括削除（要確認: 稼働中の必要なコンテナが無いか事前に確認）
+docker system prune -a --volumes`
+        : `# Docker Desktopを起動してから再実行してください
+docker info  # デーモンに接続できるか確認`,
+      learningTitle: isDiskFull ? "💡 学習ポイント: Dockerのディスク使用量管理" : "💡 学習ポイント: Dockerクライアントとデーモンの関係",
+      learningContent: isDiskFull
+        ? "Dockerはビルドのたびに中間レイヤーやキャッシュを蓄積します。定期的に docker system prune で掃除しないと、気づかぬうちにディスクを圧迫します。"
+        : "`docker` コマンド自体はただの操作窓口（クライアント）で、実際の処理はバックグラウンドの `dockerd`（デーモン）が行います。デーモンが起動していないとどんなdockerコマンドも失敗します。",
+      preventionTips: isDiskFull
+        ? ["定期的に docker system df で使用量を確認する", "CI環境では自動的にpruneするジョブを組んでおく"]
+        : ["開発開始時にDocker Desktopが起動しているかまず確認する習慣をつける", "OS起動時にDocker Desktopが自動起動する設定にしておく"],
+    };
+  }
+
+  // 10. Git関連エラー（未コミット変更との衝突 / マージコンフリクト）
+  if (/CONFLICT \(content\)/i.test(log) || /Automatic merge failed/i.test(log) || /would be overwritten by merge/i.test(log) || /Please commit your changes or stash them/i.test(log)) {
+    const isUncommitted = /would be overwritten by merge/i.test(log) || /Please commit your changes or stash them/i.test(log);
+
+    return {
+      errorType: isUncommitted ? "Git: 未コミットの変更による競合" : "Git: マージコンフリクト",
+      summary: isUncommitted
+        ? "ローカルに未コミットの変更が残っているため、Gitが安全にマージ/切り替えができず処理を中断しました。"
+        : "マージしようとした2つのブランチが同じ箇所を異なる内容に変更しており、Gitが自動でどちらを採用すべきか判断できていません。",
+      rootCause: isUncommitted
+        ? "作業ツリー（ワーキングディレクトリ）に未コミットの変更が残ったまま git pull / git merge / git checkout を実行すると、その変更が上書きされて失われる恐れがあるため、Gitは安全側に倒して処理を拒否します。"
+        : "同じファイルの同じ行付近が、マージ元・マージ先の両方で別々に変更されているため、Gitのアルゴリズムでは自動統合できません。",
+      filePath: location.file !== "設定・起動プロセス (vite.config.ts / src-tauri)" ? location.file : "(コンフリクトが発生したファイル)",
+      lineNumber: "<<<<<<< / ======= / >>>>>>> の間",
+      fixType: "task",
+      taskSteps: isUncommitted
+        ? [
+            "変更を一旦コミットする\ngit add . && git commit -m \"作業中の変更を保存\"",
+            "またはコミットせず一時退避する\ngit stash",
+            "処理完了後、退避した変更を戻す場合は git stash pop",
+          ]
+        : [
+            "コンフリクトが発生したファイルを開き、<<<<<<< / ======= / >>>>>>> で囲まれた範囲を確認する",
+            "どちらの内容を採用するか（または両方を統合するか）を決めてマーカーを手動で編集・削除する",
+            "解決後にステージしてマージを完了する\ngit add <ファイル名> && git commit",
+          ],
+      diffCode: isUncommitted
+        ? `# 変更を退避してから再実行
+git stash
+git pull
+git stash pop`
+        : `<<<<<<< HEAD
+（自分のブランチの内容）
+=======
+（マージ元ブランチの内容）
+>>>>>>> マージ元ブランチ名
+
+# ↑ このマーカー部分を、採用したい内容だけが残るように手動で編集してください`,
+      learningTitle: isUncommitted ? "💡 学習ポイント: Gitが「安全側」に倒す設計思想" : "💡 学習ポイント: コンフリクトマーカーの読み方",
+      learningContent: isUncommitted
+        ? "Gitは「変更を失うかもしれない操作」を検知すると、自動では実行せずユーザーに確認を求めます。これはミスによるデータ消失を防ぐための安全設計です。"
+        : "コンフリクトマーカーの `<<<<<<< HEAD` から `=======` までが自分側の変更、`=======` から `>>>>>>> ブランチ名` までが相手側の変更です。落ち着いてどちらを残すか判断しましょう。",
+      preventionTips: isUncommitted
+        ? ["作業中はこまめにコミットする習慣をつける", "pull前に git status で作業ツリーの状態を確認する"]
+        : ["こまめにpull/mergeして差分を小さく保つ", "同じファイルを複数人で同時に編集する際は事前にコミュニケーションを取る", "コンフリクト解決後は必ず動作確認してからコミットする"],
+    };
+  }
+
+  // 11. TypeScript コンパイルエラー (error TSxxxx)
+  if (/error TS\d{4,5}:/i.test(log)) {
+    const tsMatch = log.match(/error TS(\d{4,5}):\s*(.+)/i);
+    const tsCode = tsMatch ? tsMatch[1] : "????";
+    const tsMessage = tsMatch ? tsMatch[2].trim() : "型エラー";
+
+    return {
+      errorType: `TypeScript: コンパイルエラー (TS${tsCode})`,
+      summary: `TypeScriptの型チェックでエラーが検出されました: ${tsMessage.slice(0, 100)}`,
+      rootCause: `コードの型定義と、実際に渡している値・戻り値の型が一致していません（TS${tsCode}）。実行前の静的解析（tsc）の段階でこの不一致が検出されています。`,
+      filePath: location.file,
+      lineNumber: `${location.line}行目`,
+      diffCode: `--- a/${location.file}
++++ b/${location.file}
+@@ -${location.line},2 +${location.line},2 @@
+# エラーメッセージの型定義に合わせて、変数の型注釈や渡す値を修正してください
+# 例: 引数の型を合わせる、Optional(?)を付ける、as で明示的にキャストする 等
+# 詳細: ${tsMessage}`,
+      learningTitle: "💡 学習ポイント: TypeScriptの型エラーは「実行前」に守ってくれるガードレール",
+      learningContent: "TypeScriptのコンパイルエラーは、実行時に起きたかもしれないバグを事前に検出してくれています。エラーメッセージに書かれている『期待される型』と『実際に渡されている型』を比較し、どちらを直すべきか判断しましょう。",
+      preventionTips: [
+        "any型を安易に使わず、具体的な型・interfaceを定義する",
+        "エディタの型エラー表示（赤い波線）をこまめに確認しながらコーディングする",
+        "strict モードを有効にして早期に型不整合を検出する",
+      ],
+    };
+  }
+
+  // 12. JavaScript ヒープメモリ不足 (OutOfMemory)
+  if (/JavaScript heap out of memory/i.test(log) || /FATAL ERROR.*Allocation failed/i.test(log)) {
+    return {
+      errorType: "OutOfMemory: メモリ不足エラー",
+      summary: "Node.jsプロセスが使用可能なメモリの上限に達し、強制終了しました。",
+      rootCause: "大きなデータの一括処理、無限ループによるメモリリーク、または大規模プロジェクトのビルド処理がNode.jsのデフォルトメモリ上限（通常約1.5〜2GB）を超えたことが原因です。",
+      filePath: "実行コマンド（npm run build 等）",
+      lineNumber: "-",
+      fixType: "task",
+      taskSteps: [
+        "Node.jsのメモリ上限を一時的に引き上げて再実行する（PowerShellの場合）\n$env:NODE_OPTIONS=\"--max-old-space-size=4096\"; npm run build",
+        "bash/zshの場合\nNODE_OPTIONS=--max-old-space-size=4096 npm run build",
+        "根本対策として、処理対象データを分割する・不要な変数参照を解放する等メモリ使用量そのものを見直す",
+      ],
+      diffCode: `# メモリ上限を一時的に引き上げる (PowerShell)
+$env:NODE_OPTIONS="--max-old-space-size=4096"; npm run build
+
+# (bash/zshの場合)
+NODE_OPTIONS=--max-old-space-size=4096 npm run build`,
+      learningTitle: "💡 学習ポイント: Node.jsのメモリ管理とヒープ",
+      learningContent: "Node.js(V8エンジン)はデフォルトで確保するメモリ（ヒープ）に上限があります。大量データの処理やメモリリークがあると、この上限に達してプロセスごと強制終了されます。",
+      preventionTips: [
+        "大量データはストリーム処理やページング（分割処理）で扱う",
+        "不要になったイベントリスナーやキャッシュを明示的に解放する",
+        "メモリ使用量が急増していないか、開発時にプロファイラで確認する習慣をつける",
+      ],
+    };
+  }
+
+  // 13. Java NullPointerException
+  if (/java\.lang\.NullPointerException/i.test(log)) {
+    return {
+      errorType: "NullPointerException: Java Null参照エラー",
+      summary: "null（未初期化）のオブジェクトに対してメソッド呼び出しやフィールドアクセスを行おうとしました。",
+      rootCause: "対象の変数が期待した値ではなくnullのまま処理に渡され、そのnullに対して .メソッド() や .フィールド のアクセスを行ったため例外が発生しました。",
+      filePath: location.file,
+      lineNumber: `${location.line}行目`,
+      diffCode: `--- a/${location.file}
++++ b/${location.file}
+@@ -${location.line},3 +${location.line},5 @@
+-result.getValue();
++if (result != null) {
++    result.getValue();
++} else {
++    // nullの場合の処理をここに記述
++}`,
+      learningTitle: "💡 学習ポイント: JavaにおけるNullPointerExceptionとOptional",
+      learningContent: "Javaの参照型変数は初期化されていないとnullになります。null状態のオブジェクトへアクセスするとNullPointerException（通称NPE）が発生します。Java 8以降はOptional<T>を使うことで、nullの可能性を型として明示できます。",
+      preventionTips: [
+        "外部から受け取る値やDB検索結果は必ずnullチェックを行う",
+        "Optional<T>を活用してnullの可能性を明示する",
+        "@NonNull / @Nullableアノテーションで静的解析ツールにnull安全性をチェックさせる",
+      ],
+    };
+  }
+
+  // 14. 汎用フォールバック（未知のエラーログ）
   const firstLine = log.split("\n").find((l) => l.trim().length > 0) || "エラーが発生しました";
   return {
     errorType: "Detected Runtime Exception / エラー",

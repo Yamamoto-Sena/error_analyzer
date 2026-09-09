@@ -96,6 +96,29 @@ describe("analyzeWithGemini", () => {
     await expect(analyzeWithGemini("log", "KEY", "gemini-3.5-flash-lite")).rejects.toThrow(/タイムアウト/);
   });
 
+  it("送信前にログ内のAPIキー等をマスクし、maskedSecretsCountを結果に含める", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse("gemini-3.5-flash-lite-001"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const log = "起動失敗\nAPI_KEY=sk-topsecret1234567890\n連絡先: dev@example.com";
+    const result = await analyzeWithGemini(log, "FAKE_KEY", "gemini-3.5-flash-lite");
+
+    const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const sentBody = options.body as string;
+    expect(sentBody).not.toContain("sk-topsecret1234567890");
+    expect(sentBody).not.toContain("dev@example.com");
+    expect(result.maskedSecretsCount).toBe(2);
+  });
+
+  it("マスク対象が無い場合はmaskedSecretsCountを付与しない", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse("gemini-3.5-flash-lite-001"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await analyzeWithGemini("TypeError: x is not a function", "FAKE_KEY", "gemini-3.5-flash-lite");
+
+    expect(result.maskedSecretsCount).toBeUndefined();
+  });
+
   it("すべての候補モデルが失敗した場合は最終エラーをthrowする", async () => {
     // 呼び出しのたびに新しいResponseを返す(同一インスタンスを使い回すとbodyが
     // 2回目以降 "already been read" エラーになるため)

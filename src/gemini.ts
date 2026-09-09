@@ -1,5 +1,6 @@
 import { AnalysisResult, getOfficialDocLink } from "./analyzer";
 import { FALLBACK_MODEL_IDS } from "./models";
+import { maskSensitiveInfo } from "./sanitize";
 
 // エラー画面のスクリーンショット等、Geminiに渡す画像データ（base64・MIMEタイプ）
 export interface GeminiImagePart {
@@ -15,12 +16,16 @@ export async function analyzeWithGemini(
   images: GeminiImagePart[] = []
 ): Promise<AnalysisResult> {
   const hasImages = images.length > 0;
+  // 外部API（Gemini）へ送信する直前に、ログ内のAPIキー・トークン・パスワード・
+  // メールアドレス・パブリックIP等の機密情報らしき文字列をマスクする。
+  // ローカルの解析（analyzer.ts）やUI表示には影響しない、送信専用の処理。
+  const { sanitized: sanitizedLog, maskedCount } = maskSensitiveInfo(log);
   const prompt = `あなたは新人エンジニアを指導する親切で極めて優秀なシニアテックリードです。
 以下の情報（エラーログ・スタックトレース、および/またはユーザーが自分の言葉で書いた症状・状況の説明）を深く読み解き、新人エンジニアが根本から理解・再発防止できるように、必ず指定されたJSONフォーマットのみで回答してください。Markdownのバッククォート（\`\`\`json）も含めず、純粋なJSONオブジェクトのみを出力してください。
 明確な例外メッセージやスタックトレースがなく、ユーザーによる自然文の症状説明のみが与えられた場合でも、記述内容から最も可能性の高い原因・エラー種別を推測し、断定を避けつつも具体的な仮説として提示してください。
 
 【入力内容】
-${log.trim() ? log : "(構造化されたログはありません。添付された画像や自然文の説明のみを参照して解析してください)"}
+${sanitizedLog.trim() ? sanitizedLog : "(構造化されたログはありません。添付された画像や自然文の説明のみを参照して解析してください)"}
 ${
   hasImages
     ? `
@@ -204,6 +209,8 @@ ${
         quotaExceededModels: quotaExceededModels.length > 0 ? [...quotaExceededModels] : undefined,
         // 修正箇所に関連する公式ドキュメント（判別できた場合のみ）
         officialDocLink: getOfficialDocLink(errorType, log) ?? undefined,
+        // 送信前にマスクした機密情報らしき箇所の件数（ユーザーへの透明性表示用）
+        maskedSecretsCount: maskedCount > 0 ? maskedCount : undefined,
       };
     } catch (err) {
       lastError = err as Error;

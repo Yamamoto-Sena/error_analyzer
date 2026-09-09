@@ -600,17 +600,22 @@ export default function App() {
           selectedModel,
           hasImage ? [{ mimeType: attachedImage!.mimeType, data: attachedImage!.base64 }] : []
         );
+        // 送信前にAPIキーやメールアドレス等の機密情報らしき箇所をマスクした場合は、
+        // ユーザーが「何が送られたか」を把握できるよう明示する
+        const maskNote = result.maskedSecretsCount
+          ? `（🔒 送信前に機密情報らしき箇所を${result.maskedSecretsCount}件マスクしました）`
+          : "";
         if (result.usedFallbackModel) {
           // 指定モデルが混雑/RPD(1日の上限)超過等で使えず、別モデルに自動切替した場合は明示する
           const quotaNote = result.quotaExceededModels?.length
             ? `（上限超過: ${result.quotaExceededModels.join(", ")}）`
             : "";
           showToast(
-            `⚠️ ${selectedModelLabel} は利用できず、${result.modelUsed} で解析しました${quotaNote}`,
+            `⚠️ ${selectedModelLabel} は利用できず、${result.modelUsed} で解析しました${quotaNote}${maskNote}`,
             "warning"
           );
         } else {
-          showToast(`✨ ${result.modelUsed ?? selectedModelLabel} による高精度解析が完了しました！`, "success");
+          showToast(`✨ ${result.modelUsed ?? selectedModelLabel} による高精度解析が完了しました！${maskNote}`, "success");
         }
       } else {
         // 2. ローカル解析エンジンでフォールバック（画像は読み取れないためテキストのみ）
