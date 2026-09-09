@@ -39,12 +39,22 @@ import {
   FolderOpen,
   Save,
   Trash2,
+  Coins,
+  GitBranch,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { analyzeErrorLog, AnalysisResult } from "./analyzer";
-import { analyzeWithGemini } from "./gemini";
-import { AVAILABLE_MODELS, DEFAULT_MODEL } from "./models";
+import { analyzeWithGemini, listAvailableModels } from "./gemini";
+import { AVAILABLE_MODELS, DEFAULT_MODEL, GeminiModelOption } from "./models";
+import TerminalWatchModal from "./TerminalWatchModal";
+
+// プロジェクトのGit作業ツリーが汚れていないかの判定結果(Rust側 check_git_dirty の戻り値)
+interface GitDirtyStatus {
+  isGitRepo: boolean;
+  isDirty: boolean;
+  changedFileCount: number;
+}
 
 // 実ファイルへ安全適用できるかどうかの判定結果(Rust側 check_fix_applicability の戻り値)
 interface FixApplyCheck {
@@ -301,6 +311,14 @@ export default function App() {
 
   // 使用するGeminiモデルの選択
   const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODEL);
+  // モデル一覧はmodels.tsのハードコードを初期値とし、APIキー設定時にGoogle側から
+  // 動的取得できればそちらに差し替える（取得失敗時はハードコードのままフォールバック）。
+  const [availableModels, setAvailableModels] = useState<GeminiModelOption[]>(AVAILABLE_MODELS);
+  // Gemini解析のトークン消費量（このセッションでの累計。ローカルに永続化する）
+  const [sessionTokenTotal, setSessionTokenTotal] = useState<number>(0);
+  // プロジェクトのGit作業ツリーが汚れていないかの判定結果(実ファイル適用前の注意喚起用)
+  const [gitDirtyStatus, setGitDirtyStatus] = useState<GitDirtyStatus | null>(null);
+  const [showTerminalWatchModal, setShowTerminalWatchModal] = useState<boolean>(false);
 
   // テーマ管理（ライト / ダーク）
   const [theme, setTheme] = useState<"light" | "dark">("dark");
@@ -416,7 +434,60 @@ export default function App() {
     } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
       setTheme("light");
     }
+
+    const savedTokenTotal = Number(localStorage.getItem("debug_buddy_token_total") ?? "0");
+    if (Number.isFinite(savedTokenTotal) && savedTokenTotal > 0) {
+      setSessionTokenTotal(savedTokenTotal);
+    }
   }, []);
+
+  // APIキーが設定されている間、そのキーで実際に使えるGeminiモデル一覧を動的取得する。
+  // models.ts のハードコードはGoogle側のラインナップ変更に追従できないための保険であり、
+  // 取得できた場合はそちらを優先し、失敗時(オフライン・権限不足等)はハードコードのまま使う。
+  useEffect(() => {
+    if (!apiKey) {
+      setAvailableModels(AVAILABLE_MODELS);
+      return;
+    }
+    let cancelled = false;
+    listAvailableModels(apiKey)
+      .then((fetched) => {
+        if (cancelled || fetched.length === 0) return;
+        // 現在選択中のモデルが一覧に無い場合(廃止モデル等)でも選択自体は維持できるよう、先頭に補う
+        const merged = fetched.some((m) => m.value === selectedModel)
+          ? fetched
+          : [{ value: selectedModel, label: `${selectedModel}（現在の選択）` }, ...fetched];
+        setAvailableModels(merged);
+      })
+      .catch(() => {
+        // オフライン・キー不正等: これまで通りハードコードされた一覧にフォールバックする
+        if (!cancelled) setAvailableModels(AVAILABLE_MODELS);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiKey]);
+
+  // プロジェクトフォルダが選択されている間、Git作業ツリーが汚れていないかを判定する
+  // (読み取り専用。git未インストール/Git管理外の場合はisGitRepo:falseとして扱われ、警告は出ない)
+  useEffect(() => {
+    if (!projectRoot) {
+      setGitDirtyStatus(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<GitDirtyStatus>("check_git_dirty", { root: projectRoot })
+      .then((status) => {
+        if (!cancelled) setGitDirtyStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setGitDirtyStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectRoot]);
 
   // テーマの切り替えを <html> クラスへ反映し、選択を保存する
   useEffect(() => {
@@ -480,7 +551,7 @@ export default function App() {
     localStorage.setItem("debug_buddy_gemini_model", value);
   };
 
-  const selectedModelLabel = AVAILABLE_MODELS.find((m) => m.value === selectedModel)?.label ?? selectedModel;
+  const selectedModelLabel = availableModels.find((m) => m.value === selectedModel)?.label ?? selectedModel;
 
   // 検索クエリで履歴を絞り込む（全角/半角・大文字小文字・日本語表記ゆれを吸収）
   const searchedHistory = useMemo(() => {
@@ -626,11 +697,14 @@ export default function App() {
     }
   };
 
-  // 解析実行（Gemini API または ローカル解析エンジンのハイブリッド）
-  const handleAnalyze = async () => {
-    const hasLog = logInput.trim().length > 0;
-    const hasDescription = descriptionInput.trim().length > 0;
-    const hasImage = !!attachedImage;
+  // 解析実行（Gemini API または ローカル解析エンジンのハイブリッド）。
+  // `overrideLog` が指定された場合（ターミナル監視モードからの自動解析）は、
+  // logInputへの反映を待たずその文字列をそのまま解析対象にする(setState後の非同期タイミング問題を回避するため)。
+  const handleAnalyze = async (overrideLog?: string) => {
+    const effectiveLog = overrideLog ?? logInput;
+    const hasLog = effectiveLog.trim().length > 0;
+    const hasDescription = overrideLog === undefined && descriptionInput.trim().length > 0;
+    const hasImage = overrideLog === undefined && !!attachedImage;
     if (!hasLog && !hasDescription && !hasImage) return;
 
     // 画像・説明文のみでAPIキー未設定の場合、ローカル解析エンジンでは十分な解析ができないため中断する
@@ -641,7 +715,7 @@ export default function App() {
 
     // ログ（スタックトレース等）と、自由記述の症状説明を統合して解析対象とする
     const combinedText = [
-      hasLog ? `【エラーログ / スタックトレース】\n${logInput.trim()}` : "",
+      hasLog ? `【エラーログ / スタックトレース】\n${effectiveLog.trim()}` : "",
       hasDescription ? `【エラー内容・症状の説明（ユーザー記述）】\n${descriptionInput.trim()}` : "",
     ]
       .filter(Boolean)
@@ -680,6 +754,15 @@ export default function App() {
           );
         } else {
           showToast(`✨ ${result.modelUsed ?? selectedModelLabel} による高精度解析が完了しました！${maskNote}`, "success");
+        }
+
+        // トークン消費量をセッション累計に加算して永続化する（画面表示用。要件定義書5.3対応）
+        if (result.tokenUsage) {
+          setSessionTokenTotal((prev) => {
+            const next = prev + result.tokenUsage!.totalTokens;
+            localStorage.setItem("debug_buddy_token_total", String(next));
+            return next;
+          });
         }
       } else {
         // 2. ローカル解析エンジンでフォールバック（画像は読み取れないためテキストのみ）
@@ -726,6 +809,22 @@ export default function App() {
     setVerificationResult(null);
     setVerifyLogInput("");
     showToast("入力内容をリセットしました", "info");
+  };
+
+  // ターミナル監視モードがエラーらしき出力を検知した際に呼ばれる。
+  // autoAnalyze=false の場合はログ欄にセットするだけ(API呼び出しは行わず、ユーザー自身の
+  // 「エラーを解析する」クリックを待つ)。autoAnalyze=true はユーザーが明示的にオプトインした
+  // 場合のみで、そのまま解析まで自動実行する。
+  const handleTerminalWatchError = (capturedText: string, autoAnalyze: boolean) => {
+    setLogInput(capturedText);
+    setDescriptionInput("");
+    setAttachedImage(null);
+    if (autoAnalyze) {
+      showToast("ターミナル監視でエラーを検知したため、自動で解析します", "warning");
+      void handleAnalyze(capturedText);
+    } else {
+      showToast("ターミナル監視でエラーらしき出力を検知し、ログ欄にセットしました。「エラーを解析する」を押してください", "warning");
+    }
   };
 
   // コピー機能
@@ -1072,7 +1171,7 @@ export default function App() {
               title="解析に使用するGeminiモデルを選択"
               className="bg-transparent outline-none cursor-pointer text-slate-700 dark:text-slate-200 max-w-[160px] sm:max-w-none"
             >
-              {AVAILABLE_MODELS.map((m) => (
+              {availableModels.map((m) => (
                 <option
                   key={m.value}
                   value={m.value}
@@ -1096,6 +1195,27 @@ export default function App() {
             <Key className="w-3.5 h-3.5" />
             <span>Gemini AI:</span>
             <span className="font-semibold">{apiKey ? "Active" : "APIキー設定"}</span>
+          </button>
+
+          {/* Gemini解析のトークン消費量（セッション累計）。0件のうちは表示しない */}
+          {sessionTokenTotal > 0 && (
+            <span
+              title="このセッションでGemini APIが消費した合計トークン数"
+              className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400"
+            >
+              <Coins className="w-3.5 h-3.5 shrink-0" />
+              <span>{sessionTokenTotal.toLocaleString()} tokens</span>
+            </span>
+          )}
+
+          {/* ターミナル監視モード（開発コマンドをアプリ内から実行し、出力をリアルタイム監視する） */}
+          <button
+            onClick={() => setShowTerminalWatchModal(true)}
+            title="開発コマンドをアプリ内から実行し、出力を監視します（試験的機能）"
+            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 transition cursor-pointer"
+          >
+            <Terminal className="w-3.5 h-3.5" />
+            <span>ターミナル監視</span>
           </button>
 
           {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定） */}
@@ -1136,6 +1256,17 @@ export default function App() {
                 <X className="w-3.5 h-3.5" />
               </button>
             </>
+          )}
+
+          {/* Git作業ツリーが汚れている場合の注意喚起（実ファイル適用をブロックはしない） */}
+          {gitDirtyStatus?.isDirty && (
+            <span
+              title={`未コミットの変更が${gitDirtyStatus.changedFileCount}件あります。実ファイルへの適用前にコミットまたは退避することをお勧めします`}
+              className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300"
+            >
+              <GitBranch className="w-3.5 h-3.5 shrink-0" />
+              <span>未コミットの変更あり ({gitDirtyStatus.changedFileCount})</span>
+            </span>
           )}
 
           {/* 履歴モーダルボタン（見つけやすいよう強調表示） */}
@@ -1317,7 +1448,7 @@ export default function App() {
 
           <div className="flex items-center space-x-3">
             <button
-              onClick={handleAnalyze}
+              onClick={() => handleAnalyze()}
               disabled={isAnalyzing || (!logInput.trim() && !descriptionInput.trim() && !attachedImage)}
               className="flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-cyan-500 to-teal-500 hover:from-cyan-400 hover:to-teal-400 disabled:opacity-40 disabled:cursor-not-allowed font-semibold text-sm text-slate-950 flex items-center justify-center space-x-2 shadow-lg shadow-cyan-500/25 transition cursor-pointer active:scale-[0.99]"
             >
@@ -1358,6 +1489,15 @@ export default function App() {
                     <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/30 font-medium flex items-center space-x-1">
                       <AlertTriangle className="w-3 h-3" />
                       <span>モデル自動フォールバック</span>
+                    </span>
+                  )}
+                  {analysis.tokenUsage && (
+                    <span
+                      title={`プロンプト: ${analysis.tokenUsage.promptTokens} / 応答: ${analysis.tokenUsage.responseTokens}`}
+                      className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-300 dark:border-slate-700 font-medium flex items-center space-x-1"
+                    >
+                      <Coins className="w-3 h-3" />
+                      <span>{analysis.tokenUsage.totalTokens.toLocaleString()} tokens</span>
                     </span>
                   )}
                 </>
@@ -1744,19 +1884,31 @@ export default function App() {
                             </button>
                           </div>
                         ) : applyCheck?.applicable ? (
-                          <div className="flex items-center justify-between gap-3 flex-wrap">
-                            <p className="text-xs text-slate-600 dark:text-slate-300">
-                              <code className="text-slate-500 dark:text-slate-400">{applyCheck.resolvedPath}</code>{" "}
-                              に安全に適用できることを確認しました。
-                            </p>
-                            <button
-                              onClick={() => setShowRealApplyConfirm(true)}
-                              disabled={isRealApplying}
-                              className="shrink-0 text-xs px-3.5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold flex items-center space-x-1.5 shadow transition cursor-pointer active:scale-95"
-                            >
-                              <Save className="w-3.5 h-3.5" />
-                              <span>{isRealApplying ? "適用中..." : "実ファイルに適用する"}</span>
-                            </button>
+                          <div className="space-y-2">
+                            {gitDirtyStatus?.isDirty && (
+                              <p className="text-[11px] text-amber-700 dark:text-amber-300 bg-amber-500/10 border border-amber-500/25 rounded-lg px-2.5 py-1.5 flex items-start space-x-1.5">
+                                <GitBranch className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                                <span>
+                                  このプロジェクトには未コミットの変更が{gitDirtyStatus.changedFileCount}件あります。
+                                  自動バックアップ（.bakファイル）は作成されますが、可能であれば先にコミットまたは
+                                  <code className="mx-0.5">git stash</code>で退避することをお勧めします。
+                                </span>
+                              </p>
+                            )}
+                            <div className="flex items-center justify-between gap-3 flex-wrap">
+                              <p className="text-xs text-slate-600 dark:text-slate-300">
+                                <code className="text-slate-500 dark:text-slate-400">{applyCheck.resolvedPath}</code>{" "}
+                                に安全に適用できることを確認しました。
+                              </p>
+                              <button
+                                onClick={() => setShowRealApplyConfirm(true)}
+                                disabled={isRealApplying}
+                                className="shrink-0 text-xs px-3.5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold flex items-center space-x-1.5 shadow transition cursor-pointer active:scale-95"
+                              >
+                                <Save className="w-3.5 h-3.5" />
+                                <span>{isRealApplying ? "適用中..." : "実ファイルに適用する"}</span>
+                              </button>
+                            </div>
                           </div>
                         ) : (
                           <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center space-x-1.5">
@@ -1877,6 +2029,16 @@ export default function App() {
             <div className="rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 p-3">
               <code className="text-xs text-slate-700 dark:text-slate-300 break-all">{applyCheck.resolvedPath}</code>
             </div>
+
+            {gitDirtyStatus?.isDirty && (
+              <p className="text-[11px] text-amber-700 dark:text-amber-300 bg-amber-500/10 border border-amber-500/25 rounded-lg px-2.5 py-2 flex items-start space-x-1.5">
+                <GitBranch className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                <span>
+                  未コミットの変更が{gitDirtyStatus.changedFileCount}件残っています。このアプリの自動バックアップとは別に、
+                  Gitでもコミット/退避しておくと、より安全に元の状態へ戻せます。
+                </span>
+              </p>
+            )}
 
             <div className="flex items-center justify-end space-x-2 pt-2">
               <button
@@ -2108,6 +2270,16 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* 5.5. ターミナル監視モード（試験的機能）。閉じてもバックグラウンドでの監視自体は継続する
+          ため、show/hideはCSSのみで切り替え、コンポーネント自体はアンマウントしない。 */}
+      <TerminalWatchModal
+        open={showTerminalWatchModal}
+        onClose={() => setShowTerminalWatchModal(false)}
+        projectRoot={projectRoot}
+        onPickProjectRoot={handlePickProjectRoot}
+        onDetectedError={handleTerminalWatchError}
+      />
 
       {/* 6. トースト通知ポップアップ */}
       {toast && (

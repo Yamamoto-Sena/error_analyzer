@@ -1,7 +1,11 @@
 // 修正案(diff)を実ファイルへ安全に適用するための純粋ロジック（判定・パッチ計算のみ）。
 mod fix_apply;
+// プロジェクトフォルダのGit作業ツリーが汚れていないかを判定する（git CLIのラッパー）。
+mod git_status;
 // Gemini APIキーをOSキーチェーンに保存・読み込みするための薄いラッパー。
 mod secret_store;
+// 開発コマンドをアプリ内から起動し、出力をリアルタイム配信する「ターミナル監視モード」。
+mod terminal_watch;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -540,8 +544,17 @@ pub fn run() {
             apply_fix,
             rollback_fix,
             clear_all_backups,
-            list_backups_for_file
+            list_backups_for_file,
+            git_status::check_git_dirty,
+            terminal_watch::start_terminal_watch,
+            terminal_watch::stop_terminal_watch
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            // アプリ終了時にターミナル監視モードのプロセスが残らないよう後始末する
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                terminal_watch::kill_if_running();
+            }
+        });
 }

@@ -25,6 +25,17 @@ export interface AnalysisResult {
   officialDocLink?: OfficialDocLink;
   /** Gemini解析時、送信前にログ中の機密情報らしき箇所をマスクした件数（0件/未使用時は省略） */
   maskedSecretsCount?: number;
+  /** Gemini解析時のトークン消費量（ローカル解析エンジン使用時は省略） */
+  tokenUsage?: TokenUsage;
+}
+
+export interface TokenUsage {
+  /** 送信したプロンプト（ログ・指示文・画像等）のトークン数 */
+  promptTokens: number;
+  /** Geminiが生成した応答のトークン数 */
+  responseTokens: number;
+  /** 合計トークン数（promptTokens + responseTokens。APIが直接返す値をそのまま使う） */
+  totalTokens: number;
 }
 
 export interface OfficialDocLink {
