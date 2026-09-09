@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { analyzeWithGemini } from "./gemini";
+import { analyzeWithGemini, listAvailableModels } from "./gemini";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -96,6 +96,53 @@ describe("analyzeWithGemini", () => {
     await expect(analyzeWithGemini("log", "KEY", "gemini-3.5-flash-lite")).rejects.toThrow(/タイムアウト/);
   });
 
+  it("送信前にログ内のAPIキー等をマスクし、maskedSecretsCountを結果に含める", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse("gemini-3.5-flash-lite-001"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const log = "起動失敗\nAPI_KEY=sk-topsecret1234567890\n連絡先: dev@example.com";
+    const result = await analyzeWithGemini(log, "FAKE_KEY", "gemini-3.5-flash-lite");
+
+    const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const sentBody = options.body as string;
+    expect(sentBody).not.toContain("sk-topsecret1234567890");
+    expect(sentBody).not.toContain("dev@example.com");
+    expect(result.maskedSecretsCount).toBe(2);
+  });
+
+  it("マスク対象が無い場合はmaskedSecretsCountを付与しない", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse("gemini-3.5-flash-lite-001"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await analyzeWithGemini("TypeError: x is not a function", "FAKE_KEY", "gemini-3.5-flash-lite");
+
+    expect(result.maskedSecretsCount).toBeUndefined();
+  });
+
+  it("usageMetadataが揃っている場合はtokenUsageとして結果に含める", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        modelVersion: "gemini-3.5-flash-lite-001",
+        usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 45, totalTokenCount: 165 },
+        candidates: [{ content: { parts: [{ text: JSON.stringify(validGeminiPayload()) }] } }],
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await analyzeWithGemini("log", "KEY", "gemini-3.5-flash-lite");
+
+    expect(result.tokenUsage).toEqual({ promptTokens: 120, responseTokens: 45, totalTokens: 165 });
+  });
+
+  it("usageMetadataが無い場合はtokenUsageを付与しない", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse("gemini-3.5-flash-lite-001"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await analyzeWithGemini("log", "KEY", "gemini-3.5-flash-lite");
+
+    expect(result.tokenUsage).toBeUndefined();
+  });
+
   it("すべての候補モデルが失敗した場合は最終エラーをthrowする", async () => {
     // 呼び出しのたびに新しいResponseを返す(同一インスタンスを使い回すとbodyが
     // 2回目以降 "already been read" エラーになるため)
@@ -103,5 +150,41 @@ describe("analyzeWithGemini", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(analyzeWithGemini("log", "KEY", "gemini-3.5-flash-lite")).rejects.toThrow(/Gemini API エラー \(500\)/);
+  });
+});
+
+describe("listAvailableModels", () => {
+  it("generateContent対応モデルのみ抽出し、モデル名からprefixを除去する", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        models: [
+          {
+            name: "models/gemini-3.5-flash-lite",
+            displayName: "Gemini 3.5 Flash-Lite",
+            supportedGenerationMethods: ["generateContent"],
+          },
+          {
+            name: "models/text-embedding-004",
+            displayName: "Text Embedding",
+            supportedGenerationMethods: ["embedContent"],
+          },
+        ],
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const models = await listAvailableModels("FAKE_KEY");
+
+    expect(models).toEqual([{ value: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash-Lite" }]);
+    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/v1beta/models");
+    expect((options.headers as Record<string, string>)["x-goog-api-key"]).toBe("FAKE_KEY");
+  });
+
+  it("APIがエラーを返した場合はthrowする", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("forbidden", { status: 403 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(listAvailableModels("BAD_KEY")).rejects.toThrow(/403/);
   });
 });

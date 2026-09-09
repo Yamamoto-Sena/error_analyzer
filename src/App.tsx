@@ -39,12 +39,22 @@ import {
   FolderOpen,
   Save,
   Trash2,
+  Coins,
+  GitBranch,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { analyzeErrorLog, AnalysisResult } from "./analyzer";
-import { analyzeWithGemini } from "./gemini";
-import { AVAILABLE_MODELS, DEFAULT_MODEL } from "./models";
+import { analyzeWithGemini, listAvailableModels } from "./gemini";
+import { AVAILABLE_MODELS, DEFAULT_MODEL, GeminiModelOption } from "./models";
+import TerminalWatchModal from "./TerminalWatchModal";
+
+// プロジェクトのGit作業ツリーが汚れていないかの判定結果(Rust側 check_git_dirty の戻り値)
+interface GitDirtyStatus {
+  isGitRepo: boolean;
+  isDirty: boolean;
+  changedFileCount: number;
+}
 
 // 実ファイルへ安全適用できるかどうかの判定結果(Rust側 check_fix_applicability の戻り値)
 interface FixApplyCheck {
@@ -233,6 +243,19 @@ function buildVerificationChecklist(analysis: AnalysisResult): string[] {
 // コードの差分ではなく、手順（コマンド実行・再起動・ケーブル抜き差し等）で解決するタイプの修正案を
 // 番号付きのタスクリストとして表示するサブコンポーネント
 function TaskStepsView({ steps }: { steps: string[] }) {
+  // ステップごとに個別コピーできるようにする（どのステップがコピーされたかだけ2秒間表示）
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+
+  const handleCopyStep = async (step: string, idx: number) => {
+    try {
+      await navigator.clipboard.writeText(step);
+      setCopiedIdx(idx);
+      setTimeout(() => setCopiedIdx((cur) => (cur === idx ? null : cur)), 2000);
+    } catch {
+      // クリップボードAPIが使えない環境では何もしない（ボタン表示自体は変化しない）
+    }
+  };
+
   return (
     <div className="rounded-lg bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 divide-y divide-slate-100 dark:divide-slate-900/60 overflow-hidden">
       {steps.map((step, idx) => (
@@ -243,11 +266,31 @@ function TaskStepsView({ steps }: { steps: string[] }) {
           <pre className="flex-1 whitespace-pre-wrap break-words font-mono text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
             {step}
           </pre>
+          <button
+            type="button"
+            onClick={() => handleCopyStep(step, idx)}
+            title="この手順だけをコピー"
+            className="shrink-0 p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition cursor-pointer"
+          >
+            {copiedIdx === idx ? (
+              <Check className="w-3.5 h-3.5 text-emerald-500 dark:text-emerald-400" />
+            ) : (
+              <Copy className="w-3.5 h-3.5" />
+            )}
+          </button>
         </div>
       ))}
     </div>
   );
 }
+
+// このページが実際のTauriデスクトップアプリ（ネイティブWebView）内で動いているか、
+// それとも通常のブラウザ（GitHub Pages版のWeb版等）で動いているかを判定する。
+// Tauri v2 は起動時に window.__TAURI_INTERNALS__ を注入するため、その有無で判定できる。
+// プロジェクトフォルダ選択・実ファイル適用・Git汚れ判定・ターミナル監視など、
+// OSのファイルシステム/プロセスに触れる機能はWeb版では原理的に提供できないため、
+// これを使って該当UIを無効化・注記する（invokeが失敗して分かりにくいトーストが出るのを防ぐ）。
+const IS_TAURI_RUNTIME = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export default function App() {
   const [logInput, setLogInput] = useState<string>("");
@@ -276,6 +319,14 @@ export default function App() {
 
   // 使用するGeminiモデルの選択
   const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODEL);
+  // モデル一覧はmodels.tsのハードコードを初期値とし、APIキー設定時にGoogle側から
+  // 動的取得できればそちらに差し替える（取得失敗時はハードコードのままフォールバック）。
+  const [availableModels, setAvailableModels] = useState<GeminiModelOption[]>(AVAILABLE_MODELS);
+  // Gemini解析のトークン消費量（このセッションでの累計。ローカルに永続化する）
+  const [sessionTokenTotal, setSessionTokenTotal] = useState<number>(0);
+  // プロジェクトのGit作業ツリーが汚れていないかの判定結果(実ファイル適用前の注意喚起用)
+  const [gitDirtyStatus, setGitDirtyStatus] = useState<GitDirtyStatus | null>(null);
+  const [showTerminalWatchModal, setShowTerminalWatchModal] = useState<boolean>(false);
 
   // テーマ管理（ライト / ダーク）
   const [theme, setTheme] = useState<"light" | "dark">("dark");
@@ -317,6 +368,12 @@ export default function App() {
   const [realApplyResult, setRealApplyResult] = useState<{ backupId: string; appliedPath: string } | null>(
     null
   );
+  // 過去のバックアップ履歴（複数世代）を一覧表示し、任意の時点へ戻せるようにする機能
+  const [showBackupHistory, setShowBackupHistory] = useState<boolean>(false);
+  const [isLoadingBackupHistory, setIsLoadingBackupHistory] = useState<boolean>(false);
+  const [backupHistory, setBackupHistory] = useState<
+    { id: string; relativePath: string; createdAtUnixMs: number }[]
+  >([]);
 
   // APIキーの読み込み（OSキーチェーン優先、Tauri外や旧バージョンからの移行はlocalStorageにフォールバック）。
   // 他の初期化（履歴・モデル選択・テーマ等）は同期的なlocalStorage読み込みのみなので、
@@ -385,7 +442,60 @@ export default function App() {
     } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
       setTheme("light");
     }
+
+    const savedTokenTotal = Number(localStorage.getItem("debug_buddy_token_total") ?? "0");
+    if (Number.isFinite(savedTokenTotal) && savedTokenTotal > 0) {
+      setSessionTokenTotal(savedTokenTotal);
+    }
   }, []);
+
+  // APIキーが設定されている間、そのキーで実際に使えるGeminiモデル一覧を動的取得する。
+  // models.ts のハードコードはGoogle側のラインナップ変更に追従できないための保険であり、
+  // 取得できた場合はそちらを優先し、失敗時(オフライン・権限不足等)はハードコードのまま使う。
+  useEffect(() => {
+    if (!apiKey) {
+      setAvailableModels(AVAILABLE_MODELS);
+      return;
+    }
+    let cancelled = false;
+    listAvailableModels(apiKey)
+      .then((fetched) => {
+        if (cancelled || fetched.length === 0) return;
+        // 現在選択中のモデルが一覧に無い場合(廃止モデル等)でも選択自体は維持できるよう、先頭に補う
+        const merged = fetched.some((m) => m.value === selectedModel)
+          ? fetched
+          : [{ value: selectedModel, label: `${selectedModel}（現在の選択）` }, ...fetched];
+        setAvailableModels(merged);
+      })
+      .catch(() => {
+        // オフライン・キー不正等: これまで通りハードコードされた一覧にフォールバックする
+        if (!cancelled) setAvailableModels(AVAILABLE_MODELS);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiKey]);
+
+  // プロジェクトフォルダが選択されている間、Git作業ツリーが汚れていないかを判定する
+  // (読み取り専用。git未インストール/Git管理外の場合はisGitRepo:falseとして扱われ、警告は出ない)
+  useEffect(() => {
+    if (!projectRoot) {
+      setGitDirtyStatus(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<GitDirtyStatus>("check_git_dirty", { root: projectRoot })
+      .then((status) => {
+        if (!cancelled) setGitDirtyStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setGitDirtyStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectRoot]);
 
   // テーマの切り替えを <html> クラスへ反映し、選択を保存する
   useEffect(() => {
@@ -414,6 +524,8 @@ export default function App() {
     let cancelled = false;
     setRealApplyResult(null);
     setApplyCheck(null);
+    setBackupHistory([]);
+    setShowBackupHistory(false);
 
     if (!analysis || analysis.fixType === "task" || !projectRoot) {
       return;
@@ -447,7 +559,7 @@ export default function App() {
     localStorage.setItem("debug_buddy_gemini_model", value);
   };
 
-  const selectedModelLabel = AVAILABLE_MODELS.find((m) => m.value === selectedModel)?.label ?? selectedModel;
+  const selectedModelLabel = availableModels.find((m) => m.value === selectedModel)?.label ?? selectedModel;
 
   // 検索クエリで履歴を絞り込む（全角/半角・大文字小文字・日本語表記ゆれを吸収）
   const searchedHistory = useMemo(() => {
@@ -529,14 +641,10 @@ export default function App() {
     showToast(`サンプル（${key}）を挿入しました`, "info");
   };
 
-  // エラー画面のスクリーンショット等の画像を選択して添付する
-  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = ""; // 同じファイルを選び直せるようにリセット
-    if (!file) return;
-
+  // エラー画面のスクリーンショット等の画像ファイルを添付する（ファイル選択・クリップボード貼り付け共通処理）
+  const processImageFile = (file: File, source: "select" | "paste") => {
     if (!file.type.startsWith("image/")) {
-      showToast("画像ファイル（PNG/JPEGなど）を選択してください", "warning");
+      if (source === "select") showToast("画像ファイル（PNG/JPEGなど）を選択してください", "warning");
       return;
     }
     if (file.size > MAX_IMAGE_BYTES) {
@@ -552,21 +660,59 @@ export default function App() {
         mimeType: file.type,
         base64,
         previewUrl: dataUrl,
-        fileName: file.name,
+        fileName: file.name || "clipboard-image.png",
       });
-      showToast(`画像「${file.name}」を添付しました`, "info");
+      showToast(
+        source === "paste" ? "クリップボードの画像を添付しました" : `画像「${file.name}」を添付しました`,
+        "info"
+      );
     };
     reader.onerror = () => showToast("画像の読み込みに失敗しました", "warning");
     reader.readAsDataURL(file);
   };
 
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // 同じファイルを選び直せるようにリセット
+    if (!file) return;
+    processImageFile(file, "select");
+  };
+
   const handleRemoveImage = () => setAttachedImage(null);
 
-  // 解析実行（Gemini API または ローカル解析エンジンのハイブリッド）
-  const handleAnalyze = async () => {
-    const hasLog = logInput.trim().length > 0;
-    const hasDescription = descriptionInput.trim().length > 0;
-    const hasImage = !!attachedImage;
+  // テキストエリアへのペースト時、クリップボードに画像（スクリーンショット等）が
+  // 含まれていれば自動で添付する。通常のテキスト貼り付けは妨げない。
+  const handlePasteImage = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          e.preventDefault();
+          processImageFile(file, "paste");
+        }
+        return;
+      }
+    }
+  };
+
+  // Ctrl+Enter (macOSはCmd+Enter) で解析を実行するショートカット
+  const handleAnalyzeShortcut = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      if (!isAnalyzing) void handleAnalyze();
+    }
+  };
+
+  // 解析実行（Gemini API または ローカル解析エンジンのハイブリッド）。
+  // `overrideLog` が指定された場合（ターミナル監視モードからの自動解析）は、
+  // logInputへの反映を待たずその文字列をそのまま解析対象にする(setState後の非同期タイミング問題を回避するため)。
+  const handleAnalyze = async (overrideLog?: string) => {
+    const effectiveLog = overrideLog ?? logInput;
+    const hasLog = effectiveLog.trim().length > 0;
+    const hasDescription = overrideLog === undefined && descriptionInput.trim().length > 0;
+    const hasImage = overrideLog === undefined && !!attachedImage;
     if (!hasLog && !hasDescription && !hasImage) return;
 
     // 画像・説明文のみでAPIキー未設定の場合、ローカル解析エンジンでは十分な解析ができないため中断する
@@ -577,7 +723,7 @@ export default function App() {
 
     // ログ（スタックトレース等）と、自由記述の症状説明を統合して解析対象とする
     const combinedText = [
-      hasLog ? `【エラーログ / スタックトレース】\n${logInput.trim()}` : "",
+      hasLog ? `【エラーログ / スタックトレース】\n${effectiveLog.trim()}` : "",
       hasDescription ? `【エラー内容・症状の説明（ユーザー記述）】\n${descriptionInput.trim()}` : "",
     ]
       .filter(Boolean)
@@ -600,17 +746,31 @@ export default function App() {
           selectedModel,
           hasImage ? [{ mimeType: attachedImage!.mimeType, data: attachedImage!.base64 }] : []
         );
+        // 送信前にAPIキーやメールアドレス等の機密情報らしき箇所をマスクした場合は、
+        // ユーザーが「何が送られたか」を把握できるよう明示する
+        const maskNote = result.maskedSecretsCount
+          ? `（🔒 送信前に機密情報らしき箇所を${result.maskedSecretsCount}件マスクしました）`
+          : "";
         if (result.usedFallbackModel) {
           // 指定モデルが混雑/RPD(1日の上限)超過等で使えず、別モデルに自動切替した場合は明示する
           const quotaNote = result.quotaExceededModels?.length
             ? `（上限超過: ${result.quotaExceededModels.join(", ")}）`
             : "";
           showToast(
-            `⚠️ ${selectedModelLabel} は利用できず、${result.modelUsed} で解析しました${quotaNote}`,
+            `⚠️ ${selectedModelLabel} は利用できず、${result.modelUsed} で解析しました${quotaNote}${maskNote}`,
             "warning"
           );
         } else {
-          showToast(`✨ ${result.modelUsed ?? selectedModelLabel} による高精度解析が完了しました！`, "success");
+          showToast(`✨ ${result.modelUsed ?? selectedModelLabel} による高精度解析が完了しました！${maskNote}`, "success");
+        }
+
+        // トークン消費量をセッション累計に加算して永続化する（画面表示用。要件定義書5.3対応）
+        if (result.tokenUsage) {
+          setSessionTokenTotal((prev) => {
+            const next = prev + result.tokenUsage!.totalTokens;
+            localStorage.setItem("debug_buddy_token_total", String(next));
+            return next;
+          });
         }
       } else {
         // 2. ローカル解析エンジンでフォールバック（画像は読み取れないためテキストのみ）
@@ -657,6 +817,22 @@ export default function App() {
     setVerificationResult(null);
     setVerifyLogInput("");
     showToast("入力内容をリセットしました", "info");
+  };
+
+  // ターミナル監視モードがエラーらしき出力を検知した際に呼ばれる。
+  // autoAnalyze=false の場合はログ欄にセットするだけ(API呼び出しは行わず、ユーザー自身の
+  // 「エラーを解析する」クリックを待つ)。autoAnalyze=true はユーザーが明示的にオプトインした
+  // 場合のみで、そのまま解析まで自動実行する。
+  const handleTerminalWatchError = (capturedText: string, autoAnalyze: boolean) => {
+    setLogInput(capturedText);
+    setDescriptionInput("");
+    setAttachedImage(null);
+    if (autoAnalyze) {
+      showToast("ターミナル監視でエラーを検知したため、自動で解析します", "warning");
+      void handleAnalyze(capturedText);
+    } else {
+      showToast("ターミナル監視でエラーらしき出力を検知し、ログ欄にセットしました。「エラーを解析する」を押してください", "warning");
+    }
   };
 
   // コピー機能
@@ -773,6 +949,8 @@ export default function App() {
       });
       setRealApplyResult(result);
       showToast(`✅ 実際に書き換えました: ${result.appliedPath}`, "success");
+      // バックアップ履歴を表示中であれば、今回作成された分も含めて最新化する
+      if (showBackupHistory) void loadBackupHistory();
     } catch (err) {
       showToast(`実ファイルへの適用に失敗しました: ${String(err).slice(0, 100)}`, "warning");
     } finally {
@@ -780,19 +958,54 @@ export default function App() {
     }
   };
 
-  // 実ファイルのロールバック（バックアップから復元する本物のロールバック）
-  const handleRealRollback = async () => {
-    if (!projectRoot || !realApplyResult) return;
+  // 指定したバックアップ世代(backupId)から実ファイルを復元する共通処理。
+  // 直近のロールバック（handleRealRollback）と、過去世代を選んでのロールバック
+  // （backupHistoryからの選択）の両方から呼び出す。
+  const handleRollbackToBackup = async (backupId: string) => {
+    if (!projectRoot) return;
     setIsRollingBackReal(true);
     try {
-      await invoke("rollback_fix", { root: projectRoot, backupId: realApplyResult.backupId });
+      await invoke("rollback_fix", { root: projectRoot, backupId });
       showToast("バックアップから元のファイル内容に復元しました", "info");
-      setRealApplyResult(null);
+      if (realApplyResult?.backupId === backupId) setRealApplyResult(null);
+      // バックアップ履歴を表示中であれば最新の状態に更新する
+      if (showBackupHistory) void loadBackupHistory();
     } catch (err) {
       showToast(`ロールバックに失敗しました: ${String(err).slice(0, 100)}`, "warning");
     } finally {
       setIsRollingBackReal(false);
     }
+  };
+
+  // 実ファイルのロールバック（直近に自分が適用した分を戻す、これまで通りのボタン）
+  const handleRealRollback = () => {
+    if (!realApplyResult) return;
+    void handleRollbackToBackup(realApplyResult.backupId);
+  };
+
+  // このファイルの過去のバックアップ一覧を取得する（読み取り専用）
+  const loadBackupHistory = async () => {
+    if (!projectRoot || !analysis) return;
+    setIsLoadingBackupHistory(true);
+    try {
+      const list = await invoke<{ id: string; relativePath: string; createdAtUnixMs: number }[]>(
+        "list_backups_for_file",
+        { root: projectRoot, filePath: analysis.filePath }
+      );
+      setBackupHistory(list);
+    } catch (err) {
+      showToast(`バックアップ履歴の取得に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      setBackupHistory([]);
+    } finally {
+      setIsLoadingBackupHistory(false);
+    }
+  };
+
+  // バックアップ履歴の開閉。開くタイミングで一覧を取得する（毎回の再描画では取得しない）
+  const handleToggleBackupHistory = () => {
+    const next = !showBackupHistory;
+    setShowBackupHistory(next);
+    if (next) void loadBackupHistory();
   };
 
   // チェックリストの各項目のON/OFFを切り替える
@@ -966,7 +1179,7 @@ export default function App() {
               title="解析に使用するGeminiモデルを選択"
               className="bg-transparent outline-none cursor-pointer text-slate-700 dark:text-slate-200 max-w-[160px] sm:max-w-none"
             >
-              {AVAILABLE_MODELS.map((m) => (
+              {availableModels.map((m) => (
                 <option
                   key={m.value}
                   value={m.value}
@@ -992,16 +1205,46 @@ export default function App() {
             <span className="font-semibold">{apiKey ? "Active" : "APIキー設定"}</span>
           </button>
 
-          {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定） */}
+          {/* Gemini解析のトークン消費量（セッション累計）。0件のうちは表示しない */}
+          {sessionTokenTotal > 0 && (
+            <span
+              title="このセッションでGemini APIが消費した合計トークン数"
+              className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400"
+            >
+              <Coins className="w-3.5 h-3.5 shrink-0" />
+              <span>{sessionTokenTotal.toLocaleString()} tokens</span>
+            </span>
+          )}
+
+          {/* ターミナル監視モード（開発コマンドをアプリ内から実行し、出力をリアルタイム監視する）。
+              サブプロセス起動が必要なため、デスクトップアプリ版でのみ利用できる。 */}
           <button
-            onClick={handlePickProjectRoot}
-            disabled={isPickingRoot}
+            onClick={() => IS_TAURI_RUNTIME && setShowTerminalWatchModal(true)}
+            disabled={!IS_TAURI_RUNTIME}
             title={
-              projectRoot
+              IS_TAURI_RUNTIME
+                ? "開発コマンドをアプリ内から実行し、出力を監視します（試験的機能）"
+                : "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
+            }
+            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300 transition cursor-pointer"
+          >
+            <Terminal className="w-3.5 h-3.5" />
+            <span>ターミナル監視</span>
+          </button>
+
+          {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定）。
+              ネイティブのフォルダ選択ダイアログ・ファイルI/Oが必要なため、Web版では利用できない。 */}
+          <button
+            onClick={() => IS_TAURI_RUNTIME && handlePickProjectRoot()}
+            disabled={isPickingRoot || !IS_TAURI_RUNTIME}
+            title={
+              !IS_TAURI_RUNTIME
+                ? "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
+                : projectRoot
                 ? `プロジェクトフォルダ: ${projectRoot}（クリックで変更）`
                 : "プロジェクトフォルダを選択すると、実ファイルへの安全な自動適用が使えます"
             }
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer disabled:opacity-60 max-w-[220px] ${
+            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed max-w-[220px] ${
               projectRoot
                 ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
                 : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700"
@@ -1030,6 +1273,17 @@ export default function App() {
                 <X className="w-3.5 h-3.5" />
               </button>
             </>
+          )}
+
+          {/* Git作業ツリーが汚れている場合の注意喚起（実ファイル適用をブロックはしない） */}
+          {gitDirtyStatus?.isDirty && (
+            <span
+              title={`未コミットの変更が${gitDirtyStatus.changedFileCount}件あります。実ファイルへの適用前にコミットまたは退避することをお勧めします`}
+              className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300"
+            >
+              <GitBranch className="w-3.5 h-3.5 shrink-0" />
+              <span>未コミットの変更あり ({gitDirtyStatus.changedFileCount})</span>
+            </span>
           )}
 
           {/* 履歴モーダルボタン（見つけやすいよう強調表示） */}
@@ -1135,7 +1389,9 @@ export default function App() {
             <textarea
               value={logInput}
               onChange={(e) => setLogInput(e.target.value)}
-              placeholder="ターミナルやコンソールに出力された任意のエラーログをペーストしてください..."
+              onPaste={handlePasteImage}
+              onKeyDown={handleAnalyzeShortcut}
+              placeholder="ターミナルやコンソールに出力された任意のエラーログをペーストしてください...（画像を貼り付けると自動で添付されます / Ctrl+Enterで解析実行）"
               rows={14}
               className="w-full bg-transparent p-4 font-mono text-xs text-slate-800 dark:text-slate-200 resize-none outline-none leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-600"
             />
@@ -1161,7 +1417,9 @@ export default function App() {
           <textarea
             value={descriptionInput}
             onChange={(e) => setDescriptionInput(e.target.value)}
-            placeholder="例:「保存ボタンを押すとアプリが固まる」「ログイン後に画面が真っ白になる」など、ログが手元になくても状況を自由に記述できます。"
+            onPaste={handlePasteImage}
+            onKeyDown={handleAnalyzeShortcut}
+            placeholder="例:「保存ボタンを押すとアプリが固まる」「ログイン後に画面が真っ白になる」など、ログが手元になくても状況を自由に記述できます。（Ctrl+Enterで解析実行）"
             rows={3}
             className="w-full rounded-xl border border-slate-300 dark:border-slate-800 bg-white dark:bg-slate-900/80 shadow-inner focus-within:border-cyan-500/60 focus:border-cyan-500/60 focus:ring-1 focus:ring-cyan-500/50 transition p-3 font-mono text-xs text-slate-800 dark:text-slate-200 resize-none outline-none leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-600"
           />
@@ -1207,7 +1465,7 @@ export default function App() {
 
           <div className="flex items-center space-x-3">
             <button
-              onClick={handleAnalyze}
+              onClick={() => handleAnalyze()}
               disabled={isAnalyzing || (!logInput.trim() && !descriptionInput.trim() && !attachedImage)}
               className="flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-cyan-500 to-teal-500 hover:from-cyan-400 hover:to-teal-400 disabled:opacity-40 disabled:cursor-not-allowed font-semibold text-sm text-slate-950 flex items-center justify-center space-x-2 shadow-lg shadow-cyan-500/25 transition cursor-pointer active:scale-[0.99]"
             >
@@ -1248,6 +1506,15 @@ export default function App() {
                     <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/30 font-medium flex items-center space-x-1">
                       <AlertTriangle className="w-3 h-3" />
                       <span>モデル自動フォールバック</span>
+                    </span>
+                  )}
+                  {analysis.tokenUsage && (
+                    <span
+                      title={`プロンプト: ${analysis.tokenUsage.promptTokens} / 応答: ${analysis.tokenUsage.responseTokens}`}
+                      className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-300 dark:border-slate-700 font-medium flex items-center space-x-1"
+                    >
+                      <Coins className="w-3 h-3" />
+                      <span>{analysis.tokenUsage.totalTokens.toLocaleString()} tokens</span>
                     </span>
                   )}
                 </>
@@ -1596,7 +1863,15 @@ export default function App() {
                           <span>実ファイルへの適用（オプション）</span>
                         </h4>
 
-                        {!projectRoot ? (
+                        {!IS_TAURI_RUNTIME ? (
+                          <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed flex items-start space-x-1.5">
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400 shrink-0 mt-0.5" />
+                            <span>
+                              この機能（実ファイルへの安全な適用）はデスクトップアプリ版でのみ利用できます。
+                              Web版では上の差分を「差分をコピー」してご自身のエディタで適用してください。
+                            </span>
+                          </p>
+                        ) : !projectRoot ? (
                           <div className="flex items-center justify-between gap-3 flex-wrap">
                             <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
                               プロジェクトフォルダを選択すると、安全性を確認したうえで実際のファイルへ書き込めます（対応できないケースはこれまで通りプレビューのみになります）。
@@ -1634,25 +1909,89 @@ export default function App() {
                             </button>
                           </div>
                         ) : applyCheck?.applicable ? (
-                          <div className="flex items-center justify-between gap-3 flex-wrap">
-                            <p className="text-xs text-slate-600 dark:text-slate-300">
-                              <code className="text-slate-500 dark:text-slate-400">{applyCheck.resolvedPath}</code>{" "}
-                              に安全に適用できることを確認しました。
-                            </p>
-                            <button
-                              onClick={() => setShowRealApplyConfirm(true)}
-                              disabled={isRealApplying}
-                              className="shrink-0 text-xs px-3.5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold flex items-center space-x-1.5 shadow transition cursor-pointer active:scale-95"
-                            >
-                              <Save className="w-3.5 h-3.5" />
-                              <span>{isRealApplying ? "適用中..." : "実ファイルに適用する"}</span>
-                            </button>
+                          <div className="space-y-2">
+                            {gitDirtyStatus?.isDirty && (
+                              <p className="text-[11px] text-amber-700 dark:text-amber-300 bg-amber-500/10 border border-amber-500/25 rounded-lg px-2.5 py-1.5 flex items-start space-x-1.5">
+                                <GitBranch className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                                <span>
+                                  このプロジェクトには未コミットの変更が{gitDirtyStatus.changedFileCount}件あります。
+                                  自動バックアップ（.bakファイル）は作成されますが、可能であれば先にコミットまたは
+                                  <code className="mx-0.5">git stash</code>で退避することをお勧めします。
+                                </span>
+                              </p>
+                            )}
+                            <div className="flex items-center justify-between gap-3 flex-wrap">
+                              <p className="text-xs text-slate-600 dark:text-slate-300">
+                                <code className="text-slate-500 dark:text-slate-400">{applyCheck.resolvedPath}</code>{" "}
+                                に安全に適用できることを確認しました。
+                              </p>
+                              <button
+                                onClick={() => setShowRealApplyConfirm(true)}
+                                disabled={isRealApplying}
+                                className="shrink-0 text-xs px-3.5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold flex items-center space-x-1.5 shadow transition cursor-pointer active:scale-95"
+                              >
+                                <Save className="w-3.5 h-3.5" />
+                                <span>{isRealApplying ? "適用中..." : "実ファイルに適用する"}</span>
+                              </button>
+                            </div>
                           </div>
                         ) : (
                           <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center space-x-1.5">
                             <AlertTriangle className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400 shrink-0" />
                             <span>{describeUnapplicableReason(applyCheck?.reason ?? null)}</span>
                           </p>
+                        )}
+
+                        {/* 過去のバックアップ履歴（複数世代）。直近1件だけでなく、任意の時点まで
+                            戻せるように一覧表示する。取得は開いたときだけ行う（読み取り専用）。 */}
+                        {projectRoot && (
+                          <div className="pt-3 mt-1 border-t border-amber-500/20 space-y-2">
+                            <button
+                              type="button"
+                              onClick={handleToggleBackupHistory}
+                              className="text-xs flex items-center space-x-1.5 text-amber-700 dark:text-amber-300 hover:text-amber-900 dark:hover:text-amber-100 transition cursor-pointer"
+                            >
+                              <History className="w-3.5 h-3.5" />
+                              <span>{showBackupHistory ? "過去のバックアップ履歴を閉じる" : "過去のバックアップ履歴を見る"}</span>
+                              {showBackupHistory ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                            </button>
+
+                            {showBackupHistory &&
+                              (isLoadingBackupHistory ? (
+                                <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center space-x-1.5">
+                                  <span className="w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin shrink-0" />
+                                  <span>読み込み中...</span>
+                                </p>
+                              ) : backupHistory.length === 0 ? (
+                                <p className="text-xs text-slate-400 dark:text-slate-500">このファイルのバックアップはまだありません。</p>
+                              ) : (
+                                <div className="rounded-lg border border-amber-500/20 bg-white dark:bg-slate-950/60 divide-y divide-amber-500/10 max-h-56 overflow-y-auto">
+                                  {backupHistory.map((entry, idx) => (
+                                    <div key={entry.id} className="flex items-center justify-between gap-3 px-3 py-2">
+                                      <span className="text-xs text-slate-600 dark:text-slate-300 flex items-center space-x-1.5 min-w-0">
+                                        <Clock className="w-3.5 h-3.5 shrink-0 text-slate-400 dark:text-slate-500" />
+                                        <span className="truncate">
+                                          {new Date(entry.createdAtUnixMs).toLocaleString("ja-JP")}
+                                        </span>
+                                        {idx === 0 && (
+                                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-300">
+                                            最新
+                                          </span>
+                                        )}
+                                      </span>
+                                      <button
+                                        onClick={() => handleRollbackToBackup(entry.id)}
+                                        disabled={isRollingBackReal}
+                                        className="shrink-0 text-[11px] px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-amber-700 dark:text-amber-300 border border-amber-500/30 disabled:opacity-50 flex items-center space-x-1 transition cursor-pointer"
+                                      >
+                                        <Undo2 className="w-3 h-3" />
+                                        <span>この時点に戻す</span>
+                                      </button>
+                                    </div>
+                                  ))}
+                                </div>
+                              ))}
+                          </div>
                         )}
                       </div>
                     )}
@@ -1716,6 +2055,16 @@ export default function App() {
               <code className="text-xs text-slate-700 dark:text-slate-300 break-all">{applyCheck.resolvedPath}</code>
             </div>
 
+            {gitDirtyStatus?.isDirty && (
+              <p className="text-[11px] text-amber-700 dark:text-amber-300 bg-amber-500/10 border border-amber-500/25 rounded-lg px-2.5 py-2 flex items-start space-x-1.5">
+                <GitBranch className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                <span>
+                  未コミットの変更が{gitDirtyStatus.changedFileCount}件残っています。このアプリの自動バックアップとは別に、
+                  Gitでもコミット/退避しておくと、より安全に元の状態へ戻せます。
+                </span>
+              </p>
+            )}
+
             <div className="flex items-center justify-end space-x-2 pt-2">
               <button
                 onClick={() => setShowRealApplyConfirm(false)}
@@ -1753,7 +2102,11 @@ export default function App() {
             </div>
 
             <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-              Google AI Studio で取得したAPIキーを入力してください。キーはOSのキーチェーン（資格情報マネージャー等）に安全に保存され、上部で選択したGeminiモデルによる超高精度なリアルタイム解析が可能になります。
+              Google AI Studio で取得したAPIキーを入力してください。
+              {IS_TAURI_RUNTIME
+                ? "キーはOSのキーチェーン（資格情報マネージャー等）に安全に保存され、"
+                : "Web版ではキーはこのブラウザのlocalStorageに保存されます（共有・公共のPCでは入力後、使い終わったら忘れずにクリアしてください）。"}
+              上部で選択したGeminiモデルによる超高精度なリアルタイム解析が可能になります。
             </p>
 
             <div className="space-y-1.5">
@@ -1946,6 +2299,16 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* 5.5. ターミナル監視モード（試験的機能）。閉じてもバックグラウンドでの監視自体は継続する
+          ため、show/hideはCSSのみで切り替え、コンポーネント自体はアンマウントしない。 */}
+      <TerminalWatchModal
+        open={showTerminalWatchModal}
+        onClose={() => setShowTerminalWatchModal(false)}
+        projectRoot={projectRoot}
+        onPickProjectRoot={handlePickProjectRoot}
+        onDetectedError={handleTerminalWatchError}
+      />
 
       {/* 6. トースト通知ポップアップ */}
       {toast && (

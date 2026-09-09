@@ -85,6 +85,102 @@ AttributeError: 'NoneType' object has no attribute 'user_id'`;
     expect(result.errorType).toContain("CORS");
   });
 
+  it("npmのERESOLVE(peer dependency競合)を手順(task)として検出する", () => {
+    const log = `npm ERR! code ERESOLVE
+npm ERR! ERESOLVE unable to resolve dependency tree
+npm ERR! Found: react@18.3.1
+npm ERR! peer react@19.0.0 from some-lib@2.0.0`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("ERESOLVE");
+    expect(result.fixType).toBe("task");
+    expect(result.summary).toContain("react@19.0.0");
+  });
+
+  it("EACCES/Permission deniedを手順(task)として検出する", () => {
+    const log = `Error: EACCES: permission denied, open '/usr/local/lib/node_modules'`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("EACCES");
+    expect(result.fixType).toBe("task");
+  });
+
+  it("Dockerデーモン未起動エラーを検出する", () => {
+    const log = `Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("デーモン未起動");
+    expect(result.fixType).toBe("task");
+  });
+
+  it("Dockerのディスク容量不足エラーを検出する", () => {
+    const log = `Error response from daemon: no space left on device`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("ディスク容量不足");
+  });
+
+  it("Gitの未コミット変更による競合を検出する", () => {
+    const log = `error: Your local changes to the following files would be overwritten by merge:
+        src/App.tsx
+Please commit your changes or stash them before you merge.`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("未コミットの変更");
+    expect(result.fixType).toBe("task");
+  });
+
+  it("Gitのマージコンフリクトを検出する", () => {
+    const log = `Auto-merging src/App.tsx
+CONFLICT (content): Merge conflict in src/App.tsx
+Automatic merge failed; fix conflicts and then commit the result.`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("マージコンフリクト");
+  });
+
+  it("TypeScriptコンパイルエラー(TSxxxx)からエラーコードを抽出する", () => {
+    const log = `src/App.tsx(42,10): error TS2345: Argument of type 'string' is not assignable to parameter of type 'number'.`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("TS2345");
+    expect(result.summary).toContain("Argument of type");
+  });
+
+  it("JavaScriptヒープメモリ不足エラーを検出する", () => {
+    const log = `<--- Last few GCs --->
+FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("OutOfMemory");
+    expect(result.fixType).toBe("task");
+  });
+
+  it("Java NullPointerExceptionを検出する", () => {
+    const log = `Exception in thread "main" java.lang.NullPointerException
+    at com.example.UserService.getName(UserService.java:15)`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("NullPointerException");
+  });
+
+  it("JSON.parseの構文解析エラーを検出する", () => {
+    const log = `SyntaxError: Unexpected token < in JSON at position 0`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("JSON.parse");
+  });
+
   it("未知のエラーは汎用フォールバックとして扱う", () => {
     const log = `Something completely unexpected happened in module Zeta`;
 

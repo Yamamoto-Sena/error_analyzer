@@ -1,5 +1,6 @@
-import { AnalysisResult, getOfficialDocLink } from "./analyzer";
-import { FALLBACK_MODEL_IDS } from "./models";
+import { AnalysisResult, getOfficialDocLink, TokenUsage } from "./analyzer";
+import { FALLBACK_MODEL_IDS, GeminiModelOption } from "./models";
+import { maskSensitiveInfo } from "./sanitize";
 
 // エラー画面のスクリーンショット等、Geminiに渡す画像データ（base64・MIMEタイプ）
 export interface GeminiImagePart {
@@ -15,12 +16,16 @@ export async function analyzeWithGemini(
   images: GeminiImagePart[] = []
 ): Promise<AnalysisResult> {
   const hasImages = images.length > 0;
+  // 外部API（Gemini）へ送信する直前に、ログ内のAPIキー・トークン・パスワード・
+  // メールアドレス・パブリックIP等の機密情報らしき文字列をマスクする。
+  // ローカルの解析（analyzer.ts）やUI表示には影響しない、送信専用の処理。
+  const { sanitized: sanitizedLog, maskedCount } = maskSensitiveInfo(log);
   const prompt = `あなたは新人エンジニアを指導する親切で極めて優秀なシニアテックリードです。
 以下の情報（エラーログ・スタックトレース、および/またはユーザーが自分の言葉で書いた症状・状況の説明）を深く読み解き、新人エンジニアが根本から理解・再発防止できるように、必ず指定されたJSONフォーマットのみで回答してください。Markdownのバッククォート（\`\`\`json）も含めず、純粋なJSONオブジェクトのみを出力してください。
 明確な例外メッセージやスタックトレースがなく、ユーザーによる自然文の症状説明のみが与えられた場合でも、記述内容から最も可能性の高い原因・エラー種別を推測し、断定を避けつつも具体的な仮説として提示してください。
 
 【入力内容】
-${log.trim() ? log : "(構造化されたログはありません。添付された画像や自然文の説明のみを参照して解析してください)"}
+${sanitizedLog.trim() ? sanitizedLog : "(構造化されたログはありません。添付された画像や自然文の説明のみを参照して解析してください)"}
 ${
   hasImages
     ? `
@@ -182,6 +187,19 @@ ${
       const cleanedText = text.trim().replace(/^```json\s*/i, "").replace(/\s*```$/i, "");
       const parsed = JSON.parse(cleanedText);
       const errorType = parsed.errorType || "Exception";
+      // トークン消費量（画面表示・セッション累計用）。Geminiが返さない場合もあるため、
+      // 3つとも揃って初めて意味のある数値として扱う（片方だけ欠けると誤解を招くため）。
+      const usage = data.usageMetadata;
+      const tokenUsage: TokenUsage | undefined =
+        typeof usage?.promptTokenCount === "number" &&
+        typeof usage?.candidatesTokenCount === "number" &&
+        typeof usage?.totalTokenCount === "number"
+          ? {
+              promptTokens: usage.promptTokenCount,
+              responseTokens: usage.candidatesTokenCount,
+              totalTokens: usage.totalTokenCount,
+            }
+          : undefined;
       return {
         errorType,
         summary: parsed.summary || "エラーが検出されました。",
@@ -204,6 +222,9 @@ ${
         quotaExceededModels: quotaExceededModels.length > 0 ? [...quotaExceededModels] : undefined,
         // 修正箇所に関連する公式ドキュメント（判別できた場合のみ）
         officialDocLink: getOfficialDocLink(errorType, log) ?? undefined,
+        // 送信前にマスクした機密情報らしき箇所の件数（ユーザーへの透明性表示用）
+        maskedSecretsCount: maskedCount > 0 ? maskedCount : undefined,
+        tokenUsage,
       };
     } catch (err) {
       lastError = err as Error;
@@ -212,5 +233,50 @@ ${
   }
 
   throw lastError || new Error("Gemini API で利用可能なモデルが見つかりませんでした (404)。APIキーの権限をご確認ください。");
+}
+
+/**
+ * Google AI Studio が現在そのAPIキーで実際に利用可能なモデル一覧を動的に取得する。
+ * src/models.ts のハードコードされた一覧は、Google側のラインナップ変更（新モデル追加・
+ * 旧モデル廃止）に追従できないという弱点があるため、可能な場合はこちらを優先して使う。
+ * 呼び出し側は失敗時（オフライン・キー未設定・権限不足等）に models.ts の
+ * AVAILABLE_MODELS へフォールバックすること。
+ */
+export async function listAvailableModels(apiKey: string): Promise<GeminiModelOption[]> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  let response: Response;
+  try {
+    response = await fetch("https://generativelanguage.googleapis.com/v1beta/models", {
+      method: "GET",
+      headers: { "x-goog-api-key": apiKey },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    throw new Error(`モデル一覧の取得に失敗しました (${response.status})`);
+  }
+
+  const data = await response.json();
+  const models: unknown[] = Array.isArray(data.models) ? data.models : [];
+
+  const options: GeminiModelOption[] = models
+    .map((m) => m as { name?: string; displayName?: string; supportedGenerationMethods?: string[] })
+    // このアプリはテキスト生成(generateContent)のみを使うため、対応していないモデル
+    // （embedding専用モデル等）は選択肢から除外する
+    .filter((m) => m.name && m.supportedGenerationMethods?.includes("generateContent"))
+    .map((m) => {
+      // API上の名前は "models/gemini-3.5-flash-lite" 形式なのでプレフィックスを除去する
+      const value = m.name!.replace(/^models\//, "");
+      return { value, label: m.displayName ? `${m.displayName}` : value };
+    });
+
+  // 重複除去（同名モデルが複数バリアントで返る場合がある）
+  const seen = new Set<string>();
+  return options.filter((o) => (seen.has(o.value) ? false : (seen.add(o.value), true)));
 }
 
