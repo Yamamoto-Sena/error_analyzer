@@ -44,17 +44,15 @@ develop/
 │   └── main.tsx             # エントリーポイント
 ├── src-tauri/
 │   └── src/
-│       ├── lib.rs            # Tauriコマンド（フォルダ選択・適用可否判定・適用・ロールバック）
+│       ├── lib.rs            # Tauriコマンド（フォルダ選択・適用可否判定・適用・ロールバック・APIキー管理）
 │       ├── fix_apply.rs      # diff解析・安全なパス解決・適用ロジック（純粋関数・テスト付き）
+│       ├── secret_store.rs   # Gemini APIキーのOSキーチェーン保存・読み込み
 │       └── main.rs
-├── python-cli/               # 初期プロトタイプのPython CLI（現在は未使用・開発停止中）
 ├── 01_requirements_definition.md
 ├── 02_introduction_spec.md
 ├── package.json
 └── vite.config.ts
 ```
-
-> `python-cli/` は開発初期に検討していたPython/Typer製CLI版の名残です。現在アクティブに開発されているのは Tauri + React によるデスクトップアプリ（本README）であり、`python-cli/` は各コマンドが未実装のスタブのままとなっています。
 
 ---
 
@@ -81,7 +79,7 @@ pnpm dev:web
 ```
 
 ### 3. Gemini APIキーの設定
-`.env` ファイルは使用しません。アプリ起動後、右上の **「Gemini AI: APIキー設定」** ボタンからGoogle AI Studioで取得したAPIキーを入力してください。キーはブラウザ（Webview）のlocalStorageにのみ保存されます。未設定でもローカル解析エンジンで動作します。
+`.env` ファイルは使用しません。アプリ起動後、右上の **「Gemini AI: APIキー設定」** ボタンからGoogle AI Studioで取得したAPIキーを入力してください。キーはOSのキーチェーン（Windowsの資格情報マネージャー等、[src-tauri/src/secret_store.rs](src-tauri/src/secret_store.rs)経由）に保存されます。未設定でもローカル解析エンジンで動作します。
 
 キーの取得: https://aistudio.google.com/app/apikey
 
@@ -95,8 +93,11 @@ pnpm tauri build  # デスクトップアプリのインストーラー生成
 
 ## 🧪 テスト
 
-Rust側の判定・適用ロジックにはユニットテストがあります。
 ```bash
+# フロントエンド（解析ロジック: src/analyzer.ts, src/gemini.ts）
+pnpm test
+
+# Rust側（diff適用・バックアップ世代管理などの判定・適用ロジック）
 cd src-tauri
 cargo test
 ```

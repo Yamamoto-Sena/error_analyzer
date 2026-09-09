@@ -1,5 +1,7 @@
 // 修正案(diff)を実ファイルへ安全に適用するための純粋ロジック（判定・パッチ計算のみ）。
 mod fix_apply;
+// Gemini APIキーをOSキーチェーンに保存・読み込みするための薄いラッパー。
+mod secret_store;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,10 @@ fn greet(name: &str) -> String {
 const BACKUP_DIR_NAME: &str = ".debug-buddy-backups";
 /// バックアップの一覧（id ⇔ 元のファイルの相対パス の対応）を記録するファイル名
 const MANIFEST_FILE_NAME: &str = "manifest.json";
+/// 同一ファイルにつき保持するバックアップの最大件数。これを超えた分は
+/// 作成日時が古い順に自動で削除し、`.debug-buddy-backups` が無制限に
+/// 肥大化するのを防ぐ（頻繁に「実ファイルに適用」を使うプロジェクトほど効く）。
+const MAX_BACKUPS_PER_FILE: usize = 20;
 
 /// `apply_fix` が返す結果。フロントエンドはこの `backup_id` を覚えておき、
 /// ロールバック時に `rollback_fix` へそのまま渡す。
@@ -120,6 +126,54 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 同一ファイル(`relative_path`)のバックアップが`MAX_BACKUPS_PER_FILE`件を超えている場合、
+/// 作成日時が古い順に超過分の`.bak`ファイルを削除し、`entries`からも取り除く。
+/// バックアップ本体の削除に失敗しても致命的ではないため無視する
+/// （ディスク容量を圧迫しないことが目的で、削除の失敗で適用処理全体を失敗させたくないため）。
+fn prune_backups_for_path(root: &Path, entries: &mut Vec<BackupEntry>, relative_path: &str) {
+    let mut same_file_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.relative_path == relative_path)
+        .map(|(i, _)| i)
+        .collect();
+
+    if same_file_indices.len() <= MAX_BACKUPS_PER_FILE {
+        return;
+    }
+
+    // 古い順（created_at_unix_ms昇順）に並べ、超過分だけ削除対象にする
+    same_file_indices.sort_by_key(|&i| entries[i].created_at_unix_ms);
+    let excess_count = same_file_indices.len() - MAX_BACKUPS_PER_FILE;
+    let remove_set: std::collections::HashSet<usize> =
+        same_file_indices.into_iter().take(excess_count).collect();
+
+    for &i in &remove_set {
+        let backup_file = backup_dir(root).join(format!("{}.bak", entries[i].id));
+        let _ = fs::remove_file(backup_file);
+    }
+
+    let mut i = 0usize;
+    entries.retain(|_| {
+        let keep = !remove_set.contains(&i);
+        i += 1;
+        keep
+    });
+}
+
+/// Gemini APIキーをOSキーチェーンに保存する（空文字なら削除）。
+/// 実処理は `secret_store` モジュールに委譲する。
+#[tauri::command]
+fn save_api_key(key: String) -> Result<(), String> {
+    secret_store::save_api_key(&key)
+}
+
+/// OSキーチェーンからGemini APIキーを読み込む。未保存の場合は `null`（`None`）を返す。
+#[tauri::command]
+fn load_api_key() -> Result<Option<String>, String> {
+    secret_store::load_api_key()
+}
+
 /// プロジェクトフォルダをネイティブのダイアログで選ばせる。
 /// フロントエンドはJS版の `@tauri-apps/plugin-dialog` を一切呼ばず、この専用コマンドだけを使う
 /// （フロントエンドに公開する操作を「フォルダを選ぶ」の1つだけに絞るための設計）。
@@ -178,12 +232,14 @@ fn apply_fix(root: String, file_path: String, diff_code: String) -> Result<Apply
     let mut entries = read_manifest(root_path)?;
     entries.push(BackupEntry {
         id: id.clone(),
-        relative_path,
+        relative_path: relative_path.clone(),
         created_at_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0),
     });
+    // 同一ファイルのバックアップが溜まり続けないよう、上限を超えた古いものを削除する
+    prune_backups_for_path(root_path, &mut entries, &relative_path);
     write_manifest(root_path, &entries)?;
 
     // 3. バックアップとマニフェストの両方が確定してから、実ファイルを書き換える
@@ -193,6 +249,21 @@ fn apply_fix(root: String, file_path: String, diff_code: String) -> Result<Apply
         backup_id: id,
         applied_path: applied.resolved_path.to_string_lossy().to_string(),
     })
+}
+
+/// `.debug-buddy-backups` ディレクトリ（バックアップ本体・マニフェストの両方）を
+/// まるごと削除する。自動プルーニング（`MAX_BACKUPS_PER_FILE`）とは別に、
+/// ユーザーが明示的にディスク容量を整理したい場合のための機能。
+/// 適用済みの対象ファイル自体には一切触れない（削除するのはバックアップのみ）。
+#[tauri::command]
+fn clear_all_backups(root: String) -> Result<(), String> {
+    let root_path = Path::new(&root);
+    let dir = backup_dir(root_path);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)
+            .map_err(|e| format!("バックアップフォルダの削除に失敗しました: {e}"))?;
+    }
+    Ok(())
 }
 
 /// `apply_fix` が作成したバックアップから、対象ファイルの内容を復元する。
@@ -268,6 +339,96 @@ mod tests {
     }
 
     #[test]
+    fn prune_backups_for_path_keeps_only_newest_entries_and_deletes_old_bak_files() {
+        let tmp = TempDir::new();
+        fs::create_dir_all(backup_dir(&tmp.0)).unwrap();
+
+        let total = MAX_BACKUPS_PER_FILE + 5;
+        let mut entries: Vec<BackupEntry> = (0..total)
+            .map(|i| {
+                let id = format!("id-{i}");
+                fs::write(backup_dir(&tmp.0).join(format!("{id}.bak")), "dummy").unwrap();
+                BackupEntry {
+                    id,
+                    relative_path: "app.py".to_string(),
+                    created_at_unix_ms: i as u128,
+                }
+            })
+            .collect();
+
+        prune_backups_for_path(&tmp.0, &mut entries, "app.py");
+
+        assert_eq!(entries.len(), MAX_BACKUPS_PER_FILE);
+        // 残っているのは新しい(created_at_unix_msが大きい)ものだけ
+        assert!(entries.iter().all(|e| e.created_at_unix_ms >= 5));
+        // 削除されたはずの古いバックアップ本体はディスク上からも消えている
+        for i in 0..5 {
+            assert!(!backup_dir(&tmp.0).join(format!("id-{i}.bak")).exists());
+        }
+        // 残っているはずの新しいバックアップ本体はディスク上に残っている
+        for i in 5..total {
+            assert!(backup_dir(&tmp.0).join(format!("id-{i}.bak")).exists());
+        }
+    }
+
+    #[test]
+    fn prune_backups_for_path_does_not_touch_other_files() {
+        let tmp = TempDir::new();
+        fs::create_dir_all(backup_dir(&tmp.0)).unwrap();
+
+        let mut entries: Vec<BackupEntry> = (0..(MAX_BACKUPS_PER_FILE + 3))
+            .map(|i| BackupEntry {
+                id: format!("a-{i}"),
+                relative_path: "a.py".to_string(),
+                created_at_unix_ms: i as u128,
+            })
+            .collect();
+        entries.push(BackupEntry {
+            id: "b-only".to_string(),
+            relative_path: "b.py".to_string(),
+            created_at_unix_ms: 0,
+        });
+
+        prune_backups_for_path(&tmp.0, &mut entries, "a.py");
+
+        // 別ファイル(b.py)のエントリはプルーニング対象にならない
+        assert!(entries.iter().any(|e| e.relative_path == "b.py"));
+        assert_eq!(
+            entries.iter().filter(|e| e.relative_path == "a.py").count(),
+            MAX_BACKUPS_PER_FILE
+        );
+    }
+
+    #[test]
+    fn clear_all_backups_removes_backup_directory_entirely() {
+        let tmp = TempDir::new();
+        let root = tmp.0.to_string_lossy().to_string();
+        fs::write(tmp.0.join("sample.py"), "line1\nold_value\nline3\n").unwrap();
+        let diff = "@@ -1,3 +1,3 @@\nline1\n-old_value\n+new_value\nline3\n".to_string();
+        apply_fix(root.clone(), "sample.py".to_string(), diff).unwrap();
+        assert!(backup_dir(&tmp.0).exists());
+
+        clear_all_backups(root).unwrap();
+
+        assert!(!backup_dir(&tmp.0).exists());
+        // 適用済みの対象ファイル自体は削除されない
+        assert_eq!(
+            fs::read_to_string(tmp.0.join("sample.py")).unwrap(),
+            "line1\nnew_value\nline3\n"
+        );
+    }
+
+    #[test]
+    fn clear_all_backups_is_a_no_op_when_no_backups_exist_yet() {
+        let tmp = TempDir::new();
+        let root = tmp.0.to_string_lossy().to_string();
+
+        clear_all_backups(root).unwrap();
+
+        assert!(!backup_dir(&tmp.0).exists());
+    }
+
+    #[test]
     fn apply_fix_refuses_and_writes_nothing_when_diff_does_not_match() {
         let tmp = TempDir::new();
         let root = tmp.0.to_string_lossy().to_string();
@@ -292,10 +453,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             greet,
+            save_api_key,
+            load_api_key,
             pick_project_root,
             check_fix_applicability,
             apply_fix,
-            rollback_fix
+            rollback_fix,
+            clear_all_backups
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

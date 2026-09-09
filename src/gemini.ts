@@ -1,4 +1,5 @@
 import { AnalysisResult, getOfficialDocLink } from "./analyzer";
+import { FALLBACK_MODEL_IDS } from "./models";
 
 // エラー画面のスクリーンショット等、Geminiに渡す画像データ（base64・MIMEタイプ）
 export interface GeminiImagePart {
@@ -67,11 +68,9 @@ ${
   ]
 }`;
 
-  // Google AI Studio の公式有効モデル候補（指定モデルを最優先、次に現行の代表的モデルで自動試行）
-  // 注: gemini-1.5-flash/pro, gemini-2.0-flash は廃止済みのため候補から除外
-  const candidateModels = Array.from(
-    new Set([modelName, "gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"])
-  );
+  // Google AI Studio の公式有効モデル候補（指定モデルを最優先、次にsrc/models.tsで定義した
+  // 現行の代表的モデルで自動試行。一覧はApp.tsxの表示用一覧と共通のファイルで一元管理している）
+  const candidateModels = Array.from(new Set([modelName, ...FALLBACK_MODEL_IDS]));
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   // 503(UNAVAILABLE) や 429のうち「一時的な混雑・レート制限」は、

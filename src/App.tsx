@@ -38,11 +38,13 @@ import {
   ClipboardList,
   FolderOpen,
   Save,
+  Trash2,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { analyzeErrorLog, AnalysisResult } from "./analyzer";
 import { analyzeWithGemini } from "./gemini";
+import { AVAILABLE_MODELS, DEFAULT_MODEL } from "./models";
 
 // 実ファイルへ安全適用できるかどうかの判定結果(Rust側 check_fix_applicability の戻り値)
 interface FixApplyCheck {
@@ -133,20 +135,6 @@ function expandSearchQuery(rawQuery: string): string[] {
 
   return Array.from(expanded).filter(Boolean);
 }
-
-// 選択可能な Gemini モデル一覧（現行の Flash 系ラインナップ）
-const AVAILABLE_MODELS: { value: string; label: string }[] = [
-  { value: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash-Lite（既定・軽量高速）" },
-  { value: "gemini-flash-latest", label: "Gemini Flash（最新版・自動追従）" },
-  { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
-  { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash" },
-  { value: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
-  { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
-  { value: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash-Lite" },
-];
-
-// アプリの既定（初期表示）モデル
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 
 // 初心者向けサンプルログ群
 const SAMPLE_LOGS = {
@@ -325,16 +313,53 @@ export default function App() {
   const [showRealApplyConfirm, setShowRealApplyConfirm] = useState<boolean>(false);
   const [isRealApplying, setIsRealApplying] = useState<boolean>(false);
   const [isRollingBackReal, setIsRollingBackReal] = useState<boolean>(false);
+  const [isClearingBackups, setIsClearingBackups] = useState<boolean>(false);
   const [realApplyResult, setRealApplyResult] = useState<{ backupId: string; appliedPath: string } | null>(
     null
   );
 
-  // 初期ロード時に localStorage から APIキー・履歴・モデル選択・テーマを復元
+  // APIキーの読み込み（OSキーチェーン優先、Tauri外や旧バージョンからの移行はlocalStorageにフォールバック）。
+  // 他の初期化（履歴・モデル選択・テーマ等）は同期的なlocalStorage読み込みのみなので、
+  // 非同期処理が必要なAPIキーだけ別のeffectに分けている。
   useEffect(() => {
-    const savedKey = localStorage.getItem("debug_buddy_gemini_key") || "";
-    setApiKey(savedKey);
-    setTempApiKey(savedKey);
+    let cancelled = false;
 
+    (async () => {
+      try {
+        // 1. まずOSキーチェーンから読み込みを試みる（Tauriアプリ内でのみ動作）
+        const stored = await invoke<string | null>("load_api_key");
+        if (cancelled) return;
+        if (stored) {
+          setApiKey(stored);
+          setTempApiKey(stored);
+          return;
+        }
+      } catch {
+        // invokeが使えない(dev:web等のTauri外プレビュー)場合は、下のlocalStorage読み込みにフォールバックする
+      }
+
+      // 2. キーチェーンに値が無い場合: 旧バージョンでlocalStorageに平文保存されていたキーが
+      //    残っていないか確認し、あれば読み込みつつキーチェーンへ移行する（移行できたらlocalStorageからは消す）
+      const legacyKey = localStorage.getItem("debug_buddy_gemini_key") || "";
+      if (!legacyKey) return;
+      if (cancelled) return;
+      setApiKey(legacyKey);
+      setTempApiKey(legacyKey);
+      try {
+        await invoke("save_api_key", { key: legacyKey });
+        localStorage.removeItem("debug_buddy_gemini_key");
+      } catch {
+        // キーチェーンへの移行に失敗した場合は、これまで通りlocalStorageに残したままにする
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 初期ロード時に localStorage から 履歴・モデル選択・テーマ等を復元
+  useEffect(() => {
     const savedHistory = localStorage.getItem("debug_buddy_history");
     if (savedHistory) {
       try {
@@ -479,10 +504,18 @@ export default function App() {
     }, 4000);
   };
 
-  const saveApiKey = () => {
+  const saveApiKey = async () => {
     const cleanKey = tempApiKey.trim();
     setApiKey(cleanKey);
-    localStorage.setItem("debug_buddy_gemini_key", cleanKey);
+    try {
+      // OSキーチェーンへ保存（空文字なら削除として扱われる。詳細はsrc-tauri/src/secret_store.rs参照）
+      await invoke("save_api_key", { key: cleanKey });
+      // キーチェーンへの保存に成功したら、移行前の平文コピーが残っていないよう念のため削除する
+      localStorage.removeItem("debug_buddy_gemini_key");
+    } catch {
+      // invokeが使えない(dev:web等のTauri外プレビュー)場合のみ、従来通りlocalStorageに保存する
+      localStorage.setItem("debug_buddy_gemini_key", cleanKey);
+    }
     setShowKeyModal(false);
     if (cleanKey) {
       showToast("Gemini APIキーを保存しました！リアルタイム解析が有効です", "success");
@@ -702,6 +735,28 @@ export default function App() {
     setProjectRoot(null);
     localStorage.removeItem("debug_buddy_project_root");
     showToast("プロジェクトフォルダの設定を解除しました", "info");
+  };
+
+  // 「実ファイルへの適用」を使うたびに溜まっていくバックアップ(.debug-buddy-backups)を
+  // まとめて削除する。自動的な世代管理（直近20件/ファイルまで保持）とは別に、
+  // ユーザーが明示的にディスク容量を整理したい場合のための手動操作。
+  const handleClearAllBackups = async () => {
+    if (!projectRoot) return;
+    const confirmed = window.confirm(
+      "このプロジェクトのバックアップ（過去に「実ファイルに適用」した際の復元用データ）をすべて削除します。よろしいですか？\n※適用済みのファイル自体は変更されません。ロールバックできなくなる点のみご注意ください。"
+    );
+    if (!confirmed) return;
+
+    setIsClearingBackups(true);
+    try {
+      await invoke("clear_all_backups", { root: projectRoot });
+      setRealApplyResult(null);
+      showToast("バックアップをすべて削除しました", "info");
+    } catch (err) {
+      showToast(`バックアップの削除に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+    } finally {
+      setIsClearingBackups(false);
+    }
   };
 
   // 実ファイルへの適用（確認モーダルでのOK後に実行される）。
@@ -958,13 +1013,23 @@ export default function App() {
             </span>
           </button>
           {projectRoot && (
-            <button
-              onClick={handleClearProjectRoot}
-              title="プロジェクトフォルダの設定を解除"
-              className="flex items-center justify-center p-1.5 rounded-lg text-slate-400 hover:text-rose-500 dark:hover:text-rose-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
+            <>
+              <button
+                onClick={handleClearAllBackups}
+                disabled={isClearingBackups}
+                title="このプロジェクトの修正バックアップ(.debug-buddy-backups)をすべて削除して整理します"
+                className="flex items-center justify-center p-1.5 rounded-lg text-slate-400 hover:text-amber-500 dark:hover:text-amber-400 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 transition cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={handleClearProjectRoot}
+                title="プロジェクトフォルダの設定を解除"
+                className="flex items-center justify-center p-1.5 rounded-lg text-slate-400 hover:text-rose-500 dark:hover:text-rose-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </>
           )}
 
           {/* 履歴モーダルボタン（見つけやすいよう強調表示） */}
@@ -1688,7 +1753,7 @@ export default function App() {
             </div>
 
             <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-              Google AI Studio で取得したAPIキーを入力してください。キーはローカルブラウザ内にのみ安全に保存され、上部で選択したGeminiモデルによる超高精度なリアルタイム解析が可能になります。
+              Google AI Studio で取得したAPIキーを入力してください。キーはOSのキーチェーン（資格情報マネージャー等）に安全に保存され、上部で選択したGeminiモデルによる超高精度なリアルタイム解析が可能になります。
             </p>
 
             <div className="space-y-1.5">
