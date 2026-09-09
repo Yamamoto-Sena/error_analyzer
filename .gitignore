@@ -45,3 +45,6 @@ env/
 .coverage
 htmlcov/
 
+# Node / Vite / Tauri build output
+node_modules/
+

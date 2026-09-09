@@ -77,6 +77,9 @@ ${
   // 503(UNAVAILABLE) や 429のうち「一時的な混雑・レート制限」は、
   // 別モデルに切り替える前に同一モデルへ軽くリトライする
   const RETRY_DELAYS_MS = [1000, 2000];
+  // ネットワークが応答不能になった場合でも解析ボタンが永久に固まらないよう、
+  // 1回のfetchごとに上限を設けて必ず中断する
+  const FETCH_TIMEOUT_MS = 45_000;
 
   // RPD(1日あたりの上限)などのクォータ超過でスキップしたモデルを記録（診断用）
   const quotaExceededModels: string[] = [];
@@ -84,35 +87,55 @@ ${
 
   for (const model of candidateModels) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      // APIキーはURLクエリではなく x-goog-api-key ヘッダーで送る
+      // （devtoolsのネットワークログ等にキーがそのまま残ってしまうのを避けるため）
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
       let response: Response;
       let errorBodyText: string | null = null;
       let attempt = 0;
 
       while (true) {
-        response = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  { text: prompt },
-                  ...images.map((img) => ({
-                    inline_data: { mime_type: img.mimeType, data: img.data },
-                  })),
-                ],
-              },
-            ],
-            generationConfig: {
-              responseMimeType: "application/json",
-              temperature: 0.2,
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+        try {
+          response = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": apiKey,
             },
-          }),
-        });
+            signal: controller.signal,
+            body: JSON.stringify({
+              contents: [
+                {
+                  parts: [
+                    { text: prompt },
+                    ...images.map((img) => ({
+                      inline_data: { mime_type: img.mimeType, data: img.data },
+                    })),
+                  ],
+                },
+              ],
+              generationConfig: {
+                responseMimeType: "application/json",
+                temperature: 0.2,
+              },
+            }),
+          });
+        } catch (fetchErr) {
+          // タイムアウト(AbortError)の場合は、ネットワークがハングしたまま
+          // 「解析中...」が固まり続けないよう、分かりやすいメッセージにして
+          // 通常のエラーフロー（次候補モデルへの切り替え/最終エラー送出）に乗せる
+          if (fetchErr instanceof DOMException && fetchErr.name === "AbortError") {
+            throw new Error(
+              `Gemini APIへの接続がタイムアウトしました（${FETCH_TIMEOUT_MS / 1000}秒経過）。ネットワーク状態をご確認のうえ、もう一度お試しください。`
+            );
+          }
+          throw fetchErr;
+        } finally {
+          clearTimeout(timeoutId);
+        }
 
         if (response.status === 429 || response.status === 503) {
           errorBodyText = await response.text();
