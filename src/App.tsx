@@ -284,6 +284,14 @@ function TaskStepsView({ steps }: { steps: string[] }) {
   );
 }
 
+// このページが実際のTauriデスクトップアプリ（ネイティブWebView）内で動いているか、
+// それとも通常のブラウザ（GitHub Pages版のWeb版等）で動いているかを判定する。
+// Tauri v2 は起動時に window.__TAURI_INTERNALS__ を注入するため、その有無で判定できる。
+// プロジェクトフォルダ選択・実ファイル適用・Git汚れ判定・ターミナル監視など、
+// OSのファイルシステム/プロセスに触れる機能はWeb版では原理的に提供できないため、
+// これを使って該当UIを無効化・注記する（invokeが失敗して分かりにくいトーストが出るのを防ぐ）。
+const IS_TAURI_RUNTIME = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
 export default function App() {
   const [logInput, setLogInput] = useState<string>("");
   // ログが手元にない場合でも解析できるよう、自由記述の症状・状況説明を別枠で受け付ける
@@ -1208,26 +1216,35 @@ export default function App() {
             </span>
           )}
 
-          {/* ターミナル監視モード（開発コマンドをアプリ内から実行し、出力をリアルタイム監視する） */}
+          {/* ターミナル監視モード（開発コマンドをアプリ内から実行し、出力をリアルタイム監視する）。
+              サブプロセス起動が必要なため、デスクトップアプリ版でのみ利用できる。 */}
           <button
-            onClick={() => setShowTerminalWatchModal(true)}
-            title="開発コマンドをアプリ内から実行し、出力を監視します（試験的機能）"
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 transition cursor-pointer"
+            onClick={() => IS_TAURI_RUNTIME && setShowTerminalWatchModal(true)}
+            disabled={!IS_TAURI_RUNTIME}
+            title={
+              IS_TAURI_RUNTIME
+                ? "開発コマンドをアプリ内から実行し、出力を監視します（試験的機能）"
+                : "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
+            }
+            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300 transition cursor-pointer"
           >
             <Terminal className="w-3.5 h-3.5" />
             <span>ターミナル監視</span>
           </button>
 
-          {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定） */}
+          {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定）。
+              ネイティブのフォルダ選択ダイアログ・ファイルI/Oが必要なため、Web版では利用できない。 */}
           <button
-            onClick={handlePickProjectRoot}
-            disabled={isPickingRoot}
+            onClick={() => IS_TAURI_RUNTIME && handlePickProjectRoot()}
+            disabled={isPickingRoot || !IS_TAURI_RUNTIME}
             title={
-              projectRoot
+              !IS_TAURI_RUNTIME
+                ? "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
+                : projectRoot
                 ? `プロジェクトフォルダ: ${projectRoot}（クリックで変更）`
                 : "プロジェクトフォルダを選択すると、実ファイルへの安全な自動適用が使えます"
             }
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer disabled:opacity-60 max-w-[220px] ${
+            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed max-w-[220px] ${
               projectRoot
                 ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
                 : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700"
@@ -1846,7 +1863,15 @@ export default function App() {
                           <span>実ファイルへの適用（オプション）</span>
                         </h4>
 
-                        {!projectRoot ? (
+                        {!IS_TAURI_RUNTIME ? (
+                          <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed flex items-start space-x-1.5">
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400 shrink-0 mt-0.5" />
+                            <span>
+                              この機能（実ファイルへの安全な適用）はデスクトップアプリ版でのみ利用できます。
+                              Web版では上の差分を「差分をコピー」してご自身のエディタで適用してください。
+                            </span>
+                          </p>
+                        ) : !projectRoot ? (
                           <div className="flex items-center justify-between gap-3 flex-wrap">
                             <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
                               プロジェクトフォルダを選択すると、安全性を確認したうえで実際のファイルへ書き込めます（対応できないケースはこれまで通りプレビューのみになります）。
@@ -2077,7 +2102,11 @@ export default function App() {
             </div>
 
             <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-              Google AI Studio で取得したAPIキーを入力してください。キーはOSのキーチェーン（資格情報マネージャー等）に安全に保存され、上部で選択したGeminiモデルによる超高精度なリアルタイム解析が可能になります。
+              Google AI Studio で取得したAPIキーを入力してください。
+              {IS_TAURI_RUNTIME
+                ? "キーはOSのキーチェーン（資格情報マネージャー等）に安全に保存され、"
+                : "Web版ではキーはこのブラウザのlocalStorageに保存されます（共有・公共のPCでは入力後、使い終わったら忘れずにクリアしてください）。"}
+              上部で選択したGeminiモデルによる超高精度なリアルタイム解析が可能になります。
             </p>
 
             <div className="space-y-1.5">
