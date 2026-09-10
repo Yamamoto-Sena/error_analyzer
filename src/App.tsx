@@ -109,6 +109,9 @@ function colorForErrorType(errorType: string) {
 // 添付画像1件あたりの最大サイズ（4MB）
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 
+// 解析履歴の保存件数上限（localStorage）
+const MAX_HISTORY_ITEMS = 100;
+
 // 全角/半角・大文字小文字・空白や記号の違いなど「表記ゆれ」を吸収するための正規化
 function normalizeForSearch(text: string): string {
   return text
@@ -729,6 +732,26 @@ export default function App() {
     }
   };
 
+  // 解析結果を履歴に積んで保存する（新規解析・再検証どちらからも呼ばれる共通処理）。
+  // 「エラー種別 + ファイルパス + 行番号」が一致する既存の履歴（＝同じ箇所で起きた同じエラー）は
+  // 古い方を削除してから今回の結果を先頭に追加することで、同じエラーの繰り返しで履歴が
+  // 埋まってしまわず、実質的により多くの“異なる”エラーを記録できるようにする。
+  const saveToHistory = (result: AnalysisResult) => {
+    const newItem: HistoryItem = {
+      id: Date.now().toString(),
+      timestamp: new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
+      result,
+    };
+    const isSameError = (item: HistoryItem) =>
+      item.result.errorType === result.errorType &&
+      item.result.filePath === result.filePath &&
+      item.result.lineNumber === result.lineNumber;
+    const deduped = history.filter((item) => !isSameError(item));
+    const updatedHistory = [newItem, ...deduped].slice(0, MAX_HISTORY_ITEMS);
+    setHistory(updatedHistory);
+    localStorage.setItem("debug_buddy_history", JSON.stringify(updatedHistory));
+  };
+
   // 解析実行（Gemini API または ローカル解析エンジンのハイブリッド）。
   // `overrideLog` が指定された場合（ターミナル監視モードからの自動解析）は、
   // logInputへの反映を待たずその文字列をそのまま解析対象にする(setState後の非同期タイミング問題を回避するため)。
@@ -807,16 +830,7 @@ export default function App() {
       setAnalysis(result);
       setHasResult(true);
       setActiveTab("cause");
-
-      // 履歴に追加して保存
-      const newItem: HistoryItem = {
-        id: Date.now().toString(),
-        timestamp: new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
-        result,
-      };
-      const updatedHistory = [newItem, ...history.slice(0, 19)];
-      setHistory(updatedHistory);
-      localStorage.setItem("debug_buddy_history", JSON.stringify(updatedHistory));
+      saveToHistory(result);
     } catch (err) {
       // APIエラー時はローカル解析へ安全にフォールバック
       console.error(err);
@@ -1098,15 +1112,7 @@ export default function App() {
       setActiveTab("cause");
       setIsApplied(false);
       setVerifyLogInput("");
-
-      const newItem: HistoryItem = {
-        id: Date.now().toString(),
-        timestamp: new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
-        result: recheck,
-      };
-      const updatedHistory = [newItem, ...history.slice(0, 19)];
-      setHistory(updatedHistory);
-      localStorage.setItem("debug_buddy_history", JSON.stringify(updatedHistory));
+      saveToHistory(recheck);
     } catch (err) {
       console.error(err);
       showToast(`検証中にエラーが発生しました (${(err as Error).message.slice(0, 40)}...)`, "warning");
