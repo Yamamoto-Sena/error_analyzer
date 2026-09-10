@@ -279,9 +279,20 @@ export async function listAvailableModels(apiKey: string): Promise<GeminiModelOp
     // generateContentに対応していても、このアプリの用途（エラーログのテキスト解析。画像は
     // スクリーンショットの「読み取り」= 入力としてのみ使う、1回のリクエストで構造化JSON
     // 応答を受け取る）には適さないため選択肢から除外する。
+    //
+    // 加えて、実機診断（診断機能でgenerateContentを実際に叩いた結果）で判明した、
+    // 課金プランやアカウントの新旧に関係なく「誰が呼んでも失敗する」モデルも除外する:
+    //  - lyria系: 音楽生成専用
+    //  - computer-use系: 画面操作エージェント専用
+    //  - deep-research系 / antigravity系: generateContentではなくInteractions API専用
+    //    （呼ぶと400 "This model only supports Interactions API"）
+    //  - transcribe系: 音声書き起こし専用
+    //  - gemini-2.5-flash / gemini-2.5-pro / gemini-2.5-flash-lite: 2026年時点でGoogle側が
+    //    新規ユーザーへの提供を終了しており、一覧には出るが呼ぶと404になる
+    //    （既存の古いプロジェクトのみ引き続き利用可）
     .filter(
       (m) =>
-        !/image|imagen|nano.?banana|\bveo\b|text-to-speech|\btts\b|robotics|\blive\b|\bomni\b/i.test(
+        !/image|imagen|nano.?banana|\bveo\b|text-to-speech|\btts\b|robotics|\blive\b|\bomni\b|lyria|computer-use|deep-research|antigravity|transcribe|gemini-2\.5-(flash|pro)(-lite)?\b/i.test(
           `${m.name} ${m.displayName ?? ""}`
         )
     )
@@ -294,5 +305,127 @@ export async function listAvailableModels(apiKey: string): Promise<GeminiModelOp
   // 重複除去（同名モデルが複数バリアントで返る場合がある）
   const seen = new Set<string>();
   return options.filter((o) => (seen.has(o.value) ? false : (seen.add(o.value), true)));
+}
+
+// 診断1件分の結果。
+// - "ok": 実際にgenerateContentが成功した
+// - "unavailable": 404/403等でこのAPIキーでは呼び出せない（一覧には出るが恒久的に使えない）
+// - "quota": 429のうち日次/月次クォータ超過が明確なもの（プランのアップグレード等をしない限り使えない）
+// - "rate_limited": 429/503のうち一時的な混雑・分あたり制限とみられるもの（後で再試行すれば使える可能性がある）
+// - "error": 上記に当てはまらないその他のエラー
+export type ModelDiagnosticStatus = "ok" | "unavailable" | "quota" | "rate_limited" | "error";
+
+export interface ModelDiagnosticResult {
+  value: string;
+  label: string;
+  status: ModelDiagnosticStatus;
+  httpStatus?: number;
+  message?: string;
+}
+
+const DIAGNOSTIC_TIMEOUT_MS = 20_000;
+// モデル間の送信間隔。0にすると連続リクエストが分あたりレート制限に触れやすく、
+// 「本来は使えるモデル」まで rate_limited と誤診断してしまうため、少し間隔を空ける。
+const DIAGNOSTIC_INTERVAL_MS = 500;
+// 429/503を一時的な混雑とみなして軽くリトライする回数（analyzeWithGeminiと同じ考え方）
+const DIAGNOSTIC_RETRY_DELAYS_MS = [1000, 2000];
+
+/**
+ * プルダウン（listAvailableModelsが返す一覧）に表示されている各モデルへ、実際に
+ * 最小限のgenerateContentリクエストを1回ずつ順番に送り、「一覧には出るが実際には
+ * 呼び出せない」モデルを洗い出す診断機能。
+ *
+ * 注意: モデルの数だけAPI呼び出し（＝クォータ消費）が発生するため、一覧取得のたびに
+ * 自動実行してはならず、ユーザーが診断ボタンを押した時だけ呼び出すこと。
+ */
+export async function diagnoseModels(
+  apiKey: string,
+  models: GeminiModelOption[],
+  onProgress?: (doneCount: number, total: number, current: GeminiModelOption) => void
+): Promise<ModelDiagnosticResult[]> {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const results: ModelDiagnosticResult[] = [];
+
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    onProgress?.(i, models.length, model);
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model.value}:generateContent`;
+    let attempt = 0;
+
+    while (true) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), DIAGNOSTIC_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+          signal: controller.signal,
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: "OKとだけ一言で返答してください。" }] }],
+            generationConfig: { maxOutputTokens: 8, temperature: 0 },
+          }),
+        });
+
+        if (response.ok) {
+          results.push({ value: model.value, label: model.label, status: "ok" });
+          break;
+        }
+
+        const bodyText = await response.text().catch(() => "");
+        let message = bodyText;
+        try {
+          message = JSON.parse(bodyText)?.error?.message || bodyText;
+        } catch {
+          // JSONでなければ本文をそのまま使う
+        }
+
+        if (response.status === 429 || response.status === 503) {
+          const isDailyQuota =
+            response.status === 429 &&
+            /RESOURCE_EXHAUSTED|quota/i.test(bodyText) &&
+            /per[\s_]?day|daily|PerDay/i.test(bodyText);
+
+          if (isDailyQuota) {
+            results.push({ value: model.value, label: model.label, status: "quota", httpStatus: response.status, message: message.slice(0, 300) });
+            break;
+          }
+
+          if (attempt < DIAGNOSTIC_RETRY_DELAYS_MS.length) {
+            await sleep(DIAGNOSTIC_RETRY_DELAYS_MS[attempt]);
+            attempt++;
+            continue;
+          }
+
+          results.push({ value: model.value, label: model.label, status: "rate_limited", httpStatus: response.status, message: message.slice(0, 300) });
+          break;
+        }
+
+        if (response.status === 404 || response.status === 403) {
+          results.push({ value: model.value, label: model.label, status: "unavailable", httpStatus: response.status, message: message.slice(0, 300) });
+          break;
+        }
+
+        results.push({ value: model.value, label: model.label, status: "error", httpStatus: response.status, message: message.slice(0, 300) });
+        break;
+      } catch (err) {
+        const isTimeout = err instanceof DOMException && err.name === "AbortError";
+        results.push({
+          value: model.value,
+          label: model.label,
+          status: "error",
+          message: isTimeout ? `タイムアウトしました（${DIAGNOSTIC_TIMEOUT_MS / 1000}秒）` : (err as Error).message,
+        });
+        break;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    if (i < models.length - 1) await sleep(DIAGNOSTIC_INTERVAL_MS);
+  }
+
+  onProgress?.(models.length, models.length, models[models.length - 1]);
+  return results;
 }
 

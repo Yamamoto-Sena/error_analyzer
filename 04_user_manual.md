@@ -17,10 +17,49 @@
 
 ## 2. 起動方法
 
-まず、`package.json` がある**プロジェクトフォルダのルート**に移動してから実行してください（別フォルダで実行すると後述のエラーになります）。
+**何も入っていないパソコンから始める場合**は、まず「2.0 事前準備」でツールを揃えてください。
+既にGit/Node.js/pnpm/Rustが入っている場合は「2.1 ソースコードの取得」まで読み飛ばしてOKです。
+
+### 2.0 事前準備（初めてこのパソコンでセットアップする場合）
+
+以下を**上から順に**インストールします（すべて無料・公式サイトから）。Windows環境を想定しています。
+
+| # | 何を | どこから | 補足 |
+|---|---|---|---|
+| 1 | **Git** | https://git-scm.com/downloads | インストーラーは基本すべて「Next」でOK。GitHub上のソースコードをダウンロード(clone)するのに使う |
+| 2 | **Node.js**（LTS版） | https://nodejs.org/ | JavaScript実行環境。インストーラー任せでOK |
+| 3 | **pnpm** | Node.jsインストール後、ターミナル（コマンドプロンプト/PowerShell）で `corepack enable` を実行 | このプロジェクトのパッケージ管理ツール |
+| 4 | **Rust** | https://www.rust-lang.org/tools/install → `rustup-init.exe` | デスクトップアプリ部分(Tauri)のビルドに必要。インストーラーは既定の「1) Proceed with installation」でOK |
+| 5 | **C++ビルドツール**（Windowsのみ） | https://visualstudio.microsoft.com/visual-cpp-build-tools/ | 「Visual Studio Build Tools」をダウンロードし、インストール画面で**「C++によるデスクトップ開発」**にチェックを入れてインストール（Tauriのビルドに必要。[Tauri公式の前提条件ページ](https://tauri.app/start/prerequisites/)にも詳細あり） |
+
+インストール後、一度PCを再起動するかターミナルを開き直してから、それぞれ正しく入ったかを確認します。
 
 ```bash
-cd C:\develop        # package.json があるフォルダ（クローン先の場合はそのフォルダ）
+git --version
+node -v
+pnpm -v
+rustc --version
+```
+
+すべてバージョン番号が表示されれば準備完了です（`'git' は認識されません` のようなエラーが出る場合は、そのソフトのインストールをやり直すか、PCの再起動をお試しください）。
+
+### 2.1 ソースコードの取得（clone）
+
+好きな場所（例: `C:\dev`）にフォルダを作り、そこにプロジェクトをダウンロードします。
+
+```bash
+cd C:\dev
+git clone https://github.com/Yamamoto-Sena/error_analyzer.git
+cd error_analyzer
+```
+
+> `C:\dev` フォルダがまだ無い場合は「指定されたパスが見つかりません」と表示されます。その場合は先に `mkdir C:\dev` を実行してから、もう一度上の3行を実行してください。
+
+### 2.2 起動コマンド
+
+`package.json` がある**プロジェクトフォルダのルート**（上でcloneしたフォルダ）で実行してください（別フォルダで実行すると後述のエラーになります）。
+
+```bash
 pnpm install          # 初回のみ。フォルダを移動/コピーした場合はそのフォルダで毎回必要
 pnpm tauri dev        # デスクトップアプリとして起動（推奨）
 ```
@@ -28,7 +67,7 @@ pnpm tauri dev        # デスクトップアプリとして起動（推奨）
 - 初回起動はRustのビルドが走るため数分かかります。2回目以降は速くなります。
 - ブラウザだけで軽く触りたい場合は `pnpm dev:web` も使えますが、その場合は「プロジェクトフォルダ選択」「実ファイル適用」「Git連携」「ターミナル監視」が無効化されます（グレーアウト＋ツールチップで理由が表示されます）。**`pnpm tauri dev`（デスクトップ版）での起動をおすすめします。**
 
-### 起動できない場合のトラブルシューティング
+### 2.3 起動できない場合のトラブルシューティング
 
 | 症状 | 原因 | 対処 |
 |---|---|---|
@@ -38,7 +77,7 @@ pnpm tauri dev        # デスクトップアプリとして起動（推奨）
 
 > 動作確認メモ: 本プロジェクトを `git clone` で別フォルダに複製し、そのフォルダで `pnpm install` → `pnpm tauri dev` を実行しても問題なく起動することを確認済みです。
 
-### Gemini APIキー（任意だが、設定した方がAI解析の使用感が分かります）
+### 2.4 Gemini APIキー（任意だが、設定した方がAI解析の使用感が分かります）
 - 右上の **「🔑 Gemini AI: APIキー設定」** ボタンから設定します。
 - キーは https://aistudio.google.com/app/apikey で無料取得できます（要Googleアカウント）。
 - キーはOSの資格情報マネージャー（Windows）に保存され、平文ファイルには残りません。
