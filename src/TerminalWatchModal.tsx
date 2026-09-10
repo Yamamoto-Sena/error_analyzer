@@ -45,13 +45,13 @@ export default function TerminalWatchModal({
     () => localStorage.getItem("debug_buddy_watch_auto_analyze") === "true"
   );
   const [errorDetected, setErrorDetected] = useState<boolean>(false);
-  const [pendingCapturedText, setPendingCapturedText] = useState<string>("");
   const [startError, setStartError] = useState<string | null>(null);
 
   // イベントリスナー内から常に最新の値を読めるようにするためのref
   // （useEffectは[]依存で一度しか登録しないため、stateを直接読むとクロージャが古くなる）
   const autoAnalyzeRef = useRef(autoAnalyze);
   const onDetectedErrorRef = useRef(onDetectedError);
+  const commandRef = useRef(command);
   const rawLinesRef = useRef<string[]>([]);
   const hasTriggeredRef = useRef(false);
   const outputBoxRef = useRef<HTMLDivElement>(null);
@@ -64,8 +64,22 @@ export default function TerminalWatchModal({
     onDetectedErrorRef.current = onDetectedError;
   }, [onDetectedError]);
   useEffect(() => {
+    commandRef.current = command;
     localStorage.setItem("debug_buddy_watch_command", command);
   }, [command]);
+
+  // 直近の出力ログから解析欄へ渡すテキストを組み立てる。
+  // 非ゼロ終了コードによる検知は、コマンドが実質何も標準出力/標準エラーへ
+  // 書き出さないまま失敗するケース（例: シェルのクォート解釈の違いで
+  // コマンド自体が起動に失敗する等）があり、その場合rawLinesRefが空のまま
+  // になりうる。出力が空の場合でも「何が起きたか」を最低限伝えられるよう、
+  // 実行コマンドと終了コードだけのフォールバック文を返す。
+  const buildCapturedText = (exitCodeForFallback?: number | null) => {
+    const raw = rawLinesRef.current.slice(-CAPTURE_LAST_N_LINES).join("\n");
+    if (raw.trim()) return raw;
+    const codeText = exitCodeForFallback === undefined ? "" : `\n終了コード: ${exitCodeForFallback ?? "不明"}`;
+    return `（このコマンドは標準出力・標準エラーに何も出力しませんでした）\n実行コマンド: ${commandRef.current}${codeText}`;
+  };
 
   // Tauriイベントの購読は、モーダルの開閉に関わらずマウント時に一度だけ行う。
   // (モーダルを閉じてもRust側のプロセス監視自体はバックグラウンドで継続しているため、
@@ -84,7 +98,7 @@ export default function TerminalWatchModal({
             setLines((prev) => [...prev, { stream, text: line }].slice(-MAX_LINES));
 
             if (!hasTriggeredRef.current && ERROR_SIGNAL_PATTERN.test(line)) {
-              triggerDetection();
+              triggerDetection(undefined);
             }
           }
         );
@@ -99,7 +113,7 @@ export default function TerminalWatchModal({
           setExitCode(event.payload.code);
           // 非ゼロ終了は、途中経過のログでキーワードに引っかからなくても「エラーの可能性」とみなす
           if (!hasTriggeredRef.current && event.payload.code !== null && event.payload.code !== 0) {
-            triggerDetection();
+            triggerDetection(event.payload.code);
           }
         });
         if (cancelled) {
@@ -113,13 +127,11 @@ export default function TerminalWatchModal({
       }
     })();
 
-    function triggerDetection() {
+    function triggerDetection(exitCodeForFallback: number | null | undefined) {
       hasTriggeredRef.current = true;
-      const captured = rawLinesRef.current.slice(-CAPTURE_LAST_N_LINES).join("\n");
-      setPendingCapturedText(captured);
       setErrorDetected(true);
       if (autoAnalyzeRef.current) {
-        onDetectedErrorRef.current(captured, true);
+        onDetectedErrorRef.current(buildCapturedText(exitCodeForFallback), true);
       }
     }
 
@@ -143,7 +155,6 @@ export default function TerminalWatchModal({
     rawLinesRef.current = [];
     hasTriggeredRef.current = false;
     setErrorDetected(false);
-    setPendingCapturedText("");
     setExitCode(undefined);
     try {
       await invoke("start_terminal_watch", { root: projectRoot, command });
@@ -166,15 +177,14 @@ export default function TerminalWatchModal({
   };
 
   const handleUseCapturedText = () => {
-    // 検知した瞬間(triggerDetection内)のpendingCapturedTextではなく、クリック時点の
-    // rawLinesRef.currentから改めて切り出す。特に「非ゼロ終了コード」による検知は、
-    // 直前まで出力されていた最後の数行がterminal-outputイベントとしてまだ画面に反映
-    // しきっていないタイミングと競合する可能性があり、その場合pendingCapturedTextが
-    // 実際より少ない（最悪空の）内容のまま固まってしまう。クリックはユーザーが
-    // バナーを見てから行う操作＝検知から確実に時間が経っているため、ここで読み直せば
-    // 出力の取りこぼしを避けられる。
-    const latest = rawLinesRef.current.slice(-CAPTURE_LAST_N_LINES).join("\n");
-    onDetectedError(latest || pendingCapturedText, false);
+    // 検知した瞬間(triggerDetection内)のスナップショットではなく、クリック時点で
+    // 改めて組み立て直す。特に「非ゼロ終了コード」による検知は、直前まで出力されていた
+    // 最後の数行がterminal-outputイベントとしてまだ画面に反映しきっていないタイミングと
+    // 競合する可能性があり、その場合検知時点の内容が実際より少ないまま固まってしまう。
+    // クリックはユーザーがバナーを見てから行う操作＝検知から確実に時間が経っているため、
+    // ここで読み直せば出力の取りこぼしを避けられる（それでも出力自体が空の場合は、
+    // buildCapturedTextが実行コマンド＋終了コードのフォールバック文を返す）。
+    onDetectedError(buildCapturedText(exitCode), false);
     onClose();
   };
 
