@@ -26,6 +26,10 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# ターミナル監視モードで、Windowsのコンソールアプリ(cmd.exe等)が日本語ロケールで出力する
+# Shift-JIS(CP932)のエラーメッセージ等をUTF-8として読み取れない問題への対処に使用。
+# 詳細はsrc/terminal_watch.rsのspawn_reader_threadを参照。
+encoding_rs = "0.8"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

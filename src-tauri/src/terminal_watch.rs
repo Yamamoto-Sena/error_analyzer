@@ -109,6 +109,24 @@ pub fn start_terminal_watch(app: AppHandle, root: String, command: String) -> Re
     Ok(())
 }
 
+/// 1行分の生バイト列を文字列にデコードする。
+///
+/// `cmd.exe`等Windowsのコンソールアプリは、標準出力/標準エラーを必ずしもUTF-8で
+/// 出力するとは限らない。特に日本語ロケール環境では、エラーメッセージ等が
+/// Shift-JIS(CP932)で出力されることが多い。以前は`BufRead::lines()`（内部でUTF-8
+/// としてのパースを要求する）を使っていたため、UTF-8として不正な行に遭遇した時点で
+/// イテレータがエラーを返し、それ以降の出力を静かに読み捨ててしまっていた
+/// （＝日本語のエラーメッセージが出た瞬間、以後の出力が丸ごと消えていた）。
+/// まずUTF-8として解釈を試み、失敗した場合のみShift-JISとして解釈することで、
+/// 英語圏のツール（npm/git等、通常UTF-8で出力する）はそのまま正しく扱いつつ、
+/// Windowsコンソールの日本語ローカライズ済みメッセージも取りこぼさないようにする。
+fn decode_line(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => encoding_rs::SHIFT_JIS.decode(bytes).0.into_owned(),
+    }
+}
+
 fn spawn_reader_thread<R: std::io::Read + Send + 'static>(
     app: AppHandle,
     reader: R,
@@ -116,9 +134,24 @@ fn spawn_reader_thread<R: std::io::Read + Send + 'static>(
     remaining: Arc<AtomicUsize>,
 ) {
     std::thread::spawn(move || {
-        let buffered = BufReader::new(reader);
-        for line in buffered.lines() {
-            let Ok(line) = line else { break };
+        let mut buffered = BufReader::new(reader);
+        loop {
+            let mut buf: Vec<u8> = Vec::new();
+            let read = match buffered.read_until(b'\n', &mut buf) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break; // EOF
+            }
+            // 末尾の改行(\n、および\r\nの場合は\rも)を取り除く（BufRead::lines()相当の挙動）
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            }
+            let line = decode_line(&buf);
             let _ = app.emit("terminal-output", TerminalOutputPayload { stream, line });
         }
 
@@ -157,5 +190,28 @@ pub fn kill_if_running() {
         if let Some(child) = guard.as_mut() {
             let _ = child.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_line_reads_valid_utf8_as_is() {
+        let bytes = "npm error Missing script".as_bytes();
+        assert_eq!(decode_line(bytes), "npm error Missing script");
+    }
+
+    #[test]
+    fn decode_line_falls_back_to_shift_jis_for_non_utf8_bytes() {
+        // 「指定されたファイルが見つかりません。」をShift-JIS(CP932)でエンコードしたバイト列。
+        // 日本語ロケールのWindowsで cmd.exe / type コマンド等が実際に出力する形式を想定。
+        let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode("指定されたファイルが見つかりません。");
+        assert!(!had_errors);
+
+        let decoded = decode_line(&bytes);
+
+        assert_eq!(decoded, "指定されたファイルが見つかりません。");
     }
 }
