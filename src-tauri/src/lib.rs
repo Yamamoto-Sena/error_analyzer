@@ -196,6 +196,46 @@ fn pick_project_root(app: tauri::AppHandle) -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+/// 履歴のエクスポート等、ユーザーが選んだ任意の場所へテキストファイルを保存するための
+/// 汎用コマンド。ネイティブの「名前を付けて保存」ダイアログを表示し、選択された場所に
+/// そのまま書き込む。
+/// （ブラウザの `<a download>` + Blob URL によるダウンロードは、TauriのWebView上では
+/// 保存先ダイアログが出ず何も起きないことがあるため、デスクトップ版はこちらを使う。
+/// エクスポート操作はユーザーが保存先を明示的に選ぶものであり、修正案の自動適用
+/// （fix_apply::resolve_within_root）のようなプロジェクトルート配下への制限は不要）。
+/// ダイアログでキャンセルされた場合は `Ok(None)` を返す（エラーではない）。
+#[tauri::command]
+fn export_text_file(
+    app: tauri::AppHandle,
+    default_name: String,
+    content: String,
+    filter_name: String,
+    filter_extensions: Vec<String>,
+) -> Result<Option<String>, String> {
+    // ダイアログがメインウィンドウの後ろに隠れて開いてしまい、応答を待ったまま
+    // フリーズしたように見える問題を防ぐため、ダイアログを開く前に必ず前面へ出す。
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_focus();
+    }
+
+    let extensions: Vec<&str> = filter_extensions.iter().map(String::as_str).collect();
+    let picked = app
+        .dialog()
+        .file()
+        .set_file_name(&default_name)
+        .add_filter(&filter_name, &extensions)
+        .blocking_save_file();
+
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| format!("保存先パスの取得に失敗しました: {e}"))?;
+    fs::write(&path, content).map_err(|e| format!("ファイルの書き込みに失敗しました: {e}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
 /// 実際には書き込まず、「安全に適用できそうか」だけを判定する（読み取り専用）。
 #[tauri::command]
 fn check_fix_applicability(root: String, file_path: String, diff_code: String) -> FixCheckResult {
@@ -540,6 +580,7 @@ pub fn run() {
             save_api_key,
             load_api_key,
             pick_project_root,
+            export_text_file,
             check_fix_applicability,
             apply_fix,
             rollback_fix,

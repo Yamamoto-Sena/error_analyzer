@@ -1171,8 +1171,28 @@ export default function App() {
     });
   };
 
-  // 履歴を書き出し用にファイルとしてダウンロードする共通処理
-  const downloadTextFile = (filename: string, content: string, mimeType: string) => {
+  // 履歴を書き出し用にファイルとして保存する共通処理。
+  // Tauriデスクトップ版では、ブラウザの `<a download>` + Blob URL によるダウンロードが
+  // WebView上では保存先ダイアログが出ず何も起きないことがあるため、ネイティブの
+  // 「名前を付けて保存」ダイアログ経由でRust側に書き込ませる（export_text_fileコマンド）。
+  // Web版（ブラウザ単体プレビュー）では従来通りBlobダウンロードにフォールバックする。
+  // 戻り値: 実際に保存された場合はtrue、ダイアログをキャンセルした場合はfalse。
+  const saveTextFile = async (
+    filename: string,
+    content: string,
+    mimeType: string,
+    filterName: string,
+    filterExtensions: string[]
+  ): Promise<boolean> => {
+    if (IS_TAURI_RUNTIME) {
+      const savedPath = await invoke<string | null>("export_text_file", {
+        defaultName: filename,
+        content,
+        filterName,
+        filterExtensions,
+      });
+      return savedPath !== null;
+    }
     const blob = new Blob([content], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1180,18 +1200,29 @@ export default function App() {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+    return true;
   };
 
   // 履歴全件をJSONとしてエクスポートする（バックアップ・他ツールへの取り込み用）
-  const handleExportHistoryJson = () => {
+  const handleExportHistoryJson = async () => {
     if (history.length === 0) return;
     const dateStr = new Date().toISOString().slice(0, 10);
-    downloadTextFile(`debug-buddy-history-${dateStr}.json`, JSON.stringify(history, null, 2), "application/json");
-    showToast(`履歴${history.length}件をJSONでエクスポートしました`, "success");
+    try {
+      const saved = await saveTextFile(
+        `debug-buddy-history-${dateStr}.json`,
+        JSON.stringify(history, null, 2),
+        "application/json",
+        "JSON",
+        ["json"]
+      );
+      if (saved) showToast(`履歴${history.length}件をJSONでエクスポートしました`, "success");
+    } catch (err) {
+      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 100)}`, "warning");
+    }
   };
 
   // 履歴全件をMarkdownレポートとしてエクスポートする（レビュー・チーム共有用）
-  const handleExportHistoryMarkdown = () => {
+  const handleExportHistoryMarkdown = async () => {
     if (history.length === 0) return;
     const dateStr = new Date().toISOString().slice(0, 10);
     const lines: string[] = [`# Debug Buddy 解析履歴（${dateStr} エクスポート、全${history.length}件）`, ""];
@@ -1211,8 +1242,12 @@ export default function App() {
       }
       lines.push("---", "");
     }
-    downloadTextFile(`debug-buddy-history-${dateStr}.md`, lines.join("\n"), "text/markdown");
-    showToast(`履歴${history.length}件をMarkdownでエクスポートしました`, "success");
+    try {
+      const saved = await saveTextFile(`debug-buddy-history-${dateStr}.md`, lines.join("\n"), "text/markdown", "Markdown", ["md"]);
+      if (saved) showToast(`履歴${history.length}件をMarkdownでエクスポートしました`, "success");
+    } catch (err) {
+      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 100)}`, "warning");
+    }
   };
 
   // 履歴モーダル内の1行を描画（種類別/時系列どちらの表示でも共通利用）
