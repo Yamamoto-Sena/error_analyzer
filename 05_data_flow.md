@@ -89,7 +89,50 @@ sequenceDiagram
 
 ---
 
-## 3. Gemini APIキーのデータフロー
+## 3. モデル一覧取得・モデル診断のデータフロー
+
+```mermaid
+sequenceDiagram
+    participant U as ユーザー
+    participant UI as App.tsx
+    participant GM as gemini.ts
+    participant API as Gemini API
+    participant MD as ModelDiagnosticsModal
+
+    U->>UI: APIキー設定完了/変更
+    UI->>GM: listAvailableModels(apiKey)
+    GM->>API: GET /v1beta/models
+    API-->>GM: 全モデルのメタデータ
+    Note over GM: generateContent非対応・画像/動画/音声生成系・Robotics/Live/Omni系・\nLyria系・computer-use系・deep-research系/antigravity系・transcribe系・\n提供終了済みgemini-2.5系を除外
+    GM-->>UI: 選択肢一覧
+    UI-->>U: モデル選択ドロップダウンに反映
+
+    U->>MD: 「モデル診断」→「診断を開始」
+    loop 一覧の各モデルへ1件ずつ（順に間隔を空けて送信）
+        MD->>GM: diagnoseModels(apiKey, models)
+        GM->>API: HTTPS POST generateContent（固定の短い確認用テキストのみ）
+        alt 成功
+            API-->>GM: 200 → 利用可
+        else 404 / 403
+            API-->>GM: 利用不可（権限/未対応）
+        else 429（日次/月次クォータ超過が明確）
+            API-->>GM: 利用不可（クォータ超過）
+        else 429 / 503（一時的な混雑）
+            GM->>API: 軽くリトライ（最大2回）
+        end
+        GM-->>MD: 1件ごとの判定結果
+    end
+    MD-->>U: 結果一覧（理由付き）。保存はせずモーダル内のメモリ上にのみ保持
+```
+
+**ポイント**:
+- モデル診断は、ドロップダウンに表示されている件数分だけGoogle Gemini APIを呼び出します（＝モデルの数だけクォータを消費）。ユーザーが「診断を開始」を押した時のみ実行され、自動実行はしません。
+- 送信されるのは固定の短い確認用テキストのみで、入力欄のエラーログ・画像・症状説明は一切含まれません。
+- 診断結果はモーダルを閉じると破棄されます（「結果をコピー」を押した場合のみ、クリップボードにコピーされます）。
+
+---
+
+## 4. Gemini APIキーのデータフロー
 
 ```mermaid
 sequenceDiagram
@@ -117,7 +160,7 @@ sequenceDiagram
 
 ---
 
-## 4. 実ファイル適用・バックアップ・ロールバックのデータフロー
+## 5. 実ファイル適用・バックアップ・ロールバックのデータフロー
 
 ```mermaid
 sequenceDiagram
@@ -152,7 +195,7 @@ sequenceDiagram
 
 ---
 
-## 5. Git連携のデータフロー
+## 6. Git連携のデータフロー
 
 ```mermaid
 sequenceDiagram
@@ -172,7 +215,7 @@ sequenceDiagram
 
 ---
 
-## 6. ターミナル監視のデータフロー（試験的機能）
+## 7. ターミナル監視のデータフロー（試験的機能）
 
 ```mermaid
 sequenceDiagram
@@ -195,7 +238,7 @@ sequenceDiagram
 
 ---
 
-## 7. 解析履歴のデータフロー
+## 8. 解析履歴のデータフロー
 
 - 保存先: ブラウザ/Webviewの `localStorage`（キー: `debug_buddy_history`）。**外部へは送信されません。**
 - 最大100件。同一エラー（ファイル・行・エラー種別等が一致）は重複排除し、既存エントリの「再発回数」をインクリメント。
@@ -203,7 +246,7 @@ sequenceDiagram
 
 ---
 
-## 8. データ保存先まとめ
+## 9. データ保存先まとめ
 
 | データ | 保存場所 | 平文か | 外部送信の有無 |
 |---|---|---|---|
@@ -214,3 +257,4 @@ sequenceDiagram
 | モデル選択・テーマ・プロジェクトフォルダパス等の設定 | `localStorage` | 平文 | 送信なし |
 | 修正前ファイルのバックアップ | 対象プロジェクト内 `.debug-buddy-backups/` | 平文（ソースコードそのまま） | 送信なし |
 | 開発コマンドの標準出力/標準エラー | メモリ上でストリーミングのみ（永続化なし） | — | 送信なし |
+| モデル診断の確認用テキスト（固定文言、ログ本文は含まない） | 送信時のみメモリ上 | — | 診断実行時のみ、モデルの数だけGoogle Gemini APIへ送信。結果はモーダルを閉じると破棄され、保存・外部送信はされない |
