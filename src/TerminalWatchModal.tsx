@@ -26,8 +26,10 @@ const CAPTURE_LAST_N_LINES = 150;
 
 // 「エラーらしい」と判定する高確度なキーワードのみに絞ったヒューリスティック。
 // 一般的な "error" という単語だけだと、正常系ログでも頻出し誤検知が多くなるため含めない。
+// npmは v9系のどこかでエラー接頭辞を "npm ERR!"（旧）から "npm error"（新・小文字/感嘆符なし）
+// に変更しているため、両方を拾えるようにしている。
 const ERROR_SIGNAL_PATTERN =
-  /EADDRINUSE|Traceback \(most recent call last\)|Unhandled[ A-Za-z]*Rejection|FATAL ERROR|npm ERR!|error TS\d{4,5}|Segmentation fault|panic:|Exception in thread|NullPointerException|CONFLICT \(content\)/i;
+  /EADDRINUSE|Traceback \(most recent call last\)|Unhandled[ A-Za-z]*Rejection|FATAL ERROR|npm (?:ERR!|error)|error TS\d{4,5}|Segmentation fault|panic:|Exception in thread|NullPointerException|CONFLICT \(content\)/i;
 
 const DEFAULT_COMMAND = "npm run dev";
 
