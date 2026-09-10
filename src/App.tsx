@@ -497,6 +497,17 @@ export default function App() {
     };
   }, [projectRoot]);
 
+  // 実ファイルへの適用・ロールバックが成功した直後にGitの汚れ状態を再取得する。
+  // 上のuseEffectはprojectRoot選択時にしか走らないため、そのままだと「適用直後、
+  // まさに今書き換えたファイル分だけ未コミットになっている」状態を検知できず、
+  // 警告バッジが古い（適用前の）判定のまま表示され続けてしまう。
+  const refreshGitDirtyStatus = () => {
+    if (!projectRoot) return;
+    invoke<GitDirtyStatus>("check_git_dirty", { root: projectRoot })
+      .then(setGitDirtyStatus)
+      .catch(() => setGitDirtyStatus(null));
+  };
+
   // テーマの切り替えを <html> クラスへ反映し、選択を保存する
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -951,6 +962,8 @@ export default function App() {
       showToast(`✅ 実際に書き換えました: ${result.appliedPath}`, "success");
       // バックアップ履歴を表示中であれば、今回作成された分も含めて最新化する
       if (showBackupHistory) void loadBackupHistory();
+      // 実ファイルを書き換えたため、Git汚れ状態の表示も最新化する
+      refreshGitDirtyStatus();
     } catch (err) {
       showToast(`実ファイルへの適用に失敗しました: ${String(err).slice(0, 100)}`, "warning");
     } finally {
@@ -970,6 +983,8 @@ export default function App() {
       if (realApplyResult?.backupId === backupId) setRealApplyResult(null);
       // バックアップ履歴を表示中であれば最新の状態に更新する
       if (showBackupHistory) void loadBackupHistory();
+      // 実ファイルを復元したため、Git汚れ状態の表示も最新化する
+      refreshGitDirtyStatus();
     } catch (err) {
       showToast(`ロールバックに失敗しました: ${String(err).slice(0, 100)}`, "warning");
     } finally {
