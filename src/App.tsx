@@ -888,6 +888,13 @@ export default function App() {
   // 「エラーを解析する」クリックを待つ)。autoAnalyze=true はユーザーが明示的にオプトインした
   // 場合のみで、そのまま解析まで自動実行する。
   const handleTerminalWatchError = (capturedText: string, autoAnalyze: boolean) => {
+    if (!capturedText.trim()) {
+      // 検知はしたが、出力の取得タイミングの都合で内容を復元できなかった場合。
+      // ログ欄を空文字で上書きして「セットしました」と誤認させるより、
+      // 現在の入力内容を維持したまま正直に失敗を伝える方が安全。
+      showToast("エラーの可能性を検知しましたが、出力内容を取得できませんでした。お手数ですがターミナル監視モードの出力ログを直接コピーして貼り付けてください。", "warning");
+      return;
+    }
     setLogInput(capturedText);
     setDescriptionInput("");
     setAttachedImage(null);
