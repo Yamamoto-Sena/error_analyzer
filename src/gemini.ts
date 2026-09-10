@@ -269,6 +269,11 @@ export async function listAvailableModels(apiKey: string): Promise<GeminiModelOp
     // このアプリはテキスト生成(generateContent)のみを使うため、対応していないモデル
     // （embedding専用モデル等）は選択肢から除外する
     .filter((m) => m.name && m.supportedGenerationMethods?.includes("generateContent"))
+    // 画像/動画/音声の「生成」に特化したモデル（Imagen、Nano Banana (Pro)、Veo、TTS系等）は
+    // generateContentに対応していても、このアプリの用途（エラーログのテキスト解析。画像は
+    // スクリーンショットの「読み取り」= 入力としてのみ使う）には適さず、選んでも期待する
+    // 構造化JSON応答は返ってこないため選択肢から除外する。
+    .filter((m) => !/image|imagen|nano.?banana|\bveo\b|text-to-speech|\btts\b/i.test(`${m.name} ${m.displayName ?? ""}`))
     .map((m) => {
       // API上の名前は "models/gemini-3.5-flash-lite" 形式なのでプレフィックスを除去する
       const value = m.name!.replace(/^models\//, "");

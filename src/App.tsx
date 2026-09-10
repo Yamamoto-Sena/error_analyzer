@@ -352,7 +352,10 @@ export default function App() {
   // 履歴管理
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [showHistoryModal, setShowHistoryModal] = useState<boolean>(false);
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  // 種類別ビューで明示的に開いた（展開した）エラー種別のグループ名を保持する。
+  // 初期状態では空＝全グループが閉じており、まず「どんなエラーが起きているか」の
+  // 一覧（種別名＋件数）だけが見える。クリックした種別だけが展開される。
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [historyViewMode, setHistoryViewMode] = useState<"type" | "time">("type");
   const [historySortOrder, setHistorySortOrder] = useState<"desc" | "asc">("desc");
   const [historySearchQuery, setHistorySearchQuery] = useState<string>("");
@@ -621,7 +624,7 @@ export default function App() {
   }, [timeSortedHistory]);
 
   const toggleGroup = (key: string) => {
-    setCollapsedGroups((prev) => {
+    setExpandedGroups((prev) => {
       const next = new Set(prev);
       if (next.has(key)) {
         next.delete(key);
@@ -2353,9 +2356,8 @@ export default function App() {
             <div className="flex items-center justify-between flex-wrap gap-2">
               <p className="text-xs text-slate-500 dark:text-slate-400">
                 {historyViewMode === "type"
-                  ? "エラー種別ごとに色分け・グループ化しています。"
-                  : "解析した時刻順に一覧表示しています。"}
-                クリックすると再度解説とDiffを表示できます。
+                  ? "まずエラー種別ごとの一覧（色分け・件数）だけを表示しています。種別名をクリックすると中身が展開されます。"
+                  : "解析した時刻順に一覧表示しています。クリックすると再度解説とDiffを表示できます。"}
               </p>
             </div>
 
@@ -2428,7 +2430,7 @@ export default function App() {
                 </div>
               ) : (
                 groupedHistory.map(([errorType, items]) => {
-                  const isCollapsed = collapsedGroups.has(errorType);
+                  const isCollapsed = !expandedGroups.has(errorType);
                   const color = colorForErrorType(errorType);
                   return (
                     <div
