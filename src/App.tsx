@@ -2510,6 +2510,7 @@ export default function App() {
         projectRoot={projectRoot}
         onPickProjectRoot={handlePickProjectRoot}
         onDetectedError={handleTerminalWatchError}
+        showToast={showToast}
       />
 
       {/* 6. トースト通知ポップアップ */}

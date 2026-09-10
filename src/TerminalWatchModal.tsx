@@ -10,6 +10,8 @@ interface TerminalWatchModalProps {
   onPickProjectRoot: () => void;
   /** エラーらしき出力を検知した際に呼ばれる。第2引数は「自動解析」トグルがONだったか */
   onDetectedError: (capturedText: string, autoAnalyze: boolean) => void;
+  /** コマンド欄への複数行貼り付けを1行に自動変換した際の案内などに使うトースト表示 */
+  showToast: (message: string, type?: "success" | "info" | "warning") => void;
 }
 
 interface OutputLine {
@@ -35,6 +37,7 @@ export default function TerminalWatchModal({
   projectRoot,
   onPickProjectRoot,
   onDetectedError,
+  showToast,
 }: TerminalWatchModalProps) {
   const [command, setCommand] = useState<string>(() => localStorage.getItem("debug_buddy_watch_command") || DEFAULT_COMMAND);
   const [isRunning, setIsRunning] = useState<boolean>(false);
@@ -176,6 +179,36 @@ export default function TerminalWatchModal({
     }
   };
 
+  // コマンド欄は1行用の<input>のため、複数行のスニペットを貼り付けても
+  // ブラウザ側で改行が自動的に取り除かれ、コメント行と実行文がくっついた
+  // 壊れた1行になってしまう（例: 行頭が`::`/`REM`/`#`等のコメントだと、
+  // 残り全体が実行されず無視される）。貼り付け時点でこちらが割り込み、
+  // コメント行を除いた残りをcmd.exeで正しく連続実行できる`&`区切りの
+  // 1行に組み立て直す。
+  const handleCommandPaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    const pasted = e.clipboardData.getData("text");
+    if (!pasted.includes("\n")) return; // 1行だけならブラウザ標準の貼り付けに任せる
+
+    e.preventDefault();
+    const allLines = pasted.split(/\r?\n/).map((l) => l.trim());
+    const isCommentLine = (l: string) => l.startsWith("::") || l.startsWith("#") || /^rem\b/i.test(l);
+    const meaningfulLines = allLines.filter((l) => l.length > 0 && !isCommentLine(l));
+
+    if (meaningfulLines.length === 0) {
+      showToast("貼り付けた内容がコメント行のみだったため、コマンド欄には反映していません", "warning");
+      return;
+    }
+
+    setCommand(meaningfulLines.join(" & "));
+    const hadComments = meaningfulLines.length < allLines.filter((l) => l.length > 0).length;
+    showToast(
+      `複数行が貼り付けられたため、cmd.exeで実行できる1行（"&"区切り）に自動変換しました${
+        hadComments ? "（コメント行は除外）" : ""
+      }`,
+      "info"
+    );
+  };
+
   const handleUseCapturedText = () => {
     // 検知した瞬間(triggerDetection内)のスナップショットではなく、クリック時点で
     // 改めて組み立て直す。特に「非ゼロ終了コード」による検知は、直前まで出力されていた
@@ -224,6 +257,7 @@ export default function TerminalWatchModal({
               type="text"
               value={command}
               onChange={(e) => setCommand(e.target.value)}
+              onPaste={handleCommandPaste}
               disabled={isRunning}
               placeholder="npm run dev"
               className="flex-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 font-mono text-xs text-slate-800 dark:text-slate-200 outline-none focus:border-cyan-500/60 focus:ring-1 focus:ring-cyan-500/40 disabled:opacity-60 transition"
