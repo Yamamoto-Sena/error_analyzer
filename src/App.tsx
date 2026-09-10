@@ -41,6 +41,8 @@ import {
   Trash2,
   Coins,
   GitBranch,
+  Star,
+  Download,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
@@ -108,6 +110,9 @@ function colorForErrorType(errorType: string) {
 
 // 添付画像1件あたりの最大サイズ（4MB）
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+
+// 解析履歴の保存件数上限（localStorage）
+const MAX_HISTORY_ITEMS = 100;
 
 // 全角/半角・大文字小文字・空白や記号の違いなど「表記ゆれ」を吸収するための正規化
 function normalizeForSearch(text: string): string {
@@ -179,6 +184,10 @@ interface HistoryItem {
   id: string;
   timestamp: string;
   result: AnalysisResult;
+  /** 同一箇所（エラー種別+ファイルパス+行番号）の再発生を検知した回数。初回は1。 */
+  occurrenceCount: number;
+  /** ピン留めされているか。trueの場合、履歴の自動上限(MAX_HISTORY_ITEMS)による自動削除の対象外にする。 */
+  pinned: boolean;
 }
 
 // Unified Diff を追加(+)/削除(-)で色分け表示するサブコンポーネント
@@ -420,7 +429,10 @@ export default function App() {
     const savedHistory = localStorage.getItem("debug_buddy_history");
     if (savedHistory) {
       try {
-        setHistory(JSON.parse(savedHistory));
+        // occurrenceCount/pinned導入以前に保存された履歴には無いフィールドなので、
+        // 読み込み時に既定値（1回目・未ピン留め）を補う
+        const parsed = JSON.parse(savedHistory) as Partial<HistoryItem>[];
+        setHistory(parsed.map((item) => ({ occurrenceCount: 1, pinned: false, ...item } as HistoryItem)));
       } catch {
         // ignore
       }
@@ -729,6 +741,47 @@ export default function App() {
     }
   };
 
+  // 解析結果を履歴に積んで保存する（新規解析・再検証どちらからも呼ばれる共通処理）。
+  // 「エラー種別 + ファイルパス + 行番号」が一致する既存の履歴（＝同じ箇所で起きた同じエラー）は
+  // 古い方を削除してから今回の結果を先頭に追加することで、同じエラーの繰り返しで履歴が
+  // 埋まってしまわず、実質的により多くの“異なる”エラーを記録できるようにする。
+  // その際、発生回数(occurrenceCount)を引き継いで+1し、ピン留め(pinned)状態も維持する。
+  const saveToHistory = (result: AnalysisResult) => {
+    const isSameError = (item: HistoryItem) =>
+      item.result.errorType === result.errorType &&
+      item.result.filePath === result.filePath &&
+      item.result.lineNumber === result.lineNumber;
+    const previousOccurrence = history.find(isSameError);
+
+    const newItem: HistoryItem = {
+      id: Date.now().toString(),
+      timestamp: new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
+      result,
+      occurrenceCount: (previousOccurrence?.occurrenceCount ?? 0) + 1,
+      pinned: previousOccurrence?.pinned ?? false,
+    };
+    const deduped = history.filter((item) => !isSameError(item));
+
+    // 100件上限はピン留めしていない項目だけに適用する（ピン留め項目は自動削除の対象外）
+    let keptCount = 0;
+    const updatedHistory = [newItem, ...deduped].filter((item) => {
+      if (item.pinned) return true;
+      keptCount++;
+      return keptCount <= MAX_HISTORY_ITEMS;
+    });
+
+    setHistory(updatedHistory);
+    localStorage.setItem("debug_buddy_history", JSON.stringify(updatedHistory));
+
+    // 同じ箇所・同じエラー種別が繰り返し発生している場合は、根本対応を見直す合図として知らせる
+    if (newItem.occurrenceCount >= 2) {
+      showToast(
+        `⚠️ 同じ箇所（${result.filePath}）で「${result.errorType}」が${newItem.occurrenceCount}回目の発生です。根本原因への対応を見直すタイミングかもしれません`,
+        "warning"
+      );
+    }
+  };
+
   // 解析実行（Gemini API または ローカル解析エンジンのハイブリッド）。
   // `overrideLog` が指定された場合（ターミナル監視モードからの自動解析）は、
   // logInputへの反映を待たずその文字列をそのまま解析対象にする(setState後の非同期タイミング問題を回避するため)。
@@ -807,16 +860,7 @@ export default function App() {
       setAnalysis(result);
       setHasResult(true);
       setActiveTab("cause");
-
-      // 履歴に追加して保存
-      const newItem: HistoryItem = {
-        id: Date.now().toString(),
-        timestamp: new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
-        result,
-      };
-      const updatedHistory = [newItem, ...history.slice(0, 19)];
-      setHistory(updatedHistory);
-      localStorage.setItem("debug_buddy_history", JSON.stringify(updatedHistory));
+      saveToHistory(result);
     } catch (err) {
       // APIエラー時はローカル解析へ安全にフォールバック
       console.error(err);
@@ -1098,15 +1142,7 @@ export default function App() {
       setActiveTab("cause");
       setIsApplied(false);
       setVerifyLogInput("");
-
-      const newItem: HistoryItem = {
-        id: Date.now().toString(),
-        timestamp: new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
-        result: recheck,
-      };
-      const updatedHistory = [newItem, ...history.slice(0, 19)];
-      setHistory(updatedHistory);
-      localStorage.setItem("debug_buddy_history", JSON.stringify(updatedHistory));
+      saveToHistory(recheck);
     } catch (err) {
       console.error(err);
       showToast(`検証中にエラーが発生しました (${(err as Error).message.slice(0, 40)}...)`, "warning");
@@ -1124,6 +1160,59 @@ export default function App() {
     setVerificationResult(null);
     setVerifyLogInput("");
     showToast(`履歴「${item.result.errorType}」を読み込みました`, "info");
+  };
+
+  // 履歴のピン留めを切り替える。ピン留め中は100件上限の自動削除対象から除外される。
+  const handleToggleHistoryPin = (id: string) => {
+    setHistory((prev) => {
+      const updated = prev.map((item) => (item.id === id ? { ...item, pinned: !item.pinned } : item));
+      localStorage.setItem("debug_buddy_history", JSON.stringify(updated));
+      return updated;
+    });
+  };
+
+  // 履歴を書き出し用にファイルとしてダウンロードする共通処理
+  const downloadTextFile = (filename: string, content: string, mimeType: string) => {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // 履歴全件をJSONとしてエクスポートする（バックアップ・他ツールへの取り込み用）
+  const handleExportHistoryJson = () => {
+    if (history.length === 0) return;
+    const dateStr = new Date().toISOString().slice(0, 10);
+    downloadTextFile(`debug-buddy-history-${dateStr}.json`, JSON.stringify(history, null, 2), "application/json");
+    showToast(`履歴${history.length}件をJSONでエクスポートしました`, "success");
+  };
+
+  // 履歴全件をMarkdownレポートとしてエクスポートする（レビュー・チーム共有用）
+  const handleExportHistoryMarkdown = () => {
+    if (history.length === 0) return;
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const lines: string[] = [`# Debug Buddy 解析履歴（${dateStr} エクスポート、全${history.length}件）`, ""];
+    for (const item of history) {
+      const r = item.result;
+      lines.push(`## ${item.pinned ? "📌 " : ""}${r.errorType}${item.occurrenceCount > 1 ? `（${item.occurrenceCount}回発生）` : ""}`);
+      lines.push(`- 解析時刻: ${item.timestamp}`);
+      lines.push(`- 対象ファイル: \`${r.filePath}\`（${r.lineNumber}）`);
+      lines.push(`- 要約: ${r.summary}`);
+      lines.push("", "### 根本原因", r.rootCause, "");
+      if (r.diffCode) {
+        lines.push("### 修正案", "```diff", r.diffCode, "```", "");
+      }
+      lines.push("### 学習メモ", r.learningContent, "");
+      if (r.preventionTips.length > 0) {
+        lines.push("### 再発防止策", ...r.preventionTips.map((tip) => `- ${tip}`), "");
+      }
+      lines.push("---", "");
+    }
+    downloadTextFile(`debug-buddy-history-${dateStr}.md`, lines.join("\n"), "text/markdown");
+    showToast(`履歴${history.length}件をMarkdownでエクスポートしました`, "success");
   };
 
   // 履歴モーダル内の1行を描画（種類別/時系列どちらの表示でも共通利用）
@@ -1163,11 +1252,36 @@ export default function App() {
                 <span>{item.result.modelUsed}</span>
               </span>
             )}
+            {item.occurrenceCount > 1 && (
+              <span
+                title="同じ箇所・同じエラー種別が繰り返し発生した回数"
+                className="text-[10px] px-1.5 py-0.5 rounded font-semibold bg-rose-500/10 text-rose-600 dark:text-rose-400 flex items-center space-x-1"
+              >
+                <RotateCcw className="w-2.5 h-2.5" />
+                <span>{item.occurrenceCount}回目</span>
+              </span>
+            )}
           </div>
           <p className="text-xs text-slate-700 dark:text-slate-300 truncate font-medium">{item.result.summary}</p>
           <p className="text-[10px] text-slate-400 dark:text-slate-500 font-mono">📁 {item.result.filePath}</p>
         </div>
-        <ChevronRight className="w-4 h-4 text-slate-300 dark:text-slate-600 group-hover:text-cyan-500 dark:group-hover:text-cyan-400 transition shrink-0" />
+        <div className="flex items-center space-x-1 shrink-0">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              handleToggleHistoryPin(item.id);
+            }}
+            title={item.pinned ? "ピン留めを解除（100件上限の自動削除対象に戻す）" : "ピン留め（100件上限の自動削除対象から外す）"}
+            className={`p-1 rounded transition cursor-pointer ${
+              item.pinned
+                ? "text-amber-500 hover:text-amber-600"
+                : "text-slate-300 dark:text-slate-600 opacity-0 group-hover:opacity-100 hover:text-amber-500"
+            }`}
+          >
+            <Star className="w-3.5 h-3.5" fill={item.pinned ? "currentColor" : "none"} />
+          </button>
+          <ChevronRight className="w-4 h-4 text-slate-300 dark:text-slate-600 group-hover:text-cyan-500 dark:group-hover:text-cyan-400 transition" />
+        </div>
       </div>
     );
   };
@@ -2311,7 +2425,25 @@ export default function App() {
             </div>
 
             {history.length > 0 && (
-              <div className="flex justify-end pt-2 border-t border-slate-200 dark:border-slate-800">
+              <div className="flex items-center justify-between gap-2 flex-wrap pt-2 border-t border-slate-200 dark:border-slate-800">
+                <div className="flex items-center space-x-1.5">
+                  <button
+                    onClick={handleExportHistoryJson}
+                    title="履歴全件をJSONファイルとしてダウンロード（バックアップ・他ツールへの取り込み用）"
+                    className="flex items-center space-x-1 text-xs px-2 py-1 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>JSON</span>
+                  </button>
+                  <button
+                    onClick={handleExportHistoryMarkdown}
+                    title="履歴全件をMarkdownレポートとしてダウンロード（レビュー・チーム共有用）"
+                    className="flex items-center space-x-1 text-xs px-2 py-1 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Markdown</span>
+                  </button>
+                </div>
                 <button
                   onClick={() => {
                     setHistory([]);
