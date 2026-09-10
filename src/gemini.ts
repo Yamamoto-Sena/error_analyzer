@@ -269,11 +269,17 @@ export async function listAvailableModels(apiKey: string): Promise<GeminiModelOp
     // このアプリはテキスト生成(generateContent)のみを使うため、対応していないモデル
     // （embedding専用モデル等）は選択肢から除外する
     .filter((m) => m.name && m.supportedGenerationMethods?.includes("generateContent"))
-    // 画像/動画/音声の「生成」に特化したモデル（Imagen、Nano Banana (Pro)、Veo、TTS系等）は
+    // 画像/動画/音声の「生成」や、ロボット制御・リアルタイム対話など特殊用途に特化した
+    // モデル（Imagen、Nano Banana (Pro)、Veo、TTS系、Robotics系、Live/Omni系等）は、
     // generateContentに対応していても、このアプリの用途（エラーログのテキスト解析。画像は
-    // スクリーンショットの「読み取り」= 入力としてのみ使う）には適さず、選んでも期待する
-    // 構造化JSON応答は返ってこないため選択肢から除外する。
-    .filter((m) => !/image|imagen|nano.?banana|\bveo\b|text-to-speech|\btts\b/i.test(`${m.name} ${m.displayName ?? ""}`))
+    // スクリーンショットの「読み取り」= 入力としてのみ使う、1回のリクエストで構造化JSON
+    // 応答を受け取る）には適さないため選択肢から除外する。
+    .filter(
+      (m) =>
+        !/image|imagen|nano.?banana|\bveo\b|text-to-speech|\btts\b|robotics|\blive\b|\bomni\b/i.test(
+          `${m.name} ${m.displayName ?? ""}`
+        )
+    )
     .map((m) => {
       // API上の名前は "models/gemini-3.5-flash-lite" 形式なのでプレフィックスを除去する
       const value = m.name!.replace(/^models\//, "");
