@@ -166,7 +166,15 @@ export default function TerminalWatchModal({
   };
 
   const handleUseCapturedText = () => {
-    onDetectedError(pendingCapturedText, false);
+    // 検知した瞬間(triggerDetection内)のpendingCapturedTextではなく、クリック時点の
+    // rawLinesRef.currentから改めて切り出す。特に「非ゼロ終了コード」による検知は、
+    // 直前まで出力されていた最後の数行がterminal-outputイベントとしてまだ画面に反映
+    // しきっていないタイミングと競合する可能性があり、その場合pendingCapturedTextが
+    // 実際より少ない（最悪空の）内容のまま固まってしまう。クリックはユーザーが
+    // バナーを見てから行う操作＝検知から確実に時間が経っているため、ここで読み直せば
+    // 出力の取りこぼしを避けられる。
+    const latest = rawLinesRef.current.slice(-CAPTURE_LAST_N_LINES).join("\n");
+    onDetectedError(latest || pendingCapturedText, false);
     onClose();
   };
 
