@@ -50,6 +50,7 @@ import { analyzeErrorLog, AnalysisResult } from "./analyzer";
 import { analyzeWithGemini, listAvailableModels } from "./gemini";
 import { AVAILABLE_MODELS, DEFAULT_MODEL, GeminiModelOption } from "./models";
 import TerminalWatchModal from "./TerminalWatchModal";
+import ModelDiagnosticsModal from "./ModelDiagnosticsModal";
 
 // プロジェクトのGit作業ツリーが汚れていないかの判定結果(Rust側 check_git_dirty の戻り値)
 interface GitDirtyStatus {
@@ -336,6 +337,7 @@ export default function App() {
   // プロジェクトのGit作業ツリーが汚れていないかの判定結果(実ファイル適用前の注意喚起用)
   const [gitDirtyStatus, setGitDirtyStatus] = useState<GitDirtyStatus | null>(null);
   const [showTerminalWatchModal, setShowTerminalWatchModal] = useState<boolean>(false);
+  const [showModelDiagnosticsModal, setShowModelDiagnosticsModal] = useState<boolean>(false);
 
   // テーマ管理（ライト / ダーク）
   const [theme, setTheme] = useState<"light" | "dark">("dark");
@@ -1383,6 +1385,17 @@ export default function App() {
               ))}
             </select>
           </div>
+
+          {/* モデル診断（プルダウンに出ているが実際には呼び出せないモデルを洗い出す） */}
+          <button
+            onClick={() => setShowModelDiagnosticsModal(true)}
+            disabled={!apiKey}
+            title={apiKey ? "一覧の各モデルへ実際にリクエストを送り、使えるか確認します" : "先にGemini APIキーを設定してください"}
+            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+          >
+            <Cpu className="w-3.5 h-3.5" />
+            <span>モデル診断</span>
+          </button>
 
           {/* Gemini API 設定ボタン */}
           <button
@@ -2522,6 +2535,13 @@ export default function App() {
         onPickProjectRoot={handlePickProjectRoot}
         onDetectedError={handleTerminalWatchError}
         showToast={showToast}
+      />
+
+      <ModelDiagnosticsModal
+        open={showModelDiagnosticsModal}
+        onClose={() => setShowModelDiagnosticsModal(false)}
+        apiKey={apiKey}
+        models={availableModels}
       />
 
       {/* 6. トースト通知ポップアップ */}
