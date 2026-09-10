@@ -256,11 +256,11 @@ taskkill /F /IM tauri-app.exe /T
 +    else:
 +        print("ユーザー情報が見つかりませんでした")`,
       learningTitle: "💡 学習ポイント: Pythonにおける NoneType とガード節（Null Check）",
-      learningContent: "Pythonの関数やSQLAlchemyなどのORM（.first()）は、対象データが存在しない場合に None を返します。None は特定の値を持たない特殊なオブジェクトであるため、そのまま '.${attrName}' のように属性アクセスするとクラッシュします。必ず事前に 'if obj is not None:' で安全性を担保しましょう。",
+      learningContent: `Pythonの関数やSQLAlchemyなどのORM（.first()）は、対象データが存在しない場合に None を返します。None は特定の値を持たない特殊なオブジェクトであるため、そのまま '.${attrName}' のように属性アクセスするとクラッシュします。必ず事前に 'if obj is not None:' で安全性を担保しましょう。`,
       preventionTips: [
         "DBクエリやAPI戻り値など、データが存在しない可能性がある場合は必ず事前に None チェックを行う",
         "関数の型ヒントに Optional[User] や User | None を明記し、mypy/Pyrightなどの静的解析を活用する",
-        "getattr(obj, '${attrName}', None) や三項演算子を活用してデフォルト値を設ける"
+        `getattr(obj, '${attrName}', None) や三項演算子を活用してデフォルト値を設ける`
       ],
     };
   }
@@ -319,7 +319,7 @@ npm install ${pkgName}
 -const result = data.${propName};
 +const result = data?.${propName} ?? "初期値";`,
       learningTitle: "💡 学習ポイント: オプショナルチェーン (?.) と Null合体 (??)",
-      learningContent: "TypeScript/JavaScriptでは `data?.${propName}` のように安全なアクセス演算子を使うことで、undefined/null時に例外を投げず安全に処理を継続できます。",
+      learningContent: `TypeScript/JavaScriptでは \`data?.${propName}\` のように安全なアクセス演算子を使うことで、undefined/null時に例外を投げず安全に処理を継続できます。`,
       preventionTips: [
         "オブジェクトの初期ステートにデフォルト値を設ける",
         "APIフェッチのローディング状態（isLoading）を判定してから表示する",
