@@ -636,8 +636,21 @@ export default function App() {
     }
   };
 
+  // ログ入力が別内容に置き換わる際、古い解析結果が新しい入力と矛盾したまま
+  // 画面に残らないよう、解析結果関連stateを破棄する。
+  // （verificationChecklist/checkedItems/realApplyResult等は、analysisの変化に連動する
+  // 既存のuseEffectが自動的にクリアするため、ここでは触らない）
+  const clearAnalysisResult = () => {
+    setHasResult(false);
+    setAnalysis(null);
+    setIsApplied(false);
+    setVerificationResult(null);
+    setVerifyLogInput("");
+  };
+
   const handleSampleLoad = (key: keyof typeof SAMPLE_LOGS) => {
     setLogInput(SAMPLE_LOGS[key]);
+    clearAnalysisResult();
     showToast(`サンプル（${key}）を挿入しました`, "info");
   };
 
@@ -811,11 +824,7 @@ export default function App() {
     setLogInput("");
     setDescriptionInput("");
     setAttachedImage(null);
-    setHasResult(false);
-    setAnalysis(null);
-    setIsApplied(false);
-    setVerificationResult(null);
-    setVerifyLogInput("");
+    clearAnalysisResult();
     showToast("入力内容をリセットしました", "info");
   };
 
@@ -827,6 +836,7 @@ export default function App() {
     setLogInput(capturedText);
     setDescriptionInput("");
     setAttachedImage(null);
+    clearAnalysisResult();
     if (autoAnalyze) {
       showToast("ターミナル監視でエラーを検知したため、自動で解析します", "warning");
       void handleAnalyze(capturedText);
@@ -1388,7 +1398,10 @@ export default function App() {
           <div className="relative rounded-xl border border-slate-300 dark:border-slate-800 bg-white dark:bg-slate-900/80 shadow-inner focus-within:border-cyan-500/60 focus-within:ring-1 focus-within:ring-cyan-500/50 transition">
             <textarea
               value={logInput}
-              onChange={(e) => setLogInput(e.target.value)}
+              onChange={(e) => {
+                setLogInput(e.target.value);
+                clearAnalysisResult();
+              }}
               onPaste={handlePasteImage}
               onKeyDown={handleAnalyzeShortcut}
               placeholder="ターミナルやコンソールに出力された任意のエラーログをペーストしてください...（画像を貼り付けると自動で添付されます / Ctrl+Enterで解析実行）"
