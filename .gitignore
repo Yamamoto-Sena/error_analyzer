@@ -48,3 +48,6 @@ htmlcov/
 # Node / Vite / Tauri build output
 node_modules/
 
+# 実ファイル適用機能などを手動確認するためのテスト専用フィクスチャ（コミット対象外）
+manual-test-fixtures/
+
