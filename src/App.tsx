@@ -1127,17 +1127,26 @@ export default function App() {
         recheck.modelUsed = "ローカル解析エンジン（ルールベース）";
       }
 
-      // エラー種別・対象ファイルが一致するかで「同じ問題が再発しているか」を簡易判定
+      // エラー種別・対象ファイルが一致するかで「同じ問題が再発しているか」を簡易判定。
+      // 「種別は違うがファイルだけ同じ」（例: 修正の副作用で別種のエラーが同じファイルに
+      // 発生した）を、種別が同じ場合とORでまとめて「同じ種類のエラー」と表示していると、
+      // 実際には別のエラーなのに誤った文言になってしまうため、3パターンに分けて判定する。
       const normalize = (s: string) => s.trim().toLowerCase();
       const sameErrorType = normalize(recheck.errorType) === normalize(analysis.errorType);
       const sameFile = normalize(recheck.filePath) === normalize(analysis.filePath);
 
-      if (sameErrorType || sameFile) {
+      if (sameErrorType) {
         setVerificationResult({
           status: "still-failing",
           message: `⚠️ 同じ種類のエラー（${recheck.errorType}）がまだ発生しているようです。新しい根本原因と修正案に更新しました。下の「根本原因」「修正案 (Diff)」タブをご確認ください。`,
         });
         showToast("修正が不十分なようです。新しい修正案を表示します", "warning");
+      } else if (sameFile) {
+        setVerificationResult({
+          status: "new-error",
+          message: `元のエラーは解消されたようですが、同じファイル（${recheck.filePath}）で別の種類の問題（${recheck.errorType}）が新たに検出されました。修正の副作用の可能性もあるため、あわせてご確認ください。`,
+        });
+        showToast("同じファイルで別の問題を検出しました。新しい解析結果を表示します", "warning");
       } else {
         setVerificationResult({
           status: "new-error",
