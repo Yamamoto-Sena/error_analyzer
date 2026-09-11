@@ -1,0 +1,28 @@
+{
+  "name": "debug-buddy-ide-poc",
+  "displayName": "Debug Buddy (IDE拡張 PoC)",
+  "description": "エディタ上でエラーの疑いを赤波線で表示し、ホバー説明とQuick Fixで即座に修正できるかを試すプロトタイプ拡張機能。",
+  "version": "0.0.1",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {},
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}
