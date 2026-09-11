@@ -341,6 +341,9 @@ export default function App() {
   const [gitDirtyStatus, setGitDirtyStatus] = useState<GitDirtyStatus | null>(null);
   const [showTerminalWatchModal, setShowTerminalWatchModal] = useState<boolean>(false);
   const [showClipboardWatchModal, setShowClipboardWatchModal] = useState<boolean>(false);
+  // クリップボード監視が実際に実行中かどうか。モーダルを閉じていてもヘッダーの
+  // ボタン上で分かるようにするため、モーダル内部の状態をここに引き上げている。
+  const [isClipboardWatching, setIsClipboardWatching] = useState<boolean>(false);
   const [showModelDiagnosticsModal, setShowModelDiagnosticsModal] = useState<boolean>(false);
 
   // テーマ管理（ライト / ダーク）
@@ -1595,19 +1598,28 @@ export default function App() {
           </button>
 
           {/* クリップボード監視モード（MotionBoard等、他アプリで出たエラーをコピーするだけで自動検知する）。
-              ネイティブのクリップボードAPIが必要なため、デスクトップアプリ版でのみ利用できる。 */}
+              ネイティブのクリップボードAPIが必要なため、デスクトップアプリ版でのみ利用できる。
+              実行中はボタン自体の見た目を変え（緑色＋点滅ドット）、モーダルを閉じていても
+              「今、監視中かどうか」がひと目で分かるようにしている。 */}
           <button
             onClick={() => IS_TAURI_RUNTIME && setShowClipboardWatchModal(true)}
             disabled={!IS_TAURI_RUNTIME}
             title={
               IS_TAURI_RUNTIME
-                ? "他のアプリでコピーしたエラーメッセージを自動検知します（試験的機能）"
+                ? isClipboardWatching
+                  ? "クリップボード監視: 実行中です（クリックで停止・設定変更）"
+                  : "他のアプリでコピーしたエラーメッセージを自動検知します（試験的機能）"
                 : "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
             }
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300 transition cursor-pointer"
+            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+              isClipboardWatching
+                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
+                : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300"
+            }`}
           >
+            {isClipboardWatching && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />}
             <ClipboardPaste className="w-3.5 h-3.5" />
-            <span>クリップボード監視</span>
+            <span>{isClipboardWatching ? "クリップボード監視: 監視中" : "クリップボード監視"}</span>
           </button>
 
           {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定）。
@@ -2717,6 +2729,7 @@ export default function App() {
         onClose={() => setShowClipboardWatchModal(false)}
         onDetectedError={handleClipboardWatchError}
         showToast={showToast}
+        onRunningChange={setIsClipboardWatching}
       />
 
       <ModelDiagnosticsModal

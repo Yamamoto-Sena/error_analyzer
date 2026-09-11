@@ -152,6 +152,19 @@ pub fn stop_clipboard_watch() -> Result<(), String> {
     Ok(())
 }
 
+/// 現在クリップボード監視が実行中かどうかを返す。
+///
+/// フロントエンド（ClipboardWatchModal）の`isRunning`は画面を開き直した際に
+/// 常に`false`から始まってしまい、実際にはRust側で監視が継続しているのに
+/// 画面上は「未実行」に見える（＝ユーザーが「開始」を押すと「既に監視中です」
+/// と言われるのに、画面には停止ボタンが出ない）という食い違いが起きうる。
+/// マウント時にこのコマンドで実際の状態を問い合わせ、画面側の状態を
+/// 実態に合わせて補正するために使う。
+#[tauri::command]
+pub fn is_clipboard_watch_running() -> bool {
+    watch_state().lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
 /// アプリ終了時に監視スレッドが残らないよう、ベストエフォートで後始末する。
 pub fn stop_if_running() {
     if let Ok(mut guard) = watch_state().lock() {

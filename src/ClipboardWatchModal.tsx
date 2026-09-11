@@ -10,13 +10,17 @@ interface ClipboardWatchModalProps {
   /** エラーらしきテキストを検知した際に呼ばれる。第2引数は「自動解析」トグルがONだったか */
   onDetectedError: (capturedText: string, autoAnalyze: boolean) => void;
   showToast: (message: string, type?: "success" | "info" | "warning") => void;
+  /** 監視の実行状態が変化するたびに呼ばれる。ヘッダーボタン等、モーダルの外に
+   *  「今、監視中かどうか」を表示するために使う（モーダルを閉じていても分かるように）。 */
+  onRunningChange?: (isRunning: boolean) => void;
 }
 
 // バナー等でのプレビュー表示が長くなりすぎないようにする文字数
 const PREVIEW_MAX_CHARS = 300;
 
-export default function ClipboardWatchModal({ open, onClose, onDetectedError, showToast }: ClipboardWatchModalProps) {
+export default function ClipboardWatchModal({ open, onClose, onDetectedError, showToast, onRunningChange }: ClipboardWatchModalProps) {
   const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [isSyncingState, setIsSyncingState] = useState<boolean>(true);
   const [isStarting, setIsStarting] = useState<boolean>(false);
   const [autoAnalyze, setAutoAnalyze] = useState<boolean>(
     () => localStorage.getItem("debug_buddy_clipboard_watch_auto_analyze") === "true"
@@ -38,6 +42,33 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
   useEffect(() => {
     onDetectedErrorRef.current = onDetectedError;
   }, [onDetectedError]);
+
+  // 監視の実行状態をモーダルの外（ヘッダーボタン等）にも伝える
+  useEffect(() => {
+    onRunningChange?.(isRunning);
+  }, [isRunning, onRunningChange]);
+
+  // マウント時、実際にRust側で監視中かどうかを問い合わせて画面状態を補正する。
+  // これをしないと、開発中のリロードやアプリ再起動直後の画面表示は常に
+  // isRunning=falseから始まってしまい、「実際にはバックグラウンドで監視が
+  // 継続しているのに画面には『開始』ボタンしか出ない（＝停止ボタンが
+  // どこにも無い）」という食い違いが起きうる。
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const running = await invoke<boolean>("is_clipboard_watch_running");
+        if (!cancelled) setIsRunning(running);
+      } catch {
+        // Tauriアプリの外（ブラウザ単体プレビュー等）では常にfalse扱いのままでよい
+      } finally {
+        if (!cancelled) setIsSyncingState(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Tauriイベントの購読は、モーダルの開閉に関わらずマウント時に一度だけ行う
   // （ターミナル監視モードと同様、モーダルを閉じてもRust側の監視自体はバックグラウンドで
@@ -86,7 +117,21 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
       setIsRunning(true);
       showToast("クリップボード監視を開始しました", "success");
     } catch (err) {
-      setStartError(String(err).slice(0, 200));
+      // 画面側は「未実行」のつもりでも、実はRust側で既に監視中だった場合
+      // （開発中のリロード等で画面の状態だけがリセットされた場合に起こりうる）、
+      // ここで実際の状態を問い合わせて補正する。これをしないと、エラーメッセージで
+      // 「先に停止してください」と言われても、画面には停止ボタンが出ないままになる。
+      try {
+        const running = await invoke<boolean>("is_clipboard_watch_running");
+        setIsRunning(running);
+        if (running) {
+          showToast("クリップボード監視は既に開始されていました（画面表示を修正しました）", "info");
+        } else {
+          setStartError(String(err).slice(0, 200));
+        }
+      } catch {
+        setStartError(String(err).slice(0, 200));
+      }
     } finally {
       setIsStarting(false);
     }
@@ -135,7 +180,14 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
         </div>
 
         <div className="flex items-center justify-end">
-          {isRunning ? (
+          {isSyncingState ? (
+            <button
+              disabled
+              className="shrink-0 text-xs px-3.5 py-2 rounded-lg bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 font-semibold flex items-center space-x-1.5 opacity-70"
+            >
+              <span>現在の状態を確認中...</span>
+            </button>
+          ) : isRunning ? (
             <button
               onClick={handleStop}
               className="shrink-0 text-xs px-3.5 py-2 rounded-lg bg-rose-500 hover:bg-rose-400 text-white font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
@@ -174,7 +226,13 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
 
         <div className="flex items-center space-x-2 text-[11px] text-slate-400 dark:text-slate-500">
           <span className={`w-2 h-2 rounded-full shrink-0 ${isRunning ? "bg-emerald-500 animate-pulse" : "bg-slate-400 dark:bg-slate-600"}`} />
-          <span>{isRunning ? "監視中... 他のアプリでエラーをコピーしてください" : "未実行"}</span>
+          <span>
+            {isSyncingState
+              ? "状態を確認しています..."
+              : isRunning
+              ? "監視中... 他のアプリでエラーをコピーしてください（このウィンドウを閉じても監視は続きます。停止するには、ここでもう一度開いて「停止」を押してください）"
+              : "未実行"}
+          </span>
         </div>
 
         {detectedPreview && !autoAnalyze && (

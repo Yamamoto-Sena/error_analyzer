@@ -593,7 +593,8 @@ pub fn run() {
             terminal_watch::start_terminal_watch,
             terminal_watch::stop_terminal_watch,
             clipboard_watch::start_clipboard_watch,
-            clipboard_watch::stop_clipboard_watch
+            clipboard_watch::stop_clipboard_watch,
+            clipboard_watch::is_clipboard_watch_running
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
