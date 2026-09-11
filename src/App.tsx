@@ -43,6 +43,7 @@ import {
   GitBranch,
   Star,
   Download,
+  ClipboardPaste,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
@@ -50,6 +51,7 @@ import { analyzeErrorLog, AnalysisResult } from "./analyzer";
 import { analyzeWithGemini, listAvailableModels } from "./gemini";
 import { AVAILABLE_MODELS, DEFAULT_MODEL, GeminiModelOption } from "./models";
 import TerminalWatchModal from "./TerminalWatchModal";
+import ClipboardWatchModal from "./ClipboardWatchModal";
 import ModelDiagnosticsModal from "./ModelDiagnosticsModal";
 
 // プロジェクトのGit作業ツリーが汚れていないかの判定結果(Rust側 check_git_dirty の戻り値)
@@ -337,6 +339,7 @@ export default function App() {
   // プロジェクトのGit作業ツリーが汚れていないかの判定結果(実ファイル適用前の注意喚起用)
   const [gitDirtyStatus, setGitDirtyStatus] = useState<GitDirtyStatus | null>(null);
   const [showTerminalWatchModal, setShowTerminalWatchModal] = useState<boolean>(false);
+  const [showClipboardWatchModal, setShowClipboardWatchModal] = useState<boolean>(false);
   const [showModelDiagnosticsModal, setShowModelDiagnosticsModal] = useState<boolean>(false);
 
   // テーマ管理（ライト / ダーク）
@@ -888,16 +891,16 @@ export default function App() {
     showToast("入力内容をリセットしました", "info");
   };
 
-  // ターミナル監視モードがエラーらしき出力を検知した際に呼ばれる。
-  // autoAnalyze=false の場合はログ欄にセットするだけ(API呼び出しは行わず、ユーザー自身の
-  // 「エラーを解析する」クリックを待つ)。autoAnalyze=true はユーザーが明示的にオプトインした
-  // 場合のみで、そのまま解析まで自動実行する。
-  const handleTerminalWatchError = (capturedText: string, autoAnalyze: boolean) => {
+  // ターミナル監視モード／クリップボード監視モードが、エラーらしき内容を検知した際に呼ばれる
+  // 共通ハンドラ。autoAnalyze=false の場合はログ欄にセットするだけ(API呼び出しは行わず、
+  // ユーザー自身の「エラーを解析する」クリックを待つ)。autoAnalyze=true はユーザーが明示的に
+  // オプトインした場合のみで、そのまま解析まで自動実行する。
+  const handleWatchDetectedError = (sourceLabel: string, capturedText: string, autoAnalyze: boolean) => {
     if (!capturedText.trim()) {
-      // 検知はしたが、出力の取得タイミングの都合で内容を復元できなかった場合。
+      // 検知はしたが、内容の取得タイミングの都合で復元できなかった場合。
       // ログ欄を空文字で上書きして「セットしました」と誤認させるより、
       // 現在の入力内容を維持したまま正直に失敗を伝える方が安全。
-      showToast("エラーの可能性を検知しましたが、出力内容を取得できませんでした。お手数ですがターミナル監視モードの出力ログを直接コピーして貼り付けてください。", "warning");
+      showToast(`エラーの可能性を検知しましたが、内容を取得できませんでした。お手数ですが${sourceLabel}の内容を直接コピーして貼り付けてください。`, "warning");
       return;
     }
     setLogInput(capturedText);
@@ -905,12 +908,18 @@ export default function App() {
     setAttachedImage(null);
     clearAnalysisResult();
     if (autoAnalyze) {
-      showToast("ターミナル監視でエラーを検知したため、自動で解析します", "warning");
+      showToast(`${sourceLabel}でエラーを検知したため、自動で解析します`, "warning");
       void handleAnalyze(capturedText);
     } else {
-      showToast("ターミナル監視でエラーらしき出力を検知し、ログ欄にセットしました。「エラーを解析する」を押してください", "warning");
+      showToast(`${sourceLabel}でエラーらしき内容を検知し、ログ欄にセットしました。「エラーを解析する」を押してください`, "warning");
     }
   };
+
+  const handleTerminalWatchError = (capturedText: string, autoAnalyze: boolean) =>
+    handleWatchDetectedError("ターミナル監視", capturedText, autoAnalyze);
+
+  const handleClipboardWatchError = (capturedText: string, autoAnalyze: boolean) =>
+    handleWatchDetectedError("クリップボード監視", capturedText, autoAnalyze);
 
   // コピー機能
   const handleCopyDiff = async () => {
@@ -1436,6 +1445,22 @@ export default function App() {
           >
             <Terminal className="w-3.5 h-3.5" />
             <span>ターミナル監視</span>
+          </button>
+
+          {/* クリップボード監視モード（MotionBoard等、他アプリで出たエラーをコピーするだけで自動検知する）。
+              ネイティブのクリップボードAPIが必要なため、デスクトップアプリ版でのみ利用できる。 */}
+          <button
+            onClick={() => IS_TAURI_RUNTIME && setShowClipboardWatchModal(true)}
+            disabled={!IS_TAURI_RUNTIME}
+            title={
+              IS_TAURI_RUNTIME
+                ? "他のアプリでコピーしたエラーメッセージを自動検知します（試験的機能）"
+                : "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
+            }
+            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300 transition cursor-pointer"
+          >
+            <ClipboardPaste className="w-3.5 h-3.5" />
+            <span>クリップボード監視</span>
           </button>
 
           {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定）。
@@ -2534,6 +2559,16 @@ export default function App() {
         projectRoot={projectRoot}
         onPickProjectRoot={handlePickProjectRoot}
         onDetectedError={handleTerminalWatchError}
+        showToast={showToast}
+      />
+
+      {/* 5.6. クリップボード監視モード（試験的機能）。ターミナル監視モードと同様、閉じても
+          バックグラウンドでの監視自体は継続するため、show/hideはCSSのみで切り替え、
+          コンポーネント自体はアンマウントしない。 */}
+      <ClipboardWatchModal
+        open={showClipboardWatchModal}
+        onClose={() => setShowClipboardWatchModal(false)}
+        onDetectedError={handleClipboardWatchError}
         showToast={showToast}
       />
 

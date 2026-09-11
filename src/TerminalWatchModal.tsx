@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Terminal, X, Play, Square, FolderOpen, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { looksLikeErrorText } from "./analyzer";
 
 interface TerminalWatchModalProps {
   open: boolean;
@@ -23,13 +24,6 @@ interface OutputLine {
 const MAX_LINES = 500;
 // エラー検知時にAnalysisResultへ渡すのは直近何行分か（長すぎるとGeminiのプロンプトが肥大化するため）
 const CAPTURE_LAST_N_LINES = 150;
-
-// 「エラーらしい」と判定する高確度なキーワードのみに絞ったヒューリスティック。
-// 一般的な "error" という単語だけだと、正常系ログでも頻出し誤検知が多くなるため含めない。
-// npmは v9系のどこかでエラー接頭辞を "npm ERR!"（旧）から "npm error"（新・小文字/感嘆符なし）
-// に変更しているため、両方を拾えるようにしている。
-const ERROR_SIGNAL_PATTERN =
-  /EADDRINUSE|Traceback \(most recent call last\)|Unhandled[ A-Za-z]*Rejection|FATAL ERROR|npm (?:ERR!|error)|error TS\d{4,5}|Segmentation fault|panic:|Exception in thread|NullPointerException|CONFLICT \(content\)/i;
 
 const DEFAULT_COMMAND = "npm run dev";
 
@@ -102,7 +96,7 @@ export default function TerminalWatchModal({
             rawLinesRef.current = [...rawLinesRef.current, line].slice(-MAX_LINES);
             setLines((prev) => [...prev, { stream, text: line }].slice(-MAX_LINES));
 
-            if (!hasTriggeredRef.current && ERROR_SIGNAL_PATTERN.test(line)) {
+            if (!hasTriggeredRef.current && looksLikeErrorText(line)) {
               triggerDetection(undefined);
             }
           }

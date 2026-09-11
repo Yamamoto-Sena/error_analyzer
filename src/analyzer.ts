@@ -695,3 +695,45 @@ export function analyzeErrorLog(rawLog: string): AnalysisResult {
   result.officialDocLink = getOfficialDocLink(result.errorType, rawLog) ?? undefined;
   return result;
 }
+
+// 「エラーらしいテキストか」を判定する高確度なキーワードのみに絞ったヒューリスティック。
+// 一般的な "error" という単語だけだと、正常系ログでも頻出し誤検知が多くなるため、
+// 単独の "error" は含めていない（下のGENERIC_KEYWORDS_PATTERNの方でカバーする）。
+// npmは v9系のどこかでエラー接頭辞を "npm ERR!"（旧）から "npm error"（新・小文字/感嘆符なし）
+// に変更しているため、両方を拾えるようにしている。
+// もともとターミナル監視モード（TerminalWatchModal.tsx）専用に定義されていたものを、
+// クリップボード監視モードとも共用できるようここへ切り出した。
+const HIGH_CONFIDENCE_SIGNAL_PATTERN =
+  /EADDRINUSE|Traceback \(most recent call last\)|Unhandled[ A-Za-z]*Rejection|FATAL ERROR|npm (?:ERR!|error)|error TS\d{4,5}|Segmentation fault|panic:|Exception in thread|NullPointerException|CONFLICT \(content\)/i;
+
+// クリップボード監視モードが対象にするのは、ターミナルの生ログではなく
+// MotionBoard等のアプリが表示するエラーダイアログ/メッセージの文面であるため、
+// 上記の高確度シグネチャに加えて、より一般的なエラー関連キーワード（日英）も判定に含める。
+const GENERIC_KEYWORDS_PATTERN =
+  /\b(error|exception|failed|failure|warning|stack trace)\b|エラー|失敗|例外|不正な|接続できません|見つかりません|失敗しました/i;
+
+// あまりに短い文字列（単語1つのコピー等）まで拾うと誤検知が増えるため、
+// クリップボード監視モードではこの文字数未満のテキストは判定対象から除外する。
+const MIN_CLIPBOARD_TEXT_LENGTH = 20;
+
+/**
+ * テキストが「エラーらしいか」を判定する。
+ * @param options.genericKeywords true の場合、高確度シグネチャに加えて汎用的なエラー関連
+ *   キーワード（日英）でも判定する（クリップボード監視モード向け）。false（既定）の場合は
+ *   ターミナル出力向けの高確度シグネチャのみで判定する（誤検知を避けたいターミナル監視モード向け）。
+ * @param options.minLength この文字数未満のテキストは常にfalseを返す（既定0=制限なし）。
+ */
+export function looksLikeErrorText(
+  text: string,
+  options: { genericKeywords?: boolean; minLength?: number } = {}
+): boolean {
+  const { genericKeywords = false, minLength = 0 } = options;
+  if (text.trim().length < minLength) return false;
+  if (HIGH_CONFIDENCE_SIGNAL_PATTERN.test(text)) return true;
+  return genericKeywords && GENERIC_KEYWORDS_PATTERN.test(text);
+}
+
+/** クリップボード監視モード向けの既定判定（汎用キーワード判定+短文除外を有効にしたもの） */
+export function looksLikeErrorTextFromClipboard(text: string): boolean {
+  return looksLikeErrorText(text, { genericKeywords: true, minLength: MIN_CLIPBOARD_TEXT_LENGTH });
+}

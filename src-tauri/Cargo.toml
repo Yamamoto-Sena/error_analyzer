@@ -30,6 +30,10 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 # Shift-JIS(CP932)のエラーメッセージ等をUTF-8として読み取れない問題への対処に使用。
 # 詳細はsrc/terminal_watch.rsのspawn_reader_threadを参照。
 encoding_rs = "0.8"
+# クリップボード監視モードで、OSクリップボードのテキストを読み取るために使用。
+# フロントエンド(JS)からは一切呼び出さず、Rust側の`ClipboardExt`拡張トレイト経由で
+# clipboard_watch.rsの内部からのみ呼び出す（詳細はclipboard_watch.rsを参照）。
+tauri-plugin-clipboard-manager = "2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
