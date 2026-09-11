@@ -23,6 +23,7 @@ flowchart LR
         FA["fix_apply.rs（diff適用・バックアップ）"]
         GS["git_status.rs（git status呼び出し）"]
         TW["terminal_watch.rs（開発コマンド監視）"]
+        CW["clipboard_watch.rs（クリップボード監視）"]
         SS["secret_store.rs（APIキー）"]
     end
 
@@ -31,6 +32,7 @@ flowchart LR
         FS[("プロジェクトフォルダ\n実ファイル + .debug-buddy-backups")]
         GIT["gitコマンド（サブプロセス）"]
         DEV["開発コマンド\n(npm run dev 等)"]
+        CB[("OSクリップボード")]
         API["Google Gemini API"]
     end
 
@@ -40,6 +42,7 @@ flowchart LR
     LIB --> FA --> FS
     LIB --> GS --> GIT
     LIB --> TW --> DEV
+    LIB --> CW --> CB
     LIB --> SS --> KC
     UI <--> LS
 ```
@@ -238,7 +241,46 @@ sequenceDiagram
 
 ---
 
-## 8. 解析履歴のデータフロー
+## 8. クリップボード監視のデータフロー（試験的機能）
+
+```mermaid
+sequenceDiagram
+    participant U as ユーザー（他アプリ・ブラウザ）
+    participant CBWM as ClipboardWatchModal
+    participant LIB as lib.rs
+    participant CW as clipboard_watch.rs
+    participant OSCB as OSクリップボード
+    participant AN as analyzer.ts (looksLikeErrorTextFromClipboard)
+
+    U->>CBWM: 「開始」を押す
+    CBWM->>LIB: invoke("start_clipboard_watch")
+    LIB->>CW: 現在のクリップボード内容を基準値として記録し、ポーリング開始
+    loop 約800ms間隔
+        CW->>OSCB: read_text()
+        alt 基準値から変化あり
+            CW-->>CBWM: Tauriイベント "clipboard-text-changed" で配信
+            CBWM->>AN: looksLikeErrorTextFromClipboard(text)
+            alt エラーらしいと判定
+                CBWM-->>U: ログ欄へセット（自動解析ONなら解析まで実行しモーダルを閉じる）
+            else エラーらしくない/20文字未満
+                Note over CBWM: 何もしない（他の変化を待つ）
+            end
+        end
+    end
+    U->>CBWM: 「停止」を押す
+    CBWM->>LIB: invoke("stop_clipboard_watch")
+    LIB->>CW: 停止フラグを立てる（次のポーリングタイミングで自然終了）
+```
+
+**ポイント**:
+- クリップボードの内容はメモリ上でポーリング・比較されるのみで、永続化・外部送信は一切行われません（エラーらしいと判定された内容だけが、通常の解析フローと同様にログ欄へ渡り、Gemini解析時のみマスキング後に送信されます）。
+- 対象はテキストのみ。画像（スクリーンショット）はこのポーリングの対象外です。
+- モーダルを開き直した際は `invoke("is_clipboard_watch_running")` で実際の監視状態を問い合わせ、画面表示を実態に合わせて補正します（開発中のリロードやアプリ再起動直後に、画面上は「未実行」なのにRust側では監視継続中、という食い違いを防ぐため）。
+- ターミナル監視モードと状態管理（`OnceLock<Mutex<...>>`）は完全に独立しており、Rust側での競合はありません。フロントエンド側は共通の検知ハンドラを使うため、両方がほぼ同時にエラーを検知した場合は、先に解析処理が始まっている方を優先し、後着はログ欄へのセットのみに留めます。
+
+---
+
+## 9. 解析履歴のデータフロー
 
 - 保存先: ブラウザ/Webviewの `localStorage`（キー: `debug_buddy_history`）。**外部へは送信されません。**
 - 最大100件。同一エラー（ファイル・行・エラー種別等が一致）は重複排除し、既存エントリの「再発回数」をインクリメント。
@@ -246,7 +288,7 @@ sequenceDiagram
 
 ---
 
-## 9. データ保存先まとめ
+## 10. データ保存先まとめ
 
 | データ | 保存場所 | 平文か | 外部送信の有無 |
 |---|---|---|---|
@@ -257,4 +299,5 @@ sequenceDiagram
 | モデル選択・テーマ・プロジェクトフォルダパス等の設定 | `localStorage` | 平文 | 送信なし |
 | 修正前ファイルのバックアップ | 対象プロジェクト内 `.debug-buddy-backups/` | 平文（ソースコードそのまま） | 送信なし |
 | 開発コマンドの標準出力/標準エラー | メモリ上でストリーミングのみ（永続化なし） | — | 送信なし |
+| クリップボードの内容（監視ON時のみ） | メモリ上でポーリング・比較のみ（永続化なし） | — | エラーらしいと判定された内容のみ、通常の解析フローと同じ経路でログ欄へ渡る（Gemini利用時はマスキング後に送信） |
 | モデル診断の確認用テキスト（固定文言、ログ本文は含まない） | 送信時のみメモリ上 | — | 診断実行時のみ、モデルの数だけGoogle Gemini APIへ送信。結果はモーダルを閉じると破棄され、保存・外部送信はされない |

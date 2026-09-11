@@ -19,10 +19,12 @@
 - **実ファイルへの安全な適用（オプション・デスクトップ版のみ）**: プロジェクトフォルダを選択すると、diffの内容が実ファイルと一致するかを確認したうえで安全に適用でき、自動バックアップ（最大20世代）からいつでもロールバック可能
 - **Git連携**: プロジェクトフォルダの未コミット変更を検知し、適用前に警告表示（処理はブロックしない）
 - **ターミナル監視（試験的機能・デスクトップ版のみ）**: `npm run dev` などの開発コマンドをアプリ内から実行し、出力をリアルタイム監視。エラーを検知したら解析欄へワンクリックで取り込み、または自動解析まで実行可能
+- **クリップボード監視（試験的機能・デスクトップ版のみ）**: MotionBoard・BigQuery（Google Cloud Console）等、他アプリ/ブラウザで出たエラーメッセージをコピーするだけで自動検知し、貼り付け操作なしで解析欄へ取り込み（オプトインで自動解析まで実行可能）。ヘッダーのボタン自体が実行中は色を変えて状態を表示
 - **修正の検証**: 再実行後のログを再解析し、エラーが解消したか／別のエラーが出ていないかを検証。確認チェックリストで自己申告の精度を担保
 - **解析履歴**: 直近の解析結果をローカルに保存（最大100件、同一エラーは重複排除・再発回数カウント）し、種類別/時系列での閲覧・検索・ピン留め・JSON/Markdownエクスポートに対応
 - **セキュリティ**: Gemini APIキーはOSキーチェーンに保存。ログをAIへ送信する前にAPIキーやパスワード等の機密情報らしき文字列を自動マスキング
 - **ライト/ダークモード**、日本語UI
+- **右クリックメニュー**: WebView既定のブラウザ向けメニューは常に非表示にし、入力欄・テキスト選択上でのみ「コピー/切り取り/貼り付け」だけの最小メニューを表示（ローカルデスクトップアプリらしい操作感）
 
 ---
 
@@ -40,6 +42,7 @@
 | 実ファイル適用ロジック | Rust（[src-tauri/src/fix_apply.rs](src-tauri/src/fix_apply.rs)、パストラバーサル対策・バックアップ・ロールバック付き） |
 | Git連携 | Rust（[src-tauri/src/git_status.rs](src-tauri/src/git_status.rs)、作業ツリーの未コミット変更検知） |
 | ターミナル監視 | Rust（[src-tauri/src/terminal_watch.rs](src-tauri/src/terminal_watch.rs)、開発コマンドの実行・出力ストリーミング） |
+| クリップボード監視 | Rust（[src-tauri/src/clipboard_watch.rs](src-tauri/src/clipboard_watch.rs)、`tauri-plugin-clipboard-manager`経由でのポーリング・変化配信） |
 | APIキー保存 | Rust（[src-tauri/src/secret_store.rs](src-tauri/src/secret_store.rs)、OSキーチェーン経由） |
 
 ---
@@ -55,6 +58,7 @@ develop/
 │   ├── models.ts               # 選択可能なGeminiモデルの一覧・既定値
 │   ├── sanitize.ts             # Gemini送信前の機密情報マスキング
 │   ├── TerminalWatchModal.tsx  # ターミナル監視モーダルUI
+│   ├── ClipboardWatchModal.tsx # クリップボード監視モーダルUI
 │   ├── ModelDiagnosticsModal.tsx # モデル診断モーダルUI
 │   └── main.tsx                # エントリーポイント
 ├── src-tauri/
@@ -63,8 +67,10 @@ develop/
 │       ├── fix_apply.rs        # diff解析・安全なパス解決・適用ロジック（純粋関数・テスト付き）
 │       ├── git_status.rs       # Git作業ツリーの汚れ判定
 │       ├── terminal_watch.rs   # 開発コマンドの実行・出力ストリーミング
+│       ├── clipboard_watch.rs  # OSクリップボードのテキストポーリング・変化配信
 │       ├── secret_store.rs     # Gemini APIキーのOSキーチェーン保存・読み込み
 │       └── main.rs
+├── vscode-extension/              # （実験的PoC）VS Code拡張方式の検証。本体とは独立
 ├── 01_requirements_definition.md  # 要件定義書
 ├── 02_introduction_spec.md        # 起動画面・UI/UX仕様書
 ├── package.json
@@ -96,7 +102,7 @@ pnpm tauri dev
 ```bash
 pnpm dev:web
 ```
-Web版ではプロジェクトフォルダ選択・実ファイルへの適用・Git連携・ターミナル監視など、ネイティブ機能に依存するボタンは無効化されます（ローカル解析エンジンやGemini API解析、履歴機能などは利用可能）。
+Web版ではプロジェクトフォルダ選択・実ファイルへの適用・Git連携・ターミナル監視・クリップボード監視など、ネイティブ機能に依存するボタンは無効化されます（ローカル解析エンジンやGemini API解析、履歴機能などは利用可能）。
 
 ### 3. Gemini APIキーの設定
 `.env` ファイルは使用しません。アプリ起動後、右上の **「Gemini AI: APIキー設定」** ボタンからGoogle AI Studioで取得したAPIキーを入力してください。キーはOSのキーチェーン（Windowsの資格情報マネージャー等、[src-tauri/src/secret_store.rs](src-tauri/src/secret_store.rs)経由）に保存されます。未設定でもローカル解析エンジンで動作します。
@@ -120,4 +126,14 @@ pnpm test
 # Rust側（diff適用・バックアップ世代管理・Git判定・ターミナル監視の文字コード処理など）
 cd src-tauri
 cargo test
+
+# クリップボード監視の「この端末でOSクリップボードの読み書きが機能するか」を確認する
+# トラブルシューティング用テスト（通常のcargo testでは実行されない#[ignore]付き）
+cargo test -- --ignored arboard_can_read_back_written_text
 ```
+
+---
+
+## 🧪 実験的な取り組み
+
+- **[vscode-extension/](vscode-extension/)**: VS Code拡張方式でのエディタ内解析のPoC。本体アプリ（Tauriデスクトップ版）とは独立した別プロジェクトです。詳細は[vscode-extension/README.md](vscode-extension/README.md)を参照してください。
