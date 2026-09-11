@@ -667,7 +667,17 @@ NODE_OPTIONS=--max-old-space-size=4096 npm run build`,
   }
 
   // 14. 汎用フォールバック（未知のエラーログ）
-  const firstLine = log.split("\n").find((l) => l.trim().length > 0) || "エラーが発生しました";
+  // App.tsxはログ欄・症状説明欄を両方入力すると、それぞれの内容を
+  // 「【エラーログ / スタックトレース】」「【エラー内容・症状の説明（ユーザー記述）】」
+  // というラベル行を先頭に付けて連結して渡してくる。このラベル行自体は実際の
+  // エラー内容ではないため、「最初の非空行」としてそのまま拾ってしまうと
+  // 「検出されたエラー: 「【エラーログ / スタックトレース】」」という無意味な
+  // 表示になってしまう。行全体が【...】で囲まれただけの見出し行はスキップする。
+  const firstLine =
+    log.split("\n").find((l) => {
+      const trimmed = l.trim();
+      return trimmed.length > 0 && !/^【.*】$/.test(trimmed);
+    }) || "エラーが発生しました";
   return {
     errorType: "Detected Runtime Exception / エラー",
     summary: `検出されたエラー: 「${firstLine.slice(0, 80)}」`,
@@ -721,6 +731,21 @@ const GENERIC_KEYWORDS_PATTERN =
 const MIN_CLIPBOARD_TEXT_LENGTH = 20;
 
 /**
+ * 見た目上は同じに見えても文字コード上は異なる表記ゆれを吸収するための正規化。
+ * - `normalize("NFKC")`: 全角英数字・全角スペース(U+3000)・半角カナ等を、対応する
+ *   半角/標準形に変換する（例: "８０００１００６" → "80001006"、全角スペース → 半角スペース）。
+ * - 続く空白の連続を1個の半角スペースに畳み込み、前後をtrimする（タブ・改行・NBSP・
+ *   スペースが連続していたり混在していても同一視できるようにするため）。
+ *
+ * MotionBoard等、コピー元によって全角数字・全角スペースが混じった文言をユーザーが
+ * 監視ワードとして手入力（またはコピペ）した際、実際のクリップボード内容と
+ * 見た目は同じでも文字コードが微妙に異なり一致しない、という報告への対処。
+ */
+function normalizeForMatching(s: string): string {
+  return s.normalize("NFKC").replace(/\s+/g, " ").trim();
+}
+
+/**
  * テキストが「エラーらしいか」を判定する。
  * @param options.genericKeywords true の場合、高確度シグネチャに加えて汎用的なエラー関連
  *   キーワード（日英）でも判定する（クリップボード監視モード向け）。false（既定）の場合は
@@ -732,9 +757,10 @@ export function looksLikeErrorText(
   options: { genericKeywords?: boolean; minLength?: number } = {}
 ): boolean {
   const { genericKeywords = false, minLength = 0 } = options;
-  if (text.trim().length < minLength) return false;
-  if (HIGH_CONFIDENCE_SIGNAL_PATTERN.test(text)) return true;
-  return genericKeywords && GENERIC_KEYWORDS_PATTERN.test(text);
+  const normalized = normalizeForMatching(text);
+  if (normalized.length < minLength) return false;
+  if (HIGH_CONFIDENCE_SIGNAL_PATTERN.test(normalized)) return true;
+  return genericKeywords && GENERIC_KEYWORDS_PATTERN.test(normalized);
 }
 
 /** クリップボード監視モード向けの既定判定（汎用キーワード判定+短文除外を有効にしたもの） */
@@ -748,12 +774,13 @@ export function looksLikeErrorTextFromClipboard(text: string): boolean {
  * テキストが含むかを判定する。組み込みのlooksLikeErrorText系とは異なり、
  * ユーザーが明示的に登録した文言との一致は誤検知リスクが低いとみなし、
  * 文字数フィルタ（MIN_CLIPBOARD_TEXT_LENGTH）は適用しない。
- * 大文字小文字は区別しない。空文字列のキーワードは無視する。
+ * 大文字小文字は区別せず、全角/半角・空白の連続等の表記ゆれも`normalizeForMatching`で
+ * 吸収したうえで部分一致を見る。空文字列のキーワードは無視する。
  */
 export function matchesCustomKeywords(text: string, keywords: string[]): boolean {
-  const haystack = text.toLowerCase();
+  const haystack = normalizeForMatching(text).toLowerCase();
   return keywords.some((kw) => {
-    const trimmed = kw.trim();
+    const trimmed = normalizeForMatching(kw);
     return trimmed !== "" && haystack.includes(trimmed.toLowerCase());
   });
 }

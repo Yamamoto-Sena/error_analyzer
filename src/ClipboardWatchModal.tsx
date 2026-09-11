@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ClipboardPaste, X, Play, Square, AlertTriangle, CheckCircle2, Plus } from "lucide-react";
+import { ClipboardPaste, X, Play, Square, AlertTriangle, CheckCircle2, Plus, FlaskConical } from "lucide-react";
 import { looksLikeErrorTextFromClipboard, matchesCustomKeywords } from "./analyzer";
 
 interface ClipboardWatchModalProps {
@@ -51,6 +51,19 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
   // ユーザー自身に登録してもらうための一覧）
   const [customKeywords, setCustomKeywords] = useState<string[]>(loadCustomKeywords);
   const [newKeywordInput, setNewKeywordInput] = useState<string>("");
+
+  // 「この文章は検知されるか？」を実際にコピーせずその場で確認できる動作テスト欄。
+  // 「監視ワードを登録したのに検知されない」といった問い合わせの多くは、実際の
+  // クリップボード内容と登録した文言が(見た目は同じでも)微妙に違うことが原因のため、
+  // 実際の判定ロジックをそのまま使って自己診断できるようにしている。
+  const [testInput, setTestInput] = useState<string>("");
+  const testResult = useMemo(() => {
+    if (!testInput.trim()) return null;
+    const matchedKeyword = customKeywords.find((kw) => matchesCustomKeywords(testInput, [kw]));
+    if (matchedKeyword) return { detected: true, reason: `監視ワード「${matchedKeyword}」に一致` };
+    if (looksLikeErrorTextFromClipboard(testInput)) return { detected: true, reason: "組み込みのエラー判定に一致" };
+    return { detected: false, reason: null };
+  }, [testInput, customKeywords]);
 
   // イベントリスナー内から常に最新の値を読めるようにするためのref
   // （useEffectは[]依存で一度しか登録しないため、stateを直接読むとクロージャが古くなる）
@@ -335,6 +348,32 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
                 </span>
               ))}
             </div>
+          )}
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="flex items-center space-x-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+            <FlaskConical className="w-3.5 h-3.5 shrink-0" />
+            <span>動作テスト（実際にコピーせず、この文章が検知されるか確認できます）</span>
+          </label>
+          <input
+            type="text"
+            value={testInput}
+            onChange={(e) => setTestInput(e.target.value)}
+            placeholder="検知されるか確認したい文章を入力・貼り付け"
+            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 outline-none focus:border-cyan-500/60 focus:ring-1 focus:ring-cyan-500/40 transition"
+          />
+          {testResult && (
+            <p
+              className={`text-[11px] flex items-center space-x-1.5 ${
+                testResult.detected ? "text-emerald-600 dark:text-emerald-400" : "text-slate-500 dark:text-slate-400"
+              }`}
+            >
+              {testResult.detected ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <AlertTriangle className="w-3.5 h-3.5 shrink-0" />}
+              <span>
+                {testResult.detected ? `✅ 検知されます（${testResult.reason}）` : "❌ 検知されません（監視ワードの追加をご検討ください）"}
+              </span>
+            </p>
           )}
         </div>
 

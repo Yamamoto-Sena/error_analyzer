@@ -195,6 +195,31 @@ FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaS
     expect(result.errorType).toContain("Detected Runtime Exception");
     expect(result.summary).toContain("Something completely unexpected happened in module Zeta");
   });
+
+  it("App.tsxが付与する【】ラベル行自体を「検出されたエラー」として表示しない（ログ欄+症状説明欄を併用した場合の回帰）", () => {
+    // App.tsx の handleAnalyze は、ログ欄と症状説明欄の両方に入力がある場合、
+    // 「【エラーログ / スタックトレース】\n<ログ>」「【エラー内容・症状の説明（ユーザー記述）】\n<説明>」
+    // を連結してローカル解析エンジンに渡す。どのパターンにも一致せず汎用フォールバックに
+    // 落ちた際、firstLineがこのラベル行自体を拾ってしまうと「検出されたエラー: 「【エラーログ...】」」
+    // という無意味な表示になってしまっていた（実際の報告を受けての回帰テスト）。
+    const combinedText =
+      "【エラーログ / スタックトレース】\nSomething totally novel occurred\n\n" +
+      "【エラー内容・症状の説明（ユーザー記述）】\n保存ボタンを押すと画面が固まる";
+
+    const result = analyzeErrorLog(combinedText);
+
+    expect(result.summary).not.toContain("【エラーログ");
+    expect(result.summary).toContain("Something totally novel occurred");
+  });
+
+  it("症状説明欄のみの場合も、ラベル行ではなく実際の説明文を拾う", () => {
+    const combinedText = "【エラー内容・症状の説明（ユーザー記述）】\n保存ボタンを押すと画面が固まる";
+
+    const result = analyzeErrorLog(combinedText);
+
+    expect(result.summary).not.toContain("【エラー内容");
+    expect(result.summary).toContain("保存ボタンを押すと画面が固まる");
+  });
 });
 
 describe("getOfficialDocLink", () => {
@@ -299,5 +324,22 @@ describe("matchesCustomKeywords", () => {
 
   it("キーワード一覧が空でもエラーにならない", () => {
     expect(matchesCustomKeywords("何かのテキスト", [])).toBe(false);
+  });
+
+  it("全角数字・全角スペースを含む実際のクリップボード内容と、半角で登録したキーワードが一致する", () => {
+    // 実際の報告: MotionBoard等のエラーダイアログでは全角数字・全角スペースが
+    // 使われることがあり、ユーザーが半角で登録すると一致しない問題があった。
+    const clipboardText = "８０００１００６　予約語が指定されています。";
+    expect(matchesCustomKeywords(clipboardText, ["80001006 予約語が指定されています。"])).toBe(true);
+  });
+
+  it("登録したキーワード側が全角、クリップボード内容が半角でも一致する（逆パターン）", () => {
+    const clipboardText = "80001006 予約語が指定されています。";
+    expect(matchesCustomKeywords(clipboardText, ["８０００１００６　予約語が指定されています。"])).toBe(true);
+  });
+
+  it("スペースの個数・種類（タブ等）が違っても一致する", () => {
+    const clipboardText = "80001006\t\t予約語が指定されています。";
+    expect(matchesCustomKeywords(clipboardText, ["80001006 予約語が指定されています。"])).toBe(true);
   });
 });
