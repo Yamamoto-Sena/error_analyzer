@@ -34,6 +34,7 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
   // （useEffectは[]依存で一度しか登録しないため、stateを直接読むとクロージャが古くなる）
   const autoAnalyzeRef = useRef(autoAnalyze);
   const onDetectedErrorRef = useRef(onDetectedError);
+  const onCloseRef = useRef(onClose);
 
   useEffect(() => {
     autoAnalyzeRef.current = autoAnalyze;
@@ -42,6 +43,9 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
   useEffect(() => {
     onDetectedErrorRef.current = onDetectedError;
   }, [onDetectedError]);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   // 監視の実行状態をモーダルの外（ヘッダーボタン等）にも伝える
   useEffect(() => {
@@ -84,10 +88,16 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
           if (!looksLikeErrorTextFromClipboard(text)) return;
 
           detectedTextRef.current = text;
-          setDetectedPreview(text.length > PREVIEW_MAX_CHARS ? `${text.slice(0, PREVIEW_MAX_CHARS)}…` : text);
 
           if (autoAnalyzeRef.current) {
+            // 自動解析はユーザーが明示的にオプトインした「手離れ」重視の動作のため、
+            // 検知→解析開始まで行ったらモーダルも自動で閉じる。開いたままだと、
+            // メイン画面の解析結果が見えず「コピーだけしたのに何も起きていないように
+            // 見える」という違和感につながっていた。
             onDetectedErrorRef.current(text, true);
+            onCloseRef.current();
+          } else {
+            setDetectedPreview(text.length > PREVIEW_MAX_CHARS ? `${text.slice(0, PREVIEW_MAX_CHARS)}…` : text);
           }
         });
         if (cancelled) {

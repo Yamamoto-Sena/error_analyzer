@@ -1058,6 +1058,19 @@ export default function App() {
     setAttachedImage(null);
     clearAnalysisResult();
     if (autoAnalyze) {
+      // ターミナル監視・クリップボード監視は同時に有効化できるため、両方が
+      // ほぼ同時にエラーを検知すると、ここが2重に呼ばれてhandleAnalyzeの
+      // 非同期処理が重複実行されうる（Gemini解析結果やトークン集計等の共有state
+      // を後勝ちで奪い合い、画面がどちらの結果か分からなくなる）。
+      // 既に解析中の場合は自動実行を見送り、ログ欄にセットするだけに留める
+      // （＝手動の「エラーを解析する」を待つ、autoAnalyze=falseと同じ扱い）。
+      if (isAnalyzing) {
+        showToast(
+          `${sourceLabel}でエラーを検知しましたが、他の解析が進行中のためログ欄にセットするだけに留めました。完了後に「エラーを解析する」を押してください`,
+          "warning"
+        );
+        return;
+      }
       showToast(`${sourceLabel}でエラーを検知したため、自動で解析します`, "warning");
       void handleAnalyze(capturedText);
     } else {
