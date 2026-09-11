@@ -286,6 +286,20 @@ describe("looksLikeErrorTextFromClipboard", () => {
     }
   });
 
+  it("「不正な」（連体形）ではなく「〜が不正です」等の言い回しも検知する", () => {
+    // Dr.Sum Server・MotionBoard双方の公式マニュアル記載の実エラーメッセージを
+    // 検証した結果、最も多かった未検知パターン（「不正な」だと拾えなかった）。
+    const examples = [
+      "データソース定義の検索条件値の個数が不正です。",
+      "データソース定義の検索条件の内容が不正です。",
+      "SQL文のGROUP BY句の指定内容が不正です。",
+    ];
+
+    for (const text of examples) {
+      expect(looksLikeErrorTextFromClipboard(text), `検知できなかった: ${text}`).toBe(true);
+    }
+  });
+
   it("短すぎるテキスト（20文字未満）は誤検知を避けるため無視する", () => {
     expect(looksLikeErrorTextFromClipboard("Error")).toBe(false);
     expect(looksLikeErrorTextFromClipboard("エラー")).toBe(false);

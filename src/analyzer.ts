@@ -769,8 +769,13 @@ const HIGH_CONFIDENCE_SIGNAL_PATTERN = new RegExp(
 // BigQuery等のクラウドサービスのエラーは "Not found: Dataset ...", "Access Denied: ...",
 // "Exceeded rate limits", "Resources exceeded during query execution" のように、
 // 単語 "error" を含まない言い回しも多いため、それらも拾えるようにしている。
+// 「不正」は「不正な」ではなく素の形にしている。Wingarc製品（Dr.Sum Server/
+// MotionBoard）の公式マニュアル掲載の実エラーメッセージを検証したところ、
+// 「〜が不正です」「〜の内容が不正です」という言い回しが最も多く、
+// 「不正な」（連体形）では拾えていなかったため（Dr.Sum: 9件、MotionBoard: 11件、
+// 独立した2つのデータセットで同じ穴が再現）。
 const GENERIC_KEYWORDS_PATTERN =
-  /\b(error|exception|failed|failure|denied|forbidden|unauthorized|invalid|unrecognized|exceeded|not\s+found|quota|timeout|timed\s+out|duplicate|warning|stack trace)\b|エラー|失敗|例外|不正な|拒否|権限がありません|許可されていません|超過|見つかりません|接続できません|失敗しました/i;
+  /\b(error|exception|failed|failure|denied|forbidden|unauthorized|invalid|unrecognized|exceeded|not\s+found|quota|timeout|timed\s+out|duplicate|warning|stack trace)\b|エラー|失敗|例外|不正|拒否|権限がありません|許可されていません|超過|見つかりません|接続できません|失敗しました/i;
 
 // あまりに短い文字列（単語1つのコピー等）まで拾うと誤検知が増えるため、
 // クリップボード監視モードではこの文字数未満のテキストは判定対象から除外する。
