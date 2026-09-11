@@ -1,4 +1,41 @@
-# Python
+# =========================================================
+# .gitignore について
+# ここに書いたパターンに一致するファイル/フォルダは、
+# 「Gitの管理対象外（コミットしない）」になります。
+# ビルドで自動生成されるものや、個人のPC環境に依存するもの、
+# パスワード等の秘密情報を対象にするのが基本方針です。
+# =========================================================
+
+# --- Node.js / npm・pnpm ---
+node_modules/
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- フロントエンド（Vite / TypeScript）ビルド成果物 ---
+# `npm run build` (tsc && vite build) で生成される出力先。
+# 手元でいつでも作り直せるので、コミット不要。
+dist/
+dist-ssr/
+*.local
+*.tsbuildinfo
+.vite/
+# Viteがビルド時に一時生成することがある設定ファイル
+vite.config.*.timestamp-*
+
+# --- テスト（Vitest） ---
+coverage/
+
+# --- Rust / Tauri ---
+# `src-tauri/target/` (ビルド成果物) と `src-tauri/gen/schemas`
+# (自動生成スキーマ) は src-tauri/.gitignore 側で除外済み。
+# ここではプロジェクト直下からの参照ゆれに備えて明示しておく。
+src-tauri/target/
+
+# --- Python (python-cli / src/debug_buddy) ---
 __pycache__/
 *.py[cod]
 *$py.class
@@ -6,7 +43,6 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -19,35 +55,61 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.mypy_cache/
+.ruff_cache/
 
-# Virtual Environment
+# --- Python仮想環境 ---
 .venv/
 venv/
 ENV/
 env/
 
-# Environment Variables
+# --- 環境変数・秘密情報 ---
+# APIキーなどを書く .env はコミットしない
+# （チームで共有したいサンプルは .env.example のような別名で用意し、それは追跡対象にする）
 .env
+.env.*.local
+.env.local
 
-# Database & Local storage
+# --- データベース・アプリのローカル保存領域 ---
 *.db
 *.sqlite3
 .debug-buddy/
 
-# IDE / Editor
-.vscode/
+# --- OSが自動生成するファイル ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- IDE / エディタ ---
+# VSCodeはワークスペース単位の個人設定は無視しつつ、
+# チームで共有したい「推奨拡張機能」ファイルだけは追跡対象にする
+.vscode/*
+!.vscode/extensions.json
 .idea/
 *.swp
 *.swo
 
-# Testing
+# --- テストキャッシュ ---
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Node / Vite / Tauri build output
-node_modules/
+# --- Claude Code のランタイム情報 ---
+# 実行のたびに生成される、このPC/このセッション固有の状態ファイル。
+# チームメンバーや別PCと共有する意味が無いのでコミット対象外にする。
+# （.claude/launch.json は開発サーバ起動設定なので、こちらは追跡対象のまま）
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+.claude/routines/.state/
+.claude/worktrees/
+.claude/checkpoints/
+.claude/mailbox/
+.claude/agent-registry.json
+.claude/agent-memory-local
+.claude/first-run
+.claude/assistant-daemon-state.json
+.claude/settings.local.json
 
-# 実ファイル適用機能などを手動確認するためのテスト専用フィクスチャ（コミット対象外）
+# --- 実ファイル適用機能などを手動確認するためのテスト専用フィクスチャ（コミット対象外） ---
 manual-test-fixtures/
-
