@@ -60,7 +60,18 @@ pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
     // 読み取り失敗（クリップボードが空、画像のみが入っている等）は「空文字」として扱う。
     // クリップボード監視はベストエフォートの機能であり、この時点でのエラーを
     // フロントエンドへ伝播させる必要はない。
-    let initial_text = app.clipboard().read_text().unwrap_or_default();
+    //
+    // ただし「コピーしても何も検知されない」という不具合の切り分けを容易にするため、
+    // 開発コンソール（`pnpm tauri dev`実行時のターミナル）には常に開始時の状態を出力する。
+    let initial_read = app.clipboard().read_text();
+    eprintln!(
+        "[clipboard_watch] 監視を開始します（初期値の読み取り: {}）",
+        match &initial_read {
+            Ok(t) => format!("成功・{}文字", t.chars().count()),
+            Err(e) => format!("失敗（クリップボードが空か、テキスト以外の内容の可能性: {e}）"),
+        }
+    );
+    let initial_text = initial_read.unwrap_or_default();
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     *guard = Some(ClipboardWatchHandle {
@@ -70,6 +81,9 @@ pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
 
     std::thread::spawn(move || {
         let mut last_seen = initial_text;
+        // 同じ内容のエラーを連続でログに出し続けてターミナルが埋まらないよう、
+        // 直前に出力したエラーメッセージを覚えておき、変化があった時だけ再出力する。
+        let mut last_logged_error: Option<String> = None;
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -82,8 +96,19 @@ pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
 
             // 他プロセスがクリップボードを掴んでいる等で読み取りに失敗することがあるが、
             // 監視自体を止める必要はないため、そのティックはスキップして次回に回す。
-            let Ok(text) = app.clipboard().read_text() else {
-                continue;
+            let text = match app.clipboard().read_text() {
+                Ok(t) => {
+                    last_logged_error = None;
+                    t
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    if last_logged_error.as_deref() != Some(message.as_str()) {
+                        eprintln!("[clipboard_watch] クリップボードの読み取りに失敗しました: {message}");
+                        last_logged_error = Some(message);
+                    }
+                    continue;
+                }
             };
             if text == last_seen {
                 continue;
@@ -94,6 +119,13 @@ pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
             if text.trim().is_empty() {
                 continue;
             }
+
+            let preview: String = text.chars().take(60).collect();
+            eprintln!(
+                "[clipboard_watch] クリップボードの変化を検知（{}文字）: {preview}{}",
+                text.chars().count(),
+                if text.chars().count() > 60 { "…" } else { "" }
+            );
 
             let _ = app.emit("clipboard-text-changed", ClipboardTextPayload { text });
         }
@@ -115,6 +147,7 @@ pub fn stop_clipboard_watch() -> Result<(), String> {
         .map_err(|_| "内部エラー: 監視状態のロックに失敗しました。".to_string())?;
     if let Some(handle) = guard.take() {
         handle.stop_flag.store(true, Ordering::Relaxed);
+        eprintln!("[clipboard_watch] 監視を停止しました");
     }
     Ok(())
 }
@@ -125,5 +158,42 @@ pub fn stop_if_running() {
         if let Some(handle) = guard.take() {
             handle.stop_flag.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// トラブルシューティング用: 「クリップボード監視をONにしてコピーしても検知されない」
+    /// 場合に、原因が(a)この端末でのOSクリップボード読み書き自体が機能していないのか、
+    /// (b)アプリ側の配線・ヒューリスティック判定の問題なのかを切り分けるための手動テスト。
+    /// `tauri-plugin-clipboard-manager`が内部で使っているのと同じ`arboard`クレートを
+    /// 直接呼び、Tauriアプリを起動しなくても検証できるようにしている。
+    ///
+    /// 通常の`cargo test`では実行しない(`#[ignore]`)。理由:
+    /// - 実際にOSのクリップボードを書き換えてしまう副作用があり、CI等の無人環境や
+    ///   ヘッドレス環境（クリップボードが利用できない）では失敗しうるため。
+    /// 手動で実行する場合は次のコマンドを使う:
+    ///   cargo test --package tauri-app -- --ignored arboard_can_read_back_written_text
+    #[test]
+    #[ignore]
+    fn arboard_can_read_back_written_text_on_this_machine() {
+        let mut clipboard =
+            arboard::Clipboard::new().expect("この端末でのクリップボード初期化に失敗しました");
+        let probe_text = "debug-buddy-clipboard-probe-12345";
+        clipboard
+            .set_text(probe_text)
+            .expect("この端末でのクリップボードへの書き込みに失敗しました");
+
+        // 一部の環境ではOSがクリップボードの更新を反映するまで一瞬ラグがあるため、
+        // 実際のポーリングループ(POLL_INTERVAL=800ms)と同程度待ってから読み直す。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let read_back = clipboard
+            .get_text()
+            .expect("この端末でのクリップボードからの読み取りに失敗しました");
+        assert_eq!(
+            read_back, probe_text,
+            "書き込んだ内容と読み取った内容が一致しません（他のクリップボード管理ソフトが介在している可能性があります）"
+        );
     }
 }

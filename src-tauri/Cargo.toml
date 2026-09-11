@@ -17,6 +17,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+# クリップボード監視モードのトラブルシューティング用（clipboard_watch.rsの
+# `arboard_can_read_back_written_text_on_this_machine`テストでのみ使用）。
+# tauri-plugin-clipboard-managerが内部で使っているクレートそのものを直接呼び、
+# Tauriアプリ全体を起動しなくても「この端末でOSクリップボードの読み書きが
+# そもそも機能するか」だけを切り分けて検証できるようにしている。
+arboard = "3"
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
