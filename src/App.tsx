@@ -613,10 +613,11 @@ export default function App() {
       setTheme("light");
     }
 
-    const savedTokenTotal = Number(localStorage.getItem("debug_buddy_token_total") ?? "0");
-    if (Number.isFinite(savedTokenTotal) && savedTokenTotal > 0) {
-      setSessionTokenTotal(savedTokenTotal);
-    }
+    // トークン消費量表示は「真にこのセッション（アプリを起動してから今まで）」の
+    // 累計であることが分かりやすいよう、あえてlocalStorageへの永続化はしない
+    // （以前はlocalStorageに永続化していたため、表示上「セッション累計」と
+    // 案内しているのに実際は起動しても0に戻らず「いつからの累計か分からない」
+    // という分かりにくさがあった）。
   }, []);
 
   // APIキーが設定されている間、そのキーで実際に使えるGeminiモデル一覧を動的取得する。
@@ -999,20 +1000,28 @@ export default function App() {
           showToast(`✨ ${result.modelUsed ?? selectedModelLabel} による高精度解析が完了しました！${maskNote}`, "success");
         }
 
-        // トークン消費量をセッション累計に加算して永続化する（画面表示用。要件定義書5.3対応）
+        // トークン消費量をセッション累計に加算する（画面表示用。永続化はしない＝
+        // アプリを起動している間だけの累計であることをそのまま体現する）
         if (result.tokenUsage) {
-          setSessionTokenTotal((prev) => {
-            const next = prev + result.tokenUsage!.totalTokens;
-            localStorage.setItem("debug_buddy_token_total", String(next));
-            return next;
-          });
+          setSessionTokenTotal((prev) => prev + result.tokenUsage!.totalTokens);
         }
       } else {
         // 2. ローカル解析エンジンでフォールバック（画像は読み取れないためテキストのみ）
         await new Promise((r) => setTimeout(r, 600));
         result = analyzeErrorLog(combinedText);
         result.modelUsed = "ローカル解析エンジン（ルールベース）";
-        showToast("エラー内容の動的解析が完了しました（※APIキーを設定するとGemini AI解析・画像解析が利用可能です）", "info");
+        if (hasImage) {
+          // ログ/症状説明欄にテキストがあるため上のブロック（!apiKey && hasImage && !hasLog）は
+          // 素通りしてここまで来ているが、ローカル解析エンジンは画像を一切読まないため、
+          // 添付した画像が黙って無視されていることを明示しないと「画像も見てくれているはず」と
+          // 誤解されるリスクがある。
+          showToast(
+            "テキストのみで解析しました（添付した画像はローカル解析エンジンでは解析対象外です。画像も解析するにはGemini APIキーを設定してください）",
+            "warning"
+          );
+        } else {
+          showToast("エラー内容の動的解析が完了しました（※APIキーを設定するとGemini AI解析・画像解析が利用可能です）", "info");
+        }
       }
 
       setAnalysis(result);
@@ -1583,10 +1592,12 @@ export default function App() {
             <span className="font-semibold">{apiKey ? "Active" : "APIキー設定"}</span>
           </button>
 
-          {/* Gemini解析のトークン消費量（セッション累計）。0件のうちは表示しない */}
+          {/* Gemini解析のトークン消費量（セッション累計）。0件のうちは表示しない。
+              永続化はしておらず、このアプリを起動してから今までの累計のみを表示する
+              （アプリを再起動すると0に戻る＝日次クォータの消費量とは別物）。 */}
           {sessionTokenTotal > 0 && (
             <span
-              title="このセッションでGemini APIが消費した合計トークン数"
+              title="このアプリを起動してから今までにGemini APIが消費した合計トークン数（アプリを再起動すると0に戻ります。Google側の日次クォータの残量とは別の数値です）"
               className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400"
             >
               <Coins className="w-3.5 h-3.5 shrink-0" />
