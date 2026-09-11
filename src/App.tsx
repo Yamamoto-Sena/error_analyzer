@@ -43,6 +43,8 @@ import {
   GitBranch,
   Star,
   Download,
+  ClipboardPaste,
+  Scissors,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
@@ -368,6 +370,17 @@ export default function App() {
   const [isApplied, setIsApplied] = useState<boolean>(false);
   const [toast, setToast] = useState<{ message: string; type: "success" | "info" | "warning" } | null>(null);
 
+  // 自作の右クリックメニュー（Issue #3）。入力欄・テキスト選択上でのみ、
+  // 「コピー/切り取り/貼り付け」だけの最小メニューを自前で表示する。
+  // 詳細は下のuseEffect（handleContextMenu）を参照。
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    target: HTMLInputElement | HTMLTextAreaElement | null;
+    canCut: boolean;
+    canCopy: boolean;
+  } | null>(null);
+
   // 実ファイルへの安全適用（プロジェクトフォルダ選択・可否判定・確認モーダル・実適用/実ロールバック）
   // ※あくまで追加機能。上のプレビュー用state(isApplying/isApplied)とは独立させており、
   //   projectRootが未設定/対象外のケースでは、これまで通りプレビューのみの動作にフォールバックする。
@@ -390,6 +403,141 @@ export default function App() {
   >([]);
 
   // APIキーの読み込み（OSキーチェーン優先、Tauri外や旧バージョンからの移行はlocalStorageにフォールバック）。
+  // 右クリックメニュー（コンテキストメニュー）の見直し（Issue #3）
+  // 何も対処しないと、WebView既定の「戻る/進む/再読み込み/検証」等の
+  // ブラウザ向けメニューがそのまま出てしまい、ローカルアプリとして不自然になる。
+  // OS標準メニューにそのまま任せる方法だと、開発中はメニューに「検証」
+  // （DevTools）まで混ざって見えてしまうため、ここでは
+  //   ・入力欄やテキスト選択上では「コピー/切り取り/貼り付け」だけの
+  //     自作メニューを表示する
+  //   ・それ以外の「何もないところ」ではメニュー自体を出さない
+  // という方針にし、ブラウザ既定のメニューは常に使わない。
+  useEffect(() => {
+    const handleContextMenu = (event: MouseEvent) => {
+      // 常にブラウザ既定のメニューは表示しない（代わりに自作メニューを出すか、何も出さない）
+      event.preventDefault();
+
+      const target = event.target as HTMLElement | null;
+      const editableEl = target?.closest("input, textarea") as
+        | HTMLInputElement
+        | HTMLTextAreaElement
+        | null;
+      const domSelectionLength = window.getSelection()?.toString().length ?? 0;
+
+      if (editableEl) {
+        const start = editableEl.selectionStart ?? 0;
+        const end = editableEl.selectionEnd ?? 0;
+        setContextMenu({
+          x: event.clientX,
+          y: event.clientY,
+          target: editableEl,
+          canCopy: end > start,
+          canCut: end > start,
+        });
+        return;
+      }
+
+      if (domSelectionLength > 0) {
+        // 入力欄以外でのテキスト選択（結果表示エリアの文章など）はコピーのみ許可
+        setContextMenu({ x: event.clientX, y: event.clientY, target: null, canCopy: true, canCut: false });
+        return;
+      }
+
+      // それ以外（何もないところ）はメニュー自体を表示しない
+      setContextMenu(null);
+    };
+
+    window.addEventListener("contextmenu", handleContextMenu);
+    return () => window.removeEventListener("contextmenu", handleContextMenu);
+  }, []);
+
+  // メニュー表示中に、外側クリック・スクロール・Escapeキーで閉じる
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const closeOnEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [contextMenu]);
+
+  // input/textareaはReactが管理する状態(value)と実際のDOM値がズレないよう、
+  // Reactが上書きしているvalueのsetterを直接呼んでから input イベントを発火させる。
+  // （el.value = ... だけだとReact側のonChangeが呼ばれず、画面に反映されない）
+  const setEditableValue = (el: HTMLInputElement | HTMLTextAreaElement, nextValue: string) => {
+    const prototype =
+      el instanceof HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const nativeSetter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    nativeSetter?.call(el, nextValue);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
+  const handleMenuCopy = async () => {
+    if (!contextMenu) return;
+    const { target } = contextMenu;
+    const text = target
+      ? target.value.substring(target.selectionStart ?? 0, target.selectionEnd ?? 0)
+      : (window.getSelection()?.toString() ?? "");
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (err) {
+      console.error("コピーに失敗しました", err);
+      showToast("コピーに失敗しました", "warning");
+    }
+    setContextMenu(null);
+  };
+
+  const handleMenuCut = async () => {
+    if (!contextMenu?.target) return;
+    const el = contextMenu.target;
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? 0;
+    const text = el.value.substring(start, end);
+    try {
+      await navigator.clipboard.writeText(text);
+      setEditableValue(el, el.value.slice(0, start) + el.value.slice(end));
+      // ブラウザは value を直接書き換えるとカーソルを末尾に飛ばしてしまうため、
+      // dispatchEvent（＝Reactのonchange処理・再描画まで含む）が完了した直後、
+      // 同期的にカーソル位置を明示的に戻す。（requestAnimationFrameだと、
+      // ウィンドウが最小化・非アクティブなタイミングでは発火が遅れ／されず、
+      // カーソル位置が末尾のままになることがあるため使わない）
+      el.focus();
+      el.setSelectionRange(start, start);
+    } catch (err) {
+      console.error("切り取りに失敗しました", err);
+      showToast("切り取りに失敗しました", "warning");
+    }
+    setContextMenu(null);
+  };
+
+  const handleMenuPaste = async () => {
+    if (!contextMenu?.target) return;
+    const el = contextMenu.target;
+    try {
+      const text = await navigator.clipboard.readText();
+      const start = el.selectionStart ?? el.value.length;
+      const end = el.selectionEnd ?? el.value.length;
+      setEditableValue(el, el.value.slice(0, start) + text + el.value.slice(end));
+      const cursor = start + text.length;
+      // 切り取り処理と同様の理由で、rAFを使わず同期的にカーソル位置を戻す
+      el.focus();
+      el.setSelectionRange(cursor, cursor);
+    } catch (err) {
+      console.error("貼り付けに失敗しました", err);
+      showToast("貼り付けに失敗しました（Ctrl+Vもお試しください）", "warning");
+    }
+    setContextMenu(null);
+  };
+
   // 他の初期化（履歴・モデル選択・テーマ等）は同期的なlocalStorage読み込みのみなので、
   // 非同期処理が必要なAPIキーだけ別のeffectに分けている。
   useEffect(() => {
@@ -2543,6 +2691,49 @@ export default function App() {
         apiKey={apiKey}
         models={availableModels}
       />
+
+      {/* 右クリックメニュー（コピー/切り取り/貼り付けのみの自作メニュー。Issue #3） */}
+      {contextMenu && (
+        <div
+          className="fixed z-50 min-w-[140px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-xl py-1 text-xs text-slate-700 dark:text-slate-200"
+          style={{
+            left: Math.min(contextMenu.x, window.innerWidth - 150),
+            top: Math.min(contextMenu.y, window.innerHeight - 120),
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {contextMenu.canCut && (
+            <button
+              onClick={handleMenuCut}
+              className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+            >
+              <Scissors className="w-3.5 h-3.5" />
+              <span>切り取り</span>
+            </button>
+          )}
+          <button
+            onClick={handleMenuCopy}
+            disabled={!contextMenu.canCopy}
+            className={`w-full flex items-center gap-2 px-3 py-2 text-left ${
+              contextMenu.canCopy
+                ? "hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                : "opacity-40 cursor-not-allowed"
+            }`}
+          >
+            <Copy className="w-3.5 h-3.5" />
+            <span>コピー</span>
+          </button>
+          {contextMenu.target && (
+            <button
+              onClick={handleMenuPaste}
+              className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+            >
+              <ClipboardPaste className="w-3.5 h-3.5" />
+              <span>貼り付け</span>
+            </button>
+          )}
+        </div>
+      )}
 
       {/* 6. トースト通知ポップアップ */}
       {toast && (
