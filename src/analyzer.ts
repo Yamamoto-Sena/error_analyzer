@@ -707,10 +707,14 @@ const HIGH_CONFIDENCE_SIGNAL_PATTERN =
   /EADDRINUSE|Traceback \(most recent call last\)|Unhandled[ A-Za-z]*Rejection|FATAL ERROR|npm (?:ERR!|error)|error TS\d{4,5}|Segmentation fault|panic:|Exception in thread|NullPointerException|CONFLICT \(content\)/i;
 
 // クリップボード監視モードが対象にするのは、ターミナルの生ログではなく
-// MotionBoard等のアプリが表示するエラーダイアログ/メッセージの文面であるため、
-// 上記の高確度シグネチャに加えて、より一般的なエラー関連キーワード（日英）も判定に含める。
+// MotionBoard・BigQuery（Google Cloud Console）等のアプリ/Webサービスが表示する
+// エラーダイアログ/メッセージの文面であるため、上記の高確度シグネチャに加えて、
+// より一般的なエラー関連キーワード（日英）も判定に含める。
+// BigQuery等のクラウドサービスのエラーは "Not found: Dataset ...", "Access Denied: ...",
+// "Exceeded rate limits", "Resources exceeded during query execution" のように、
+// 単語 "error" を含まない言い回しも多いため、それらも拾えるようにしている。
 const GENERIC_KEYWORDS_PATTERN =
-  /\b(error|exception|failed|failure|warning|stack trace)\b|エラー|失敗|例外|不正な|接続できません|見つかりません|失敗しました/i;
+  /\b(error|exception|failed|failure|denied|forbidden|unauthorized|invalid|unrecognized|exceeded|not\s+found|quota|timeout|timed\s+out|duplicate|warning|stack trace)\b|エラー|失敗|例外|不正な|拒否|権限がありません|許可されていません|超過|見つかりません|接続できません|失敗しました/i;
 
 // あまりに短い文字列（単語1つのコピー等）まで拾うと誤検知が増えるため、
 // クリップボード監視モードではこの文字数未満のテキストは判定対象から除外する。

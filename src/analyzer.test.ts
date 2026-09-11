@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyzeErrorLog, getOfficialDocLink } from "./analyzer";
+import { analyzeErrorLog, getOfficialDocLink, looksLikeErrorText, looksLikeErrorTextFromClipboard } from "./analyzer";
 
 describe("analyzeErrorLog", () => {
   it("ポート競合(EADDRINUSE)を手順(task)として検出する", () => {
@@ -210,5 +210,61 @@ describe("getOfficialDocLink", () => {
   it("該当が無い場合はnullを返す", () => {
     const link = getOfficialDocLink("SomeCustomError", "何の手がかりも無いログ");
     expect(link).toBeNull();
+  });
+});
+
+describe("looksLikeErrorTextFromClipboard", () => {
+  it("BigQuery(Google Cloud Console)の代表的なエラー文言を検知する", () => {
+    const examples = [
+      "Error running query. Please look at the query history for more information.",
+      "Not found: Dataset my-project:my_dataset was not found in location US",
+      "Access Denied: Project my-project: User does not have bigquery.jobs.create permission",
+      "Syntax error: Unexpected keyword SELECT at [1:1]",
+      "Exceeded rate limits: too many table update operations for this table",
+      "Resources exceeded during query execution: The query could not be executed in the allotted memory.",
+      "Invalid query: Unrecognized name: colum_typo at [3:5]",
+    ];
+
+    for (const text of examples) {
+      expect(looksLikeErrorTextFromClipboard(text), `検知できなかった: ${text}`).toBe(true);
+    }
+  });
+
+  it("MotionBoard等、日本語のエラーダイアログの文言も検知する", () => {
+    const examples = [
+      "データの取得に失敗しました。接続できませんでした。",
+      "権限がありません。管理者に問い合わせてください。",
+      "指定されたファイルが見つかりませんでした。",
+    ];
+
+    for (const text of examples) {
+      expect(looksLikeErrorTextFromClipboard(text), `検知できなかった: ${text}`).toBe(true);
+    }
+  });
+
+  it("短すぎるテキスト（20文字未満）は誤検知を避けるため無視する", () => {
+    expect(looksLikeErrorTextFromClipboard("Error")).toBe(false);
+    expect(looksLikeErrorTextFromClipboard("エラー")).toBe(false);
+  });
+
+  it("エラーに無関係な通常のコピー内容には反応しない", () => {
+    const examples = [
+      "今日の会議は15時からです。よろしくお願いします。",
+      "SELECT id, name FROM users WHERE active = true",
+      "https://example.com/dashboard/report",
+    ];
+
+    for (const text of examples) {
+      expect(looksLikeErrorTextFromClipboard(text), `誤検知した: ${text}`).toBe(false);
+    }
+  });
+});
+
+describe("looksLikeErrorText (ターミナル監視モード向け・既定オプション)", () => {
+  it("既定では高確度シグネチャのみで判定し、汎用キーワードだけの行には反応しない", () => {
+    // ターミナル監視モードは大量の生ログを常時流し込むため、汎用キーワードまで含めると
+    // 誤検知（自動解析の誤爆）が増えてしまう。この既定挙動は変更していないことを確認する。
+    expect(looksLikeErrorText("npm ERR! Missing script: \"start\"")).toBe(true);
+    expect(looksLikeErrorText("[INFO] Build failed due to a warning in strict mode")).toBe(false);
   });
 });
