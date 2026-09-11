@@ -741,3 +741,19 @@ export function looksLikeErrorText(
 export function looksLikeErrorTextFromClipboard(text: string): boolean {
   return looksLikeErrorText(text, { genericKeywords: true, minLength: MIN_CLIPBOARD_TEXT_LENGTH });
 }
+
+/**
+ * ユーザーが登録したカスタム監視ワード（MotionBoard等、組み込みの英語キーワードには
+ * 引っかからない固有の言い回しをユーザー自身に追加してもらうためのもの）のいずれかを
+ * テキストが含むかを判定する。組み込みのlooksLikeErrorText系とは異なり、
+ * ユーザーが明示的に登録した文言との一致は誤検知リスクが低いとみなし、
+ * 文字数フィルタ（MIN_CLIPBOARD_TEXT_LENGTH）は適用しない。
+ * 大文字小文字は区別しない。空文字列のキーワードは無視する。
+ */
+export function matchesCustomKeywords(text: string, keywords: string[]): boolean {
+  const haystack = text.toLowerCase();
+  return keywords.some((kw) => {
+    const trimmed = kw.trim();
+    return trimmed !== "" && haystack.includes(trimmed.toLowerCase());
+  });
+}

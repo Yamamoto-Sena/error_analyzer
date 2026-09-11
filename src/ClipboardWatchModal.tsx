@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ClipboardPaste, X, Play, Square, AlertTriangle, CheckCircle2 } from "lucide-react";
-import { looksLikeErrorTextFromClipboard } from "./analyzer";
+import { ClipboardPaste, X, Play, Square, AlertTriangle, CheckCircle2, Plus } from "lucide-react";
+import { looksLikeErrorTextFromClipboard, matchesCustomKeywords } from "./analyzer";
 
 interface ClipboardWatchModalProps {
   open: boolean;
@@ -18,6 +18,23 @@ interface ClipboardWatchModalProps {
 // バナー等でのプレビュー表示が長くなりすぎないようにする文字数
 const PREVIEW_MAX_CHARS = 300;
 
+// カスタム監視ワード（組み込みのキーワードでは拾えない、ユーザー固有のエラー文言を
+// 自分で登録してもらうための機能）の保存先・上限
+const CUSTOM_KEYWORDS_STORAGE_KEY = "debug_buddy_clipboard_watch_custom_keywords";
+const MAX_CUSTOM_KEYWORDS = 20;
+const MAX_CUSTOM_KEYWORD_LENGTH = 100;
+
+function loadCustomKeywords(): string[] {
+  try {
+    const raw = localStorage.getItem(CUSTOM_KEYWORDS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 export default function ClipboardWatchModal({ open, onClose, onDetectedError, showToast, onRunningChange }: ClipboardWatchModalProps) {
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [isSyncingState, setIsSyncingState] = useState<boolean>(true);
@@ -30,11 +47,17 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
   const [detectedPreview, setDetectedPreview] = useState<string | null>(null);
   const detectedTextRef = useRef<string>("");
 
+  // カスタム監視ワード（組み込みキーワードでは拾えない独自の言い回しを、
+  // ユーザー自身に登録してもらうための一覧）
+  const [customKeywords, setCustomKeywords] = useState<string[]>(loadCustomKeywords);
+  const [newKeywordInput, setNewKeywordInput] = useState<string>("");
+
   // イベントリスナー内から常に最新の値を読めるようにするためのref
   // （useEffectは[]依存で一度しか登録しないため、stateを直接読むとクロージャが古くなる）
   const autoAnalyzeRef = useRef(autoAnalyze);
   const onDetectedErrorRef = useRef(onDetectedError);
   const onCloseRef = useRef(onClose);
+  const customKeywordsRef = useRef(customKeywords);
 
   useEffect(() => {
     autoAnalyzeRef.current = autoAnalyze;
@@ -46,6 +69,10 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
   useEffect(() => {
     onCloseRef.current = onClose;
   }, [onClose]);
+  useEffect(() => {
+    customKeywordsRef.current = customKeywords;
+    localStorage.setItem(CUSTOM_KEYWORDS_STORAGE_KEY, JSON.stringify(customKeywords));
+  }, [customKeywords]);
 
   // 監視の実行状態をモーダルの外（ヘッダーボタン等）にも伝える
   useEffect(() => {
@@ -85,7 +112,11 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
       try {
         const unlisten = await listen<{ text: string }>("clipboard-text-changed", (event) => {
           const { text } = event.payload;
-          if (!looksLikeErrorTextFromClipboard(text)) return;
+          // カスタム監視ワードとの一致を組み込み判定より先に見る（ユーザーが明示的に
+          // 登録した文言なので、20文字未満などの組み込みの足切りを受けさせないため）。
+          const isErrorLike =
+            matchesCustomKeywords(text, customKeywordsRef.current) || looksLikeErrorTextFromClipboard(text);
+          if (!isErrorLike) return;
 
           detectedTextRef.current = text;
 
@@ -162,6 +193,30 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
     onClose();
   };
 
+  const handleAddKeyword = () => {
+    const trimmed = newKeywordInput.trim();
+    if (!trimmed) return;
+    if (trimmed.length > MAX_CUSTOM_KEYWORD_LENGTH) {
+      showToast(`監視ワードは${MAX_CUSTOM_KEYWORD_LENGTH}文字以内にしてください`, "warning");
+      return;
+    }
+    if (customKeywords.some((kw) => kw.toLowerCase() === trimmed.toLowerCase())) {
+      showToast("同じ監視ワードは既に登録されています", "info");
+      setNewKeywordInput("");
+      return;
+    }
+    if (customKeywords.length >= MAX_CUSTOM_KEYWORDS) {
+      showToast(`監視ワードは${MAX_CUSTOM_KEYWORDS}件までです。不要なものを削除してから追加してください`, "warning");
+      return;
+    }
+    setCustomKeywords((prev) => [...prev, trimmed]);
+    setNewKeywordInput("");
+  };
+
+  const handleRemoveKeyword = (index: number) => {
+    setCustomKeywords((prev) => prev.filter((_, i) => i !== index));
+  };
+
   return (
     <div className={open ? "fixed inset-0 z-50 bg-slate-950/50 dark:bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4" : "hidden"}>
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-4">
@@ -233,6 +288,55 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
           />
           <span>エラーらしき内容をコピーしたら確認なしで自動的に解析する（Gemini APIキー設定時は自動で送信されます）</span>
         </label>
+
+        <div className="space-y-2">
+          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+            監視ワードを追加（任意）: 「エラー」「失敗」等の組み込みキーワードでは拾えない、MotionBoard等の固有の言い回しをここに登録すると、その文字列を含むコピー内容も検知されるようになります。
+          </p>
+          <div className="flex items-center space-x-2">
+            <input
+              type="text"
+              value={newKeywordInput}
+              onChange={(e) => setNewKeywordInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  handleAddKeyword();
+                }
+              }}
+              placeholder="例: データの取得に失敗しました"
+              maxLength={MAX_CUSTOM_KEYWORD_LENGTH}
+              className="flex-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 outline-none focus:border-cyan-500/60 focus:ring-1 focus:ring-cyan-500/40 transition"
+            />
+            <button
+              onClick={handleAddKeyword}
+              disabled={!newKeywordInput.trim()}
+              className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed text-slate-700 dark:text-slate-200 font-semibold flex items-center space-x-1 transition cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>追加</span>
+            </button>
+          </div>
+          {customKeywords.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {customKeywords.map((kw, idx) => (
+                <span
+                  key={`${kw}-${idx}`}
+                  className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-700 dark:text-cyan-300"
+                >
+                  <span className="max-w-[200px] truncate">{kw}</span>
+                  <button
+                    onClick={() => handleRemoveKeyword(idx)}
+                    className="hover:text-rose-500 transition cursor-pointer"
+                    title="この監視ワードを削除"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
 
         <div className="flex items-center space-x-2 text-[11px] text-slate-400 dark:text-slate-500">
           <span className={`w-2 h-2 rounded-full shrink-0 ${isRunning ? "bg-emerald-500 animate-pulse" : "bg-slate-400 dark:bg-slate-600"}`} />

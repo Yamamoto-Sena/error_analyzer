@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { analyzeErrorLog, getOfficialDocLink, looksLikeErrorText, looksLikeErrorTextFromClipboard } from "./analyzer";
+import {
+  analyzeErrorLog,
+  getOfficialDocLink,
+  looksLikeErrorText,
+  looksLikeErrorTextFromClipboard,
+  matchesCustomKeywords,
+} from "./analyzer";
 
 describe("analyzeErrorLog", () => {
   it("ポート競合(EADDRINUSE)を手順(task)として検出する", () => {
@@ -266,5 +272,32 @@ describe("looksLikeErrorText (ターミナル監視モード向け・既定オ�
     // 誤検知（自動解析の誤爆）が増えてしまう。この既定挙動は変更していないことを確認する。
     expect(looksLikeErrorText("npm ERR! Missing script: \"start\"")).toBe(true);
     expect(looksLikeErrorText("[INFO] Build failed due to a warning in strict mode")).toBe(false);
+  });
+});
+
+describe("matchesCustomKeywords", () => {
+  it("登録したキーワードを含むテキストはtrueを返す（組み込みキーワードでは拾えない独自の言い回し）", () => {
+    const keywords = ["データの取得に失敗しました", "MotionBoard接続エラー"];
+    expect(matchesCustomKeywords("画面上に「データの取得に失敗しました」と表示された", keywords)).toBe(true);
+  });
+
+  it("大文字小文字を区別しない", () => {
+    expect(matchesCustomKeywords("Something MOTIONBOARD-TIMEOUT happened", ["motionboard-timeout"])).toBe(true);
+  });
+
+  it("組み込みの長さフィルタ(20文字未満)を受けない（短いキーワード登録でも検知できる）", () => {
+    expect(matchesCustomKeywords("NG", ["NG"])).toBe(true);
+  });
+
+  it("一致しない場合はfalseを返す", () => {
+    expect(matchesCustomKeywords("特に問題のない文章です", ["データの取得に失敗しました"])).toBe(false);
+  });
+
+  it("空文字列のキーワードは無視する", () => {
+    expect(matchesCustomKeywords("何か普通のテキスト", ["", "  "])).toBe(false);
+  });
+
+  it("キーワード一覧が空でもエラーにならない", () => {
+    expect(matchesCustomKeywords("何かのテキスト", [])).toBe(false);
   });
 });
