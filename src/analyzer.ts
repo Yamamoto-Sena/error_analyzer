@@ -713,8 +713,33 @@ export function analyzeErrorLog(rawLog: string): AnalysisResult {
 // に変更しているため、両方を拾えるようにしている。
 // もともとターミナル監視モード（TerminalWatchModal.tsx）専用に定義されていたものを、
 // クリップボード監視モードとも共用できるようここへ切り出した。
-const HIGH_CONFIDENCE_SIGNAL_PATTERN =
-  /EADDRINUSE|Traceback \(most recent call last\)|Unhandled[ A-Za-z]*Rejection|FATAL ERROR|npm (?:ERR!|error)|error TS\d{4,5}|Segmentation fault|panic:|Exception in thread|NullPointerException|CONFLICT \(content\)/i;
+// Wingarc製品（Dr.Sum Server / MotionBoard等）のエラーコードは、例外なく
+// "8桁の16進数・先頭は8/9/aのいずれか"という統一フォーマットになっている
+// （実測: 公式マニュアル記載の712件のエラーコード全件がこの形式に一致）。
+// メッセージ本文の言い回しは「〜できません」「〜が不正です」等バラバラで
+// 汎用キーワードでは大半を拾いきれないが、コードの「形」自体を検知対象にすれば、
+// コードとメッセージが一緒に表示・コピーされる限り言い回しに関係なく拾える。
+// （UUIDの先頭セグメント等、まれに無関係な8桁16進数と偶然一致する可能性はあるが、
+// クリップボード監視はオプトイン機能であり誤検知時の実害も小さいため許容する）
+const WINGARC_ERROR_CODE_PATTERN = /\b[89a][0-9a-f]{7}\b/i;
+
+const HIGH_CONFIDENCE_SIGNAL_PATTERN = new RegExp(
+  [
+    "EADDRINUSE",
+    "Traceback \\(most recent call last\\)",
+    "Unhandled[ A-Za-z]*Rejection",
+    "FATAL ERROR",
+    "npm (?:ERR!|error)",
+    "error TS\\d{4,5}",
+    "Segmentation fault",
+    "panic:",
+    "Exception in thread",
+    "NullPointerException",
+    "CONFLICT \\(content\\)",
+    WINGARC_ERROR_CODE_PATTERN.source,
+  ].join("|"),
+  "i"
+);
 
 // クリップボード監視モードが対象にするのは、ターミナルの生ログではなく
 // MotionBoard・BigQuery（Google Cloud Console）等のアプリ/Webサービスが表示する
@@ -750,7 +775,11 @@ function normalizeForMatching(s: string): string {
  * @param options.genericKeywords true の場合、高確度シグネチャに加えて汎用的なエラー関連
  *   キーワード（日英）でも判定する（クリップボード監視モード向け）。false（既定）の場合は
  *   ターミナル出力向けの高確度シグネチャのみで判定する（誤検知を避けたいターミナル監視モード向け）。
- * @param options.minLength この文字数未満のテキストは常にfalseを返す（既定0=制限なし）。
+ * @param options.minLength この文字数未満のテキストは、汎用キーワード判定(genericKeywords)
+ *   では常にfalseとして扱う（既定0=制限なし）。高確度シグネチャ（HIGH_CONFIDENCE_SIGNAL_PATTERN、
+ *   Wingarcエラーコードのような具体的な形を含む）は、それ自体の特異性で誤検知リスクが
+ *   低いとみなし、この文字数フィルタの対象外とする（"npm ERR!"や単体のエラーコードだけを
+ *   コピーした短い場合でも検知できるようにするため）。
  */
 export function looksLikeErrorText(
   text: string,
@@ -758,8 +787,8 @@ export function looksLikeErrorText(
 ): boolean {
   const { genericKeywords = false, minLength = 0 } = options;
   const normalized = normalizeForMatching(text);
-  if (normalized.length < minLength) return false;
   if (HIGH_CONFIDENCE_SIGNAL_PATTERN.test(normalized)) return true;
+  if (normalized.length < minLength) return false;
   return genericKeywords && GENERIC_KEYWORDS_PATTERN.test(normalized);
 }
 

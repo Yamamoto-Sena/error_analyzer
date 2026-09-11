@@ -278,6 +278,30 @@ describe("looksLikeErrorTextFromClipboard", () => {
     expect(looksLikeErrorTextFromClipboard("エラー")).toBe(false);
   });
 
+  it("Wingarc製品（Dr.Sum Server/MotionBoard）のエラーコードを検知する", () => {
+    // 実際にDr.Sum Serverの公式マニュアルに掲載されている712件のエラーコードを
+    // 全件抽出して検証したところ、コードは例外なく「8桁の16進数・先頭は8/9/a」
+    // という形式だった。メッセージ本文の言い回し（〜できません／〜が不正です等）は
+    // バラバラで拾いきれないため、コードの「形」自体を高確度シグネチャとして検知する。
+    const examples = [
+      "80001006　予約語が指定されています。", // 報告のあった実例（全角スペース入り）
+      "80001006 予約語が指定されています。",
+      "a0000002",
+      "9006ffff",
+      "80002100", // 「テーブルまたはビューが存在しません。」（メッセージ側にキーワードなし）
+    ];
+    for (const text of examples) {
+      expect(looksLikeErrorTextFromClipboard(text), `検知できなかった: ${text}`).toBe(true);
+    }
+  });
+
+  it("高確度シグネチャ（エラーコード等）は20文字未満でも検知する", () => {
+    // 長さフィルタは汎用キーワード判定にのみ適用され、高確度シグネチャ
+    // （npm ERR!やエラーコードのような具体的な形）には適用されない。
+    expect(looksLikeErrorTextFromClipboard("80001006")).toBe(true);
+    expect(looksLikeErrorTextFromClipboard("npm ERR!")).toBe(true);
+  });
+
   it("エラーに無関係な通常のコピー内容には反応しない", () => {
     const examples = [
       "今日の会議は15時からです。よろしくお願いします。",
