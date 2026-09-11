@@ -48,7 +48,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
-import { analyzeErrorLog, AnalysisResult } from "./analyzer";
+import { analyzeErrorLog, isGenericFallbackResult, AnalysisResult } from "./analyzer";
 import { analyzeWithGemini, listAvailableModels } from "./gemini";
 import { AVAILABLE_MODELS, DEFAULT_MODEL, GeminiModelOption } from "./models";
 import TerminalWatchModal from "./TerminalWatchModal";
@@ -1008,7 +1008,18 @@ export default function App() {
       } else {
         // 2. ローカル解析エンジンでフォールバック（画像は読み取れないためテキストのみ）
         await new Promise((r) => setTimeout(r, 600));
-        result = analyzeErrorLog(combinedText);
+        // ログ欄・症状説明欄の両方に入力がある場合、まずログ欄だけで解析を試みる。
+        // 具体的なエラーシグネチャに一致すればそれを採用し、症状説明欄の内容とは
+        // 食い違っていてもログ欄側を優先する（既知パターンに一致しない場合のみ、
+        // 症状説明欄も含めた全文で解析し直す）。これにより「たまたま連結時に
+        // ログ欄が先に来るので優先される」という暗黙の挙動を、明示的な優先順位
+        // として仕様化している。
+        if (hasLog && hasDescription) {
+          const logOnlyResult = analyzeErrorLog(effectiveLog.trim());
+          result = isGenericFallbackResult(logOnlyResult) ? analyzeErrorLog(combinedText) : logOnlyResult;
+        } else {
+          result = analyzeErrorLog(combinedText);
+        }
         result.modelUsed = "ローカル解析エンジン（ルールベース）";
         if (hasImage) {
           // ログ/症状説明欄にテキストがあるため上のブロック（!apiKey && hasImage && !hasLog）は

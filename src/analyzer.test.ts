@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   analyzeErrorLog,
   getOfficialDocLink,
+  isGenericFallbackResult,
   looksLikeErrorText,
   looksLikeErrorTextFromClipboard,
   matchesCustomKeywords,
@@ -219,6 +220,18 @@ FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaS
 
     expect(result.summary).not.toContain("【エラー内容");
     expect(result.summary).toContain("保存ボタンを押すと画面が固まる");
+  });
+});
+
+describe("isGenericFallbackResult", () => {
+  it("既知パターンに一致した結果はfalseを返す", () => {
+    const result = analyzeErrorLog("Error: Port 1420 is already in use");
+    expect(isGenericFallbackResult(result)).toBe(false);
+  });
+
+  it("汎用フォールバックに落ちた結果はtrueを返す", () => {
+    const result = analyzeErrorLog("Something completely unexpected happened in module Zeta");
+    expect(isGenericFallbackResult(result)).toBe(true);
   });
 });
 

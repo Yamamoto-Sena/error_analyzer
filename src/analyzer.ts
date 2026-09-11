@@ -181,6 +181,12 @@ function extractLocation(log: string): { file: string; line: string } {
   return { file: "設定・起動プロセス (vite.config.ts / src-tauri)", line: "1" };
 }
 
+// ローカル解析エンジンが、どの既知パターンにも一致せず汎用フォールバックへ
+// 落ちた場合に使うerrorType。App.tsx側で「ログ欄だけでは既知パターンに
+// 一致しなかったので、症状説明欄も含めて解析し直す」という優先順位判定
+// （isGenericFallbackResult）にも使う共通の目印。
+const GENERIC_FALLBACK_ERROR_TYPE = "Detected Runtime Exception / エラー";
+
 // 入力されたエラーログを動的に解析するエンジン（内部実装）
 function analyzeErrorLogCore(rawLog: string): AnalysisResult {
   const log = rawLog.trim();
@@ -679,7 +685,7 @@ NODE_OPTIONS=--max-old-space-size=4096 npm run build`,
       return trimmed.length > 0 && !/^【.*】$/.test(trimmed);
     }) || "エラーが発生しました";
   return {
-    errorType: "Detected Runtime Exception / エラー",
+    errorType: GENERIC_FALLBACK_ERROR_TYPE,
     summary: `検出されたエラー: 「${firstLine.slice(0, 80)}」`,
     rootCause: `スタックトレースを解析した結果、${location.file} の ${location.line}行目付近の処理で例外がスローされています。`,
     filePath: location.file,
@@ -704,6 +710,21 @@ export function analyzeErrorLog(rawLog: string): AnalysisResult {
   const result = analyzeErrorLogCore(rawLog);
   result.officialDocLink = getOfficialDocLink(result.errorType, rawLog) ?? undefined;
   return result;
+}
+
+/**
+ * `analyzeErrorLog`の結果が、既知の具体的なパターンに一致せず汎用フォールバックへ
+ * 落ちたものかどうかを判定する。
+ *
+ * App.tsxはログ欄・症状説明欄を両方入力した場合、まずログ欄だけで解析を試み、
+ * これがtrue（＝ログ欄だけでは具体的な手がかりが得られなかった）の場合のみ、
+ * 症状説明欄も含めて解析し直す、という優先順位判定に使う。
+ * これにより「ログ欄に具体的なエラーシグネチャがあれば、症状説明欄の内容と
+ * 食い違っていてもログ欄側が優先される」という挙動を、暗黙の連結順序依存ではなく
+ * 明示的な仕様にしている。
+ */
+export function isGenericFallbackResult(result: AnalysisResult): boolean {
+  return result.errorType === GENERIC_FALLBACK_ERROR_TYPE;
 }
 
 // 「エラーらしいテキストか」を判定する高確度なキーワードのみに絞ったヒューリスティック。
