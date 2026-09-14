@@ -45,15 +45,30 @@ import {
   Download,
   ClipboardPaste,
   Scissors,
+  Layers,
+  BarChart3,
+  FileText,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
-import { analyzeErrorLog, isGenericFallbackResult, AnalysisResult } from "./analyzer";
+import { analyzeErrorLog, isGenericFallbackResult, AnalysisResult, HistoryItem, TokenUsage } from "./analyzer";
+import { colorForErrorType } from "./historyStats";
 import { analyzeWithGemini, listAvailableModels } from "./gemini";
 import { AVAILABLE_MODELS, DEFAULT_MODEL, GeminiModelOption } from "./models";
+import {
+  DailyUsageState,
+  formatDailyUsageTooltip,
+  loadDailyUsage,
+  modelsWithQuotaExceededToday,
+  recordGeminiUsage,
+  totalTokensToday,
+} from "./usageTracker";
 import TerminalWatchModal from "./TerminalWatchModal";
 import ClipboardWatchModal from "./ClipboardWatchModal";
+import LogFileWatchModal from "./LogFileWatchModal";
 import ModelDiagnosticsModal from "./ModelDiagnosticsModal";
+import HistoryDashboardModal from "./HistoryDashboardModal";
+import FollowUpPanel, { FollowUpEntry } from "./FollowUpPanel";
 
 // プロジェクトのGit作業ツリーが汚れていないかの判定結果(Rust側 check_git_dirty の戻り値)
 interface GitDirtyStatus {
@@ -90,26 +105,6 @@ function describeUnapplicableReason(reason: string | null): string {
     default:
       return "このファイルは自動適用の対象外です。";
   }
-}
-
-// エラー種別ごとに一貫した色を割り当てるためのカラーパレット
-const HISTORY_COLOR_PALETTE = [
-  { text: "text-cyan-700 dark:text-cyan-300", bg: "bg-cyan-500/10", border: "border-cyan-500/25", bar: "bg-cyan-500" },
-  { text: "text-rose-700 dark:text-rose-300", bg: "bg-rose-500/10", border: "border-rose-500/25", bar: "bg-rose-500" },
-  { text: "text-amber-700 dark:text-amber-300", bg: "bg-amber-500/10", border: "border-amber-500/25", bar: "bg-amber-500" },
-  { text: "text-emerald-700 dark:text-emerald-300", bg: "bg-emerald-500/10", border: "border-emerald-500/25", bar: "bg-emerald-500" },
-  { text: "text-indigo-700 dark:text-indigo-300", bg: "bg-indigo-500/10", border: "border-indigo-500/25", bar: "bg-indigo-500" },
-  { text: "text-purple-700 dark:text-purple-300", bg: "bg-purple-500/10", border: "border-purple-500/25", bar: "bg-purple-500" },
-  { text: "text-teal-700 dark:text-teal-300", bg: "bg-teal-500/10", border: "border-teal-500/25", bar: "bg-teal-500" },
-  { text: "text-sky-700 dark:text-sky-300", bg: "bg-sky-500/10", border: "border-sky-500/25", bar: "bg-sky-500" },
-];
-
-function colorForErrorType(errorType: string) {
-  let hash = 0;
-  for (let i = 0; i < errorType.length; i++) {
-    hash = (hash * 31 + errorType.charCodeAt(i)) >>> 0;
-  }
-  return HISTORY_COLOR_PALETTE[hash % HISTORY_COLOR_PALETTE.length];
 }
 
 // 添付画像1件あたりの最大サイズ（4MB）
@@ -183,16 +178,6 @@ Traceback (most recent call last):
     print("User ID: " + response.user_id)
 AttributeError: 'NoneType' object has no attribute 'user_id'`,
 };
-
-interface HistoryItem {
-  id: string;
-  timestamp: string;
-  result: AnalysisResult;
-  /** 同一箇所（エラー種別+ファイルパス+行番号）の再発生を検知した回数。初回は1。 */
-  occurrenceCount: number;
-  /** ピン留めされているか。trueの場合、履歴の自動上限(MAX_HISTORY_ITEMS)による自動削除の対象外にする。 */
-  pinned: boolean;
-}
 
 // Unified Diff を追加(+)/削除(-)で色分け表示するサブコンポーネント
 function DiffView({ diffCode }: { diffCode: string }) {
@@ -323,6 +308,9 @@ export default function App() {
   } | null>(null);
   // 「エラーは解消した」ボタンを押す前に操作者自身へ確認してもらうチェックリスト
   const [verificationChecklist, setVerificationChecklist] = useState<string[]>([]);
+  // 解析結果へのフォローアップ質問(Q&A)。非永続(履歴保存の対象外)で、analysisが
+  // 入れ替わるたびにクリアする（詳細はFollowUpPanel.tsxのコメント参照）。
+  const [followUpEntries, setFollowUpEntries] = useState<FollowUpEntry[]>([]);
   const [checkedItems, setCheckedItems] = useState<boolean[]>([]);
 
   // APIキー管理
@@ -335,8 +323,22 @@ export default function App() {
   // モデル一覧はmodels.tsのハードコードを初期値とし、APIキー設定時にGoogle側から
   // 動的取得できればそちらに差し替える（取得失敗時はハードコードのままフォールバック）。
   const [availableModels, setAvailableModels] = useState<GeminiModelOption[]>(AVAILABLE_MODELS);
-  // Gemini解析のトークン消費量（このセッションでの累計。ローカルに永続化する）
-  const [sessionTokenTotal, setSessionTokenTotal] = useState<number>(0);
+  // Gemini解析のトークン消費量。Google側の日次クォータ(RPD)がリセットされる太平洋時間(PT)の
+  // 深夜0時を境界として集計し、localStorageに永続化する（アプリを再起動しても本日分は
+  // 保持される＝「再起動したら0件に見えるが実際はまだ今日分を使い切っている」を防ぐ）。
+  const [dailyUsage, setDailyUsage] = useState<DailyUsageState>(() => loadDailyUsage());
+
+  // アプリを開いたまま太平洋時間の日付が変わった場合に備え、定期的に日次境界を再チェックする
+  // （新たな解析が実行されればその時点でも自動的に切り替わるため、これはあくまで保険）。
+  useEffect(() => {
+    const id = setInterval(() => {
+      setDailyUsage((prev) => {
+        const fresh = loadDailyUsage();
+        return fresh.periodKey !== prev.periodKey ? fresh : prev;
+      });
+    }, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
   // プロジェクトのGit作業ツリーが汚れていないかの判定結果(実ファイル適用前の注意喚起用)
   const [gitDirtyStatus, setGitDirtyStatus] = useState<GitDirtyStatus | null>(null);
   const [showTerminalWatchModal, setShowTerminalWatchModal] = useState<boolean>(false);
@@ -344,6 +346,9 @@ export default function App() {
   // クリップボード監視が実際に実行中かどうか。モーダルを閉じていてもヘッダーの
   // ボタン上で分かるようにするため、モーダル内部の状態をここに引き上げている。
   const [isClipboardWatching, setIsClipboardWatching] = useState<boolean>(false);
+  const [showLogFileWatchModal, setShowLogFileWatchModal] = useState<boolean>(false);
+  // ログファイル監視が実際に実行中かどうか（isClipboardWatchingと同じ理由で引き上げている）
+  const [isLogFileWatching, setIsLogFileWatching] = useState<boolean>(false);
   const [showModelDiagnosticsModal, setShowModelDiagnosticsModal] = useState<boolean>(false);
 
   // テーマ管理（ライト / ダーク）
@@ -361,6 +366,7 @@ export default function App() {
   // 履歴管理
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [showHistoryModal, setShowHistoryModal] = useState<boolean>(false);
+  const [showHistoryDashboardModal, setShowHistoryDashboardModal] = useState<boolean>(false);
   // 種類別ビューで明示的に開いた（展開した）エラー種別のグループ名を保持する。
   // 初期状態では空＝全グループが閉じており、まず「どんなエラーが起きているか」の
   // 一覧（種別名＋件数）だけが見える。クリックした種別だけが展開される。
@@ -828,6 +834,7 @@ export default function App() {
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
+    setFollowUpEntries([]);
   };
 
   const handleSampleLoad = (key: keyof typeof SAMPLE_LOGS) => {
@@ -941,6 +948,19 @@ export default function App() {
     }
   };
 
+  // Gemini解析結果のトークン消費量を、Google側の日次クォータ境界(太平洋時間の深夜0時)に
+  // 揃えた集計へ加算する。新規解析(handleAnalyze)・検証時の再解析(handleVerifyFix)の
+  // どちらもGemini APIを実際に消費するため、両方からこの共通処理を呼ぶ
+  // （片方でしか呼ばないと、ヘッダーの「本日のトークン消費量」が実際より少なく表示され続ける）。
+  // AnalysisResultの構造的部分型として受け取る（FollowUpAnswer等、tokenUsage/modelUsed/
+  // quotaExceededModelsを同名で持つ型もそのまま渡せるようにするため）
+  const recordUsageForResult = (result: { modelUsed?: string; tokenUsage?: TokenUsage; quotaExceededModels?: string[] }) => {
+    if (!result.tokenUsage) return;
+    setDailyUsage(
+      recordGeminiUsage(result.modelUsed ?? selectedModel, result.tokenUsage.totalTokens, result.quotaExceededModels ?? [])
+    );
+  };
+
   // 解析実行（Gemini API または ローカル解析エンジンのハイブリッド）。
   // `overrideLog` が指定された場合（ターミナル監視モードからの自動解析）は、
   // logInputへの反映を待たずその文字列をそのまま解析対象にする(setState後の非同期タイミング問題を回避するため)。
@@ -969,6 +989,7 @@ export default function App() {
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
+    setFollowUpEntries([]);
 
     try {
       let result: AnalysisResult;
@@ -1000,11 +1021,7 @@ export default function App() {
           showToast(`✨ ${result.modelUsed ?? selectedModelLabel} による高精度解析が完了しました！${maskNote}`, "success");
         }
 
-        // トークン消費量をセッション累計に加算する（画面表示用。永続化はしない＝
-        // アプリを起動している間だけの累計であることをそのまま体現する）
-        if (result.tokenUsage) {
-          setSessionTokenTotal((prev) => prev + result.tokenUsage!.totalTokens);
-        }
+        recordUsageForResult(result);
       } else {
         // 2. ローカル解析エンジンでフォールバック（画像は読み取れないためテキストのみ）
         await new Promise((r) => setTimeout(r, 600));
@@ -1016,7 +1033,13 @@ export default function App() {
         // として仕様化している。
         if (hasLog && hasDescription) {
           const logOnlyResult = analyzeErrorLog(effectiveLog.trim());
-          result = isGenericFallbackResult(logOnlyResult) ? analyzeErrorLog(combinedText) : logOnlyResult;
+          const usedLogOnly = !isGenericFallbackResult(logOnlyResult);
+          result = usedLogOnly ? logOnlyResult : analyzeErrorLog(combinedText);
+          // ローカル解析エンジンは決定的なルールベースなので、Geminiと違い「実際にどちらを
+          // 使ったか」を自己申告ではなく、この分岐そのものから確実に説明できる。
+          result.inputPriorityNote = usedLogOnly
+            ? "エラーログ欄の内容から解析しました（症状説明欄は、ログ欄だけで既知のパターンに一致したため参照していません）"
+            : "エラーログ欄だけでは既知のパターンに一致しなかったため、症状説明欄の内容も含めて解析しました";
         } else {
           result = analyzeErrorLog(combinedText);
         }
@@ -1025,7 +1048,9 @@ export default function App() {
           // ログ/症状説明欄にテキストがあるため上のブロック（!apiKey && hasImage && !hasLog）は
           // 素通りしてここまで来ているが、ローカル解析エンジンは画像を一切読まないため、
           // 添付した画像が黙って無視されていることを明示しないと「画像も見てくれているはず」と
-          // 誤解されるリスクがある。
+          // 誤解されるリスクがある（トーストは消えるため、優先順位の説明にも残す）。
+          const imageIgnoredNote = "添付した画像はローカル解析エンジンでは解析対象外のため使用していません";
+          result.inputPriorityNote = result.inputPriorityNote ? `${result.inputPriorityNote}。${imageIgnoredNote}` : imageIgnoredNote;
           showToast(
             "テキストのみで解析しました（添付した画像はローカル解析エンジンでは解析対象外です。画像も解析するにはGemini APIキーを設定してください）",
             "warning"
@@ -1033,6 +1058,13 @@ export default function App() {
         } else {
           showToast("エラー内容の動的解析が完了しました（※APIキーを設定するとGemini AI解析・画像解析が利用可能です）", "info");
         }
+      }
+
+      // ログ・症状説明・画像のうち実際に入力されたのが1種類だけなら、優先順位を
+      // 説明する意味が無いため（Gemini側の自己申告ミスに対する保険も兼ねて）ここで確実に消す。
+      const providedSourceCount = [hasLog, hasDescription, hasImage].filter(Boolean).length;
+      if (providedSourceCount < 2) {
+        result.inputPriorityNote = undefined;
       }
 
       setAnalysis(result);
@@ -1103,6 +1135,9 @@ export default function App() {
 
   const handleClipboardWatchError = (capturedText: string, autoAnalyze: boolean) =>
     handleWatchDetectedError("クリップボード監視", capturedText, autoAnalyze);
+
+  const handleLogFileWatchError = (capturedText: string, autoAnalyze: boolean) =>
+    handleWatchDetectedError("ログファイル監視", capturedText, autoAnalyze);
 
   // コピー機能
   const handleCopyDiff = async () => {
@@ -1315,8 +1350,23 @@ export default function App() {
     try {
       let recheck: AnalysisResult;
       if (apiKey) {
-        recheck = await analyzeWithGemini(verifyLogInput, apiKey, selectedModel);
+        // 直前に提示した修正案（要約・根本原因・diffCode/taskSteps）をプロンプトへ含めることで、
+        // 「今回のログはその修正を適用した後に再実行して得られたもの」という前提をGeminiに
+        // 伝える。これが無いと、Geminiは初見のログとして解析し、既に試して効かなかった
+        // 修正案を気づかず繰り返し提案してしまう。
+        recheck = await analyzeWithGemini(verifyLogInput, apiKey, selectedModel, [], {
+          summary: analysis.summary,
+          rootCause: analysis.rootCause,
+          fixType: analysis.fixType,
+          diffCode: analysis.diffCode,
+          taskSteps: analysis.taskSteps,
+        });
+        recordUsageForResult(recheck);
       } else {
+        // ローカル解析エンジンは決定的なルールベースのパターンマッチであり、「直前の修正案が
+        // 効かなかった」という文脈を踏まえて提案を変えることはできない（同じログ種別には常に
+        // 同じ結果を返す）。そのため、実質的に前回と同じ修正案を繰り返しているケースを検知し、
+        // 下のメッセージでユーザーに正直に伝える（repeatedLocalFixNoteを参照）。
         recheck = analyzeErrorLog(verifyLogInput);
         recheck.modelUsed = "ローカル解析エンジン（ルールベース）";
       }
@@ -1328,11 +1378,39 @@ export default function App() {
       const normalize = (s: string) => s.trim().toLowerCase();
       const sameErrorType = normalize(recheck.errorType) === normalize(analysis.errorType);
       const sameFile = normalize(recheck.filePath) === normalize(analysis.filePath);
+      // ローカル解析エンジンの汎用フォールバックは、既知パターンに一致しなかった場合に常に
+      // 同じ固定のerrorType/filePathを返す。そのため、前回・今回とも汎用フォールバックだと
+      // 「errorTypeが一致した」というだけでは実際に同じ問題かどうか判定できない（無関係な
+      // 別のエラーが、たまたま両方とも未知パターンだっただけの可能性がある）。この場合は
+      // 誤って「同じエラーが継続している」と断定せず、判定できない旨を正直に伝える。
+      const bothGenericFallback = !apiKey && isGenericFallbackResult(analysis) && isGenericFallbackResult(recheck);
 
-      if (sameErrorType) {
+      if (bothGenericFallback) {
         setVerificationResult({
           status: "still-failing",
-          message: `⚠️ 同じ種類のエラー（${recheck.errorType}）がまだ発生しているようです。新しい根本原因と修正案に更新しました。下の「根本原因」「修正案 (Diff)」タブをご確認ください。`,
+          message:
+            "❓ このログはローカル解析エンジンの既知パターンに一致しなかったため、前回と同じ問題が続いているのか、別の未知のエラーなのかを自動判定できませんでした。下の「根本原因」タブの内容と実際のログを見比べてご確認いただくか、Gemini APIキーを設定するとより正確に判定できます。",
+        });
+        showToast("この内容ではローカル解析エンジンが同一性を判定できませんでした", "info");
+      } else if (sameErrorType) {
+        // ローカル解析エンジンは決定的なルールベースのため、直前の修正案が効かなかったという
+        // 文脈を考慮できず、実質的に同じdiffCode/taskStepsを繰り返し提示することがある。
+        // その場合は「新しい修正案」という表現が誤解を招くため、その旨を正直に付記する。
+        // ただし、汎用フォールバック（isGenericFallbackResult）はどんなログでもほぼ固定の
+        // diffCode/errorType/filePathを返すため、"内容が完全一致"という判定条件だけでは
+        // 「実際には無関係な別のエラーが、たまたま両方とも汎用フォールバックに落ちただけ」の
+        // ケースを「同じ修正案の再提示」と誤って断定してしまう。汎用フォールバックの場合は
+        // この注記自体を出さない。
+        const repeatedLocalFixNote =
+          !apiKey &&
+          !isGenericFallbackResult(recheck) &&
+          recheck.diffCode === analysis.diffCode &&
+          JSON.stringify(recheck.taskSteps ?? []) === JSON.stringify(analysis.taskSteps ?? [])
+            ? "（※ローカル解析エンジンは直前の修正案が効かなかったという情報を考慮できないため、前回と同じ内容を再提示しています。手動での深掘り、またはGemini APIキーの設定をご検討ください）"
+            : "";
+        setVerificationResult({
+          status: "still-failing",
+          message: `⚠️ 同じ種類のエラー（${recheck.errorType}）がまだ発生しているようです。新しい根本原因と修正案に更新しました。下の「根本原因」「修正案 (Diff)」タブをご確認ください。${repeatedLocalFixNote}`,
         });
         showToast("修正が不十分なようです。新しい修正案を表示します", "warning");
       } else if (sameFile) {
@@ -1355,6 +1433,7 @@ export default function App() {
       setActiveTab("cause");
       setIsApplied(false);
       setVerifyLogInput("");
+      setFollowUpEntries([]);
       saveToHistory(recheck);
     } catch (err) {
       console.error(err);
@@ -1372,6 +1451,7 @@ export default function App() {
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
+    setFollowUpEntries([]);
     showToast(`履歴「${item.result.errorType}」を読み込みました`, "info");
   };
 
@@ -1547,9 +1627,6 @@ export default function App() {
               <span className="font-bold text-lg tracking-wider bg-gradient-to-r from-cyan-500 to-teal-500 dark:from-cyan-400 dark:to-teal-300 bg-clip-text text-transparent">
                 DEBUG BUDDY
               </span>
-              <span className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20">
-                Desktop v0.1.0
-              </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">AI-Powered Debugging & Error Log Analysis Assistant 🚀</p>
           </div>
@@ -1578,17 +1655,6 @@ export default function App() {
             </select>
           </div>
 
-          {/* モデル診断（プルダウンに出ているが実際には呼び出せないモデルを洗い出す） */}
-          <button
-            onClick={() => setShowModelDiagnosticsModal(true)}
-            disabled={!apiKey}
-            title={apiKey ? "一覧の各モデルへ実際にリクエストを送り、使えるか確認します" : "先にGemini APIキーを設定してください"}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
-          >
-            <Cpu className="w-3.5 h-3.5" />
-            <span>モデル診断</span>
-          </button>
-
           {/* Gemini API 設定ボタン */}
           <button
             onClick={() => setShowKeyModal(true)}
@@ -1603,16 +1669,24 @@ export default function App() {
             <span className="font-semibold">{apiKey ? "Active" : "APIキー設定"}</span>
           </button>
 
-          {/* Gemini解析のトークン消費量（セッション累計）。0件のうちは表示しない。
-              永続化はしておらず、このアプリを起動してから今までの累計のみを表示する
-              （アプリを再起動すると0に戻る＝日次クォータの消費量とは別物）。 */}
-          {sessionTokenTotal > 0 && (
+          {/* Gemini解析のトークン消費量（本日分）。Google側の日次クォータ(RPD)がリセットされる
+              太平洋時間の深夜0時を境界に集計し、localStorageで永続化しているため、アプリを
+              再起動しても本日分の数値は保持される（0件のうちは表示しない）。
+              いずれかのモデルで本日、日次上限超過をGoogle側から実際に検知していればアンバー表示にする。 */}
+          {totalTokensToday(dailyUsage) > 0 && (
             <span
-              title="このアプリを起動してから今までにGemini APIが消費した合計トークン数（アプリを再起動すると0に戻ります。Google側の日次クォータの残量とは別の数値です）"
-              className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400"
+              title={formatDailyUsageTooltip(dailyUsage)}
+              className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border ${
+                modelsWithQuotaExceededToday(dailyUsage).length > 0
+                  ? "bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300"
+                  : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400"
+              }`}
             >
               <Coins className="w-3.5 h-3.5 shrink-0" />
-              <span>{sessionTokenTotal.toLocaleString()} tokens</span>
+              <span>{totalTokensToday(dailyUsage).toLocaleString()} tokens（本日）</span>
+              {modelsWithQuotaExceededToday(dailyUsage).length > 0 && (
+                <AlertTriangle className="w-3 h-3 shrink-0" />
+              )}
             </span>
           )}
 
@@ -1655,6 +1729,30 @@ export default function App() {
             {isClipboardWatching && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />}
             <ClipboardPaste className="w-3.5 h-3.5" />
             <span>{isClipboardWatching ? "クリップボード監視: 監視中" : "クリップボード監視"}</span>
+          </button>
+
+          {/* ログファイル監視モード（常駐サーバー等、このアプリから直接起動していないプロセスが
+              出力するログファイルへの追記を監視する）。ファイルI/Oが必要なため、
+              デスクトップアプリ版でのみ利用できる。見た目・状態管理はクリップボード監視と同様。 */}
+          <button
+            onClick={() => IS_TAURI_RUNTIME && setShowLogFileWatchModal(true)}
+            disabled={!IS_TAURI_RUNTIME}
+            title={
+              IS_TAURI_RUNTIME
+                ? isLogFileWatching
+                  ? "ログファイル監視: 実行中です（クリックで停止・設定変更）"
+                  : "指定したログファイルへの追記を自動検知します（試験的機能）"
+                : "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
+            }
+            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+              isLogFileWatching
+                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
+                : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300"
+            }`}
+          >
+            {isLogFileWatching && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />}
+            <FileText className="w-3.5 h-3.5" />
+            <span>{isLogFileWatching ? "ログファイル監視: 監視中" : "ログファイル監視"}</span>
           </button>
 
           {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定）。
@@ -1726,6 +1824,17 @@ export default function App() {
             )}
           </button>
 
+          {/* 振り返りダッシュボードボタン。history stateはWeb版でもlocalStorage経由で使えるため、
+              ターミナル/クリップボード監視ボタンと違いIS_TAURI_RUNTIMEによるゲートは不要。 */}
+          <button
+            onClick={() => setShowHistoryDashboardModal(true)}
+            title="解析履歴を集計した振り返りダッシュボードを開く"
+            className="flex items-center space-x-1.5 px-3.5 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/20 hover:border-emerald-500/60 transition cursor-pointer font-semibold shadow-sm"
+          >
+            <BarChart3 className="w-4 h-4" />
+            <span>振り返り</span>
+          </button>
+
           {/* ライト / ダークモード切り替えボタン */}
           <button
             onClick={toggleTheme}
@@ -1737,66 +1846,8 @@ export default function App() {
         </div>
       </header>
 
-      {/* 2. ウェルカム合言葉バナー */}
-      <div className="px-6 pt-5">
-        <div className="bg-gradient-to-r from-cyan-100/60 via-white to-indigo-100/60 dark:from-cyan-950/40 dark:via-slate-900/60 dark:to-indigo-950/40 border border-cyan-500/20 rounded-2xl p-4 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 shadow-sm">
-          <div className="flex items-center space-x-3.5">
-            <div className="p-2.5 rounded-xl bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20 shrink-0">
-              <Sparkles className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center space-x-2">
-                <span className="text-sm font-semibold text-slate-900 dark:text-white">👋 ようこそ、Debug Buddy へ！</span>
-                <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/20 font-medium">
-                  合言葉: 「エラーは成長のチャンス！」
-                </span>
-              </div>
-              <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
-                ログを貼り付けるだけで、AIが原因の解説・修正パッチ・学習メモを動的生成します。
-                {!apiKey && (
-                  <span className="text-cyan-600 dark:text-cyan-400 ml-1 cursor-pointer hover:underline" onClick={() => setShowKeyModal(true)}>
-                    （※APIキーを設定するとGemini AIが有効になります）
-                  </span>
-                )}
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center space-x-2 flex-wrap gap-y-2">
-            <span className="text-xs text-slate-500 dark:text-slate-400">サンプル:</span>
-            <button
-              onClick={() => handleSampleLoad("typeError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-cyan-700 dark:text-cyan-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
-            >
-              TypeError
-            </button>
-            <button
-              onClick={() => handleSampleLoad("syntaxError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-amber-700 dark:text-amber-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
-            >
-              SyntaxError
-            </button>
-            <button
-              onClick={() => handleSampleLoad("refError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-purple-700 dark:text-purple-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
-            >
-              ReferenceError
-            </button>
-            <button
-              onClick={() => handleSampleLoad("portError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-rose-600 dark:text-rose-400 border border-rose-500/30 transition cursor-pointer"
-            >
-              Port競合 (1420)
-            </button>
-            <button
-              onClick={() => handleSampleLoad("attributeError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 transition cursor-pointer"
-            >
-              AttributeError (Python)
-            </button>
-          </div>
-        </div>
-      </div>
+      {/* 旧ウェルカム合言葉バナーは常設の装飾要素で場所を取るだけだったため撤去。
+          サンプルボタンは実際に使う場面（まだ解析結果が無い右側パネル）に移設した。 */}
 
       {/* 3. メインコンテンツ（2ペイン構成） */}
       <main className="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -1989,7 +2040,7 @@ export default function App() {
                 <div>
                   <p className="text-sm font-medium text-slate-600 dark:text-slate-300">まだ解析結果はありません</p>
                   <p className="text-xs text-slate-400 dark:text-slate-500 mt-1 max-w-sm">
-                    左側の入力欄に任意のエラーログをペーストするか、上部のサンプルボタンをクリックして「エラーを解析する」を実行してください。
+                    左側の入力欄に任意のエラーログをペーストするか、下のサンプルを試して「エラーを解析する」を実行してください。
                   </p>
                   {history.length > 0 && (
                     <button
@@ -2000,6 +2051,44 @@ export default function App() {
                       <span>過去の解析履歴を見る（{history.length}件）</span>
                     </button>
                   )}
+                </div>
+
+                {/* サンプルログ（旧ウェルカムバナーから移設）。解析結果が出た後は
+                    このパネル自体が非表示になるため、常設ヘッダーと違い自動的に隠れる。 */}
+                <div className="pt-1">
+                  <p className="text-[11px] text-slate-400 dark:text-slate-500 mb-1.5">サンプルを試す:</p>
+                  <div className="flex items-center justify-center flex-wrap gap-1.5">
+                    <button
+                      onClick={() => handleSampleLoad("typeError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-cyan-700 dark:text-cyan-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
+                    >
+                      TypeError
+                    </button>
+                    <button
+                      onClick={() => handleSampleLoad("syntaxError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-amber-700 dark:text-amber-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
+                    >
+                      SyntaxError
+                    </button>
+                    <button
+                      onClick={() => handleSampleLoad("refError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-purple-700 dark:text-purple-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
+                    >
+                      ReferenceError
+                    </button>
+                    <button
+                      onClick={() => handleSampleLoad("portError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-rose-600 dark:text-rose-400 border border-rose-500/30 transition cursor-pointer"
+                    >
+                      Port競合 (1420)
+                    </button>
+                    <button
+                      onClick={() => handleSampleLoad("attributeError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 transition cursor-pointer"
+                    >
+                      AttributeError (Python)
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : (
@@ -2027,6 +2116,23 @@ export default function App() {
 
                 {activeTab === "cause" && (
                   <div className="space-y-4">
+                    {/* ログ欄・症状説明欄・画像のうち2つ以上が入力された場合に、実際にどれを
+                        優先して解析したかを明示する（従来はrootCauseの文中に埋もれて分かり
+                        にくかったため、専用の見出し付きボックスとして先頭に出す）。 */}
+                    {analysis.inputPriorityNote && (
+                      <div className="p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/25 flex items-start space-x-2.5">
+                        <Layers className="w-4 h-4 text-indigo-600 dark:text-indigo-400 mt-0.5 shrink-0" />
+                        <div>
+                          <h4 className="text-[11px] font-semibold text-indigo-700 dark:text-indigo-300 uppercase tracking-wider">
+                            入力の優先順位について
+                          </h4>
+                          <p className="text-xs text-indigo-700/90 dark:text-indigo-200/90 mt-0.5 leading-relaxed">
+                            {analysis.inputPriorityNote}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 flex items-start space-x-3">
                       <AlertCircle className="w-5 h-5 text-rose-500 dark:text-rose-400 mt-0.5 shrink-0" />
                       <div>
@@ -2242,6 +2348,20 @@ export default function App() {
                           </div>
                         )}
                     </div>
+
+                    {/* 解析結果へのフォローアップ質問。「なぜこの修正が必要か」等を深掘りできる。
+                        Gemini APIキー必須（未設定時はFollowUpPanel内で案内のみ表示）。 */}
+                    <FollowUpPanel
+                      analysis={analysis}
+                      apiKey={apiKey}
+                      selectedModel={selectedModel}
+                      entries={followUpEntries}
+                      onAsked={(entry, usage) => {
+                        setFollowUpEntries((prev) => [...prev, entry]);
+                        recordUsageForResult(usage);
+                      }}
+                      showToast={showToast}
+                    />
 
                     <div className="flex items-center justify-end space-x-2 pt-2">
                       <button
@@ -2548,6 +2668,23 @@ export default function App() {
               />
             </div>
 
+            {/* モデル診断（プルダウンに出ているが実際には呼び出せないモデルを洗い出す）。
+                頻繁に使う操作ではないため、常設のヘッダーボタンではなくAPIキー設定の中に置く。
+                キー設定済みのときだけ表示する（未設定では実行できないため）。 */}
+            {apiKey && (
+              <button
+                onClick={() => {
+                  setShowKeyModal(false);
+                  setShowModelDiagnosticsModal(true);
+                }}
+                title="一覧の各モデルへ実際にリクエストを送り、使えるか確認します"
+                className="w-full flex items-center justify-center space-x-1.5 px-3 py-2 rounded-lg border border-dashed border-slate-300 dark:border-slate-700 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+              >
+                <Cpu className="w-3.5 h-3.5" />
+                <span>登録済みモデルを診断する</span>
+              </button>
+            )}
+
             <div className="flex items-center justify-between pt-2">
               <a
                 href="https://aistudio.google.com/app/apikey"
@@ -2767,11 +2904,32 @@ export default function App() {
         onRunningChange={setIsClipboardWatching}
       />
 
+      {/* 5.7. ログファイル監視モード（試験的機能）。他の監視モードと同様、閉じても
+          バックグラウンドでの監視自体は継続するため、show/hideはCSSのみで切り替え、
+          コンポーネント自体はアンマウントしない。 */}
+      <LogFileWatchModal
+        open={showLogFileWatchModal}
+        onClose={() => setShowLogFileWatchModal(false)}
+        onDetectedError={handleLogFileWatchError}
+        showToast={showToast}
+        onRunningChange={setIsLogFileWatching}
+      />
+
       <ModelDiagnosticsModal
         open={showModelDiagnosticsModal}
         onClose={() => setShowModelDiagnosticsModal(false)}
         apiKey={apiKey}
         models={availableModels}
+      />
+
+      <HistoryDashboardModal
+        open={showHistoryDashboardModal}
+        onClose={() => setShowHistoryDashboardModal(false)}
+        history={history}
+        onSelectHistoryItem={(item) => {
+          handleSelectHistory(item);
+          setShowHistoryDashboardModal(false);
+        }}
       />
 
       {/* 右クリックメニュー（コピー/切り取り/貼り付けのみの自作メニュー。Issue #3） */}

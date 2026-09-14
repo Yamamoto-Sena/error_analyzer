@@ -27,6 +27,20 @@ export interface AnalysisResult {
   maskedSecretsCount?: number;
   /** Gemini解析時のトークン消費量（ローカル解析エンジン使用時は省略） */
   tokenUsage?: TokenUsage;
+  /** ログ欄・症状説明欄・画像のうち2つ以上が入力された場合に、実際にどれを主たる解析対象として
+   *  採用したか（優先順位判定の結果）を一言で説明したもの。入力が1種類のみの場合は省略。 */
+  inputPriorityNote?: string;
+}
+
+// 解析履歴1件分（App.tsxの解析履歴モーダル・historyStats.tsの振り返り集計の両方から参照する）
+export interface HistoryItem {
+  id: string;
+  timestamp: string;
+  result: AnalysisResult;
+  /** 同一箇所（エラー種別+ファイルパス+行番号）の再発生を検知した回数。初回は1。 */
+  occurrenceCount: number;
+  /** ピン留めされているか。trueの場合、履歴の自動上限(MAX_HISTORY_ITEMS)による自動削除の対象外にする。 */
+  pinned: boolean;
 }
 
 export interface TokenUsage {
