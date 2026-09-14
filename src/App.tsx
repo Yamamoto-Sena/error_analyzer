@@ -33,8 +33,6 @@ import {
   ShieldCheck,
   Search,
   MessageSquareText,
-  ListChecks,
-  Circle,
   ClipboardList,
   FolderOpen,
   Save,
@@ -48,6 +46,8 @@ import {
   Layers,
   BarChart3,
   FileText,
+  Wand2,
+  Eye,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
@@ -218,25 +218,6 @@ function DiffView({ diffCode }: { diffCode: string }) {
   );
 }
 
-// 操作者自身に確認してもらう検証チェックリストを解析結果から生成する。
-// 「エラーは解消した」の自己申告だけに頼らず、具体的な確認観点を提示して精度を上げる。
-// コード修正（fixType: "code"）と手順対応（fixType: "task"）で文言を出し分ける。
-function buildVerificationChecklist(analysis: AnalysisResult): string[] {
-  const isTask = analysis.fixType === "task";
-  const items = [
-    isTask
-      ? `上記の手順（タスク）をすべて実施した`
-      : `修正を適用したコードで、エラーが発生していた操作・処理をもう一度実行した`,
-    `ターミナル/コンソール/ログに「${analysis.errorType}」と同じエラーが出力されていないことを確認した`,
-    isTask
-      ? `関連する機能（${analysis.filePath}）が正常に動作することを確認した`
-      : `修正対象のファイル（${analysis.filePath}）を含む周辺の機能が正常に動作することを確認した`,
-  ];
-  if (analysis.preventionTips.length > 0) {
-    items.push(`再発防止策「${analysis.preventionTips[0]}」を踏まえて動作確認した`);
-  }
-  return items;
-}
 
 // コードの差分ではなく、手順（コマンド実行・再起動・ケーブル抜き差し等）で解決するタイプの修正案を
 // 番号付きのタスクリストとして表示するサブコンポーネント
@@ -306,12 +287,15 @@ export default function App() {
     status: "resolved" | "still-failing" | "new-error";
     message: string;
   } | null>(null);
-  // 「エラーは解消した」ボタンを押す前に操作者自身へ確認してもらうチェックリスト
-  const [verificationChecklist, setVerificationChecklist] = useState<string[]>([]);
+  // 修正案で対応できたかの3択（未選択/解決できなかった＝再解析/違う方法で解決できた）。
+  // 以前は自動生成のチェックリスト全項目チェックを必須にしていたが、意味の薄い自己申告に
+  // なりがちだったため、結果に応じた3つの選択肢を選ぶ方式に変更した。
+  const [resolutionChoice, setResolutionChoice] = useState<"unresolved" | "different" | null>(null);
+  // 「違う方法で解決できた」選択時に、実際に行った方法を記録する自由記述欄
+  const [differentMethodInput, setDifferentMethodInput] = useState<string>("");
   // 解析結果へのフォローアップ質問(Q&A)。非永続(履歴保存の対象外)で、analysisが
   // 入れ替わるたびにクリアする（詳細はFollowUpPanel.tsxのコメント参照）。
   const [followUpEntries, setFollowUpEntries] = useState<FollowUpEntry[]>([]);
-  const [checkedItems, setCheckedItems] = useState<boolean[]>([]);
 
   // APIキー管理
   const [apiKey, setApiKey] = useState<string>("");
@@ -349,6 +333,9 @@ export default function App() {
   const [showLogFileWatchModal, setShowLogFileWatchModal] = useState<boolean>(false);
   // ログファイル監視が実際に実行中かどうか（isClipboardWatchingと同じ理由で引き上げている）
   const [isLogFileWatching, setIsLogFileWatching] = useState<boolean>(false);
+  // ヘッダーが混雑してきたため、ターミナル/クリップボード/ログファイル監視の3ボタンを
+  // 1つの「監視」ドロップダウンに集約している。その開閉状態。
+  const [showWatchMenu, setShowWatchMenu] = useState<boolean>(false);
   const [showModelDiagnosticsModal, setShowModelDiagnosticsModal] = useState<boolean>(false);
 
   // テーマ管理（ライト / ダーク）
@@ -482,6 +469,23 @@ export default function App() {
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [contextMenu]);
+
+  // 監視ドロップダウンメニュー表示中に、外側クリック・Escapeキーで閉じる（contextMenuと同じ仕組み）
+  useEffect(() => {
+    if (!showWatchMenu) return;
+    const close = () => setShowWatchMenu(false);
+    const closeOnEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [showWatchMenu]);
 
   // input/textareaはReactが管理する状態(value)と実際のDOM値がズレないよう、
   // Reactが上書きしているvalueのsetterを直接呼んでから input イベントを発火させる。
@@ -693,19 +697,6 @@ export default function App() {
     localStorage.setItem("debug_buddy_theme", theme);
   }, [theme]);
 
-  // 解析結果が変わるたび（新規解析・履歴読込・再検証）に検証チェックリストを作り直す。
-  // 「コードに適用する（プレビュー）」を押していなくても確認できるよう、isApplied には依存させない。
-  useEffect(() => {
-    if (analysis) {
-      const checklist = buildVerificationChecklist(analysis);
-      setVerificationChecklist(checklist);
-      setCheckedItems(new Array(checklist.length).fill(false));
-    } else {
-      setVerificationChecklist([]);
-      setCheckedItems([]);
-    }
-  }, [analysis]);
-
   // プロジェクトフォルダが選択されていて、かつコード修正(fixType!=="task")の場合のみ、
   // 「実ファイルへ安全に適用できるか」を裏で自動判定する（実際の書き込みは一切行わない読み取り専用の問い合わせ）。
   // Tauriアプリの外（ブラウザ単体プレビュー等）では invoke が使えないため、失敗時は静かに
@@ -848,14 +839,16 @@ export default function App() {
 
   // ログ入力が別内容に置き換わる際、古い解析結果が新しい入力と矛盾したまま
   // 画面に残らないよう、解析結果関連stateを破棄する。
-  // （verificationChecklist/checkedItems/realApplyResult等は、analysisの変化に連動する
-  // 既存のuseEffectが自動的にクリアするため、ここでは触らない）
+  // （realApplyResult等は、analysisの変化に連動する既存のuseEffectが自動的にクリアするため、
+  // ここでは触らない）
   const clearAnalysisResult = () => {
     setHasResult(false);
     setAnalysis(null);
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
+    setResolutionChoice(null);
+    setDifferentMethodInput("");
     setFollowUpEntries([]);
   };
 
@@ -1011,6 +1004,8 @@ export default function App() {
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
+    setResolutionChoice(null);
+    setDifferentMethodInput("");
     setFollowUpEntries([]);
 
     try {
@@ -1188,6 +1183,8 @@ export default function App() {
       setIsApplied(false);
       setVerificationResult(null);
       setVerifyLogInput("");
+      setResolutionChoice(null);
+      setDifferentMethodInput("");
       showToast(`プレビューを取り消しました（${analysis.filePath} は変更されていません）`, "info");
       return;
     }
@@ -1197,6 +1194,8 @@ export default function App() {
       setIsApplying(false);
       setIsApplied(true);
       setVerificationResult(null);
+      setResolutionChoice(null);
+      setDifferentMethodInput("");
       showToast(
         `📝 ${analysis.filePath} への適用をプレビュー表示しました（※実ファイルは書き換えていません。反映するには上の差分を「差分をコピー」してご自身のエディタで適用してください）`,
         "info"
@@ -1338,29 +1337,29 @@ export default function App() {
     if (next) void loadBackupHistory();
   };
 
-  // チェックリストの各項目のON/OFFを切り替える
-  const toggleChecklistItem = (index: number) => {
-    setCheckedItems((prev) => prev.map((checked, i) => (i === index ? !checked : checked)));
-  };
-
-  // 修正案が適用済みで、かつエラーが解消したことをユーザーが確認した場合
+  // 提示した修正案どおりでエラーが解消したことをユーザーが確認した場合
   const handleMarkResolved = () => {
     if (!analysis) return;
-    if (verificationChecklist.length > 0 && !checkedItems.every(Boolean)) {
-      showToast(
-        analysis.fixType === "task"
-          ? "すべての実施確認にチェックを入れてから完了報告してください"
-          : "すべての確認項目にチェックを入れてから完了報告してください",
-        "warning"
-      );
-      return;
-    }
     setVerificationResult({
       status: "resolved",
       message: "✅ 修正が正しく適用され、エラーは解消しました。お疲れ様でした！",
     });
+    setResolutionChoice(null);
     setVerifyLogInput("");
     showToast("🎉 エラーの解消を記録しました！", "success");
+  };
+
+  // 提示した修正案とは違う方法で自力解決した場合。今後の振り返りの参考になるよう、
+  // 実際に行った方法を自由記述で記録してから完了報告する。
+  const handleMarkResolvedDifferently = () => {
+    if (!analysis || !differentMethodInput.trim()) return;
+    setVerificationResult({
+      status: "resolved",
+      message: `✅ 提示した修正案とは違う方法で解決しました。記録: 「${differentMethodInput.trim()}」`,
+    });
+    setResolutionChoice(null);
+    setDifferentMethodInput("");
+    showToast("🎉 別の方法での解決を記録しました！", "success");
   };
 
   // 修正適用後に再実行して得られたログを再解析し、本当に直ったかを検証する。
@@ -1455,6 +1454,8 @@ export default function App() {
       setActiveTab("cause");
       setIsApplied(false);
       setVerifyLogInput("");
+      setResolutionChoice(null);
+      setDifferentMethodInput("");
       setFollowUpEntries([]);
       saveToHistory(recheck);
     } catch (err) {
@@ -1473,6 +1474,8 @@ export default function App() {
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
+    setResolutionChoice(null);
+    setDifferentMethodInput("");
     setFollowUpEntries([]);
     showToast(`履歴「${item.result.errorType}」を読み込みました`, "info");
   };
@@ -1712,70 +1715,91 @@ export default function App() {
             </span>
           )}
 
-          {/* ターミナル監視モード（開発コマンドをアプリ内から実行し、出力をリアルタイム監視する）。
-              サブプロセス起動が必要なため、デスクトップアプリ版でのみ利用できる。 */}
-          <button
-            onClick={() => IS_TAURI_RUNTIME && setShowTerminalWatchModal(true)}
-            disabled={!IS_TAURI_RUNTIME}
-            title={
-              IS_TAURI_RUNTIME
-                ? "開発コマンドをアプリ内から実行し、出力を監視します（試験的機能）"
-                : "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
-            }
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300 transition cursor-pointer"
-          >
-            <Terminal className="w-3.5 h-3.5" />
-            <span>ターミナル監視</span>
-          </button>
+          <div className="hidden sm:block w-px h-6 bg-slate-300 dark:bg-slate-700 mx-0.5" />
 
-          {/* クリップボード監視モード（MotionBoard等、他アプリで出たエラーをコピーするだけで自動検知する）。
-              ネイティブのクリップボードAPIが必要なため、デスクトップアプリ版でのみ利用できる。
-              実行中はボタン自体の見た目を変え（緑色＋点滅ドット）、モーダルを閉じていても
-              「今、監視中かどうか」がひと目で分かるようにしている。 */}
-          <button
-            onClick={() => IS_TAURI_RUNTIME && setShowClipboardWatchModal(true)}
-            disabled={!IS_TAURI_RUNTIME}
-            title={
-              IS_TAURI_RUNTIME
-                ? isClipboardWatching
-                  ? "クリップボード監視: 実行中です（クリックで停止・設定変更）"
-                  : "他のアプリでコピーしたエラーメッセージを自動検知します（試験的機能）"
-                : "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
-            }
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
-              isClipboardWatching
-                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
-                : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300"
-            }`}
-          >
-            {isClipboardWatching && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />}
-            <ClipboardPaste className="w-3.5 h-3.5" />
-            <span>{isClipboardWatching ? "クリップボード監視: 監視中" : "クリップボード監視"}</span>
-          </button>
+          {/* 監視系メニュー: ターミナル監視・クリップボード監視・ログファイル監視をまとめる。
+              以前はヘッダーに3つ個別のボタンを並べており混雑していたため、1つのドロップダウンに
+              集約した。いずれかが実行中の場合は、集約ボタン自体に緑色＋点滅ドットを表示する
+              （ターミナル監視は実行中フラグをApp.tsxに引き上げていないため対象外）。 */}
+          <div className="relative">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowWatchMenu((prev) => !prev);
+              }}
+              title="ターミナル監視・クリップボード監視・ログファイル監視をまとめて開く"
+              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer ${
+                isClipboardWatching || isLogFileWatching
+                  ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
+                  : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700"
+              }`}
+            >
+              {(isClipboardWatching || isLogFileWatching) && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+              )}
+              <Eye className="w-3.5 h-3.5" />
+              <span>監視</span>
+              <ChevronDown className="w-3 h-3" />
+            </button>
 
-          {/* ログファイル監視モード（常駐サーバー等、このアプリから直接起動していないプロセスが
-              出力するログファイルへの追記を監視する）。ファイルI/Oが必要なため、
-              デスクトップアプリ版でのみ利用できる。見た目・状態管理はクリップボード監視と同様。 */}
-          <button
-            onClick={() => IS_TAURI_RUNTIME && setShowLogFileWatchModal(true)}
-            disabled={!IS_TAURI_RUNTIME}
-            title={
-              IS_TAURI_RUNTIME
-                ? isLogFileWatching
-                  ? "ログファイル監視: 実行中です（クリックで停止・設定変更）"
-                  : "指定したログファイルへの追記を自動検知します（試験的機能）"
-                : "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
-            }
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
-              isLogFileWatching
-                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
-                : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300"
-            }`}
-          >
-            {isLogFileWatching && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />}
-            <FileText className="w-3.5 h-3.5" />
-            <span>{isLogFileWatching ? "ログファイル監視: 監視中" : "ログファイル監視"}</span>
-          </button>
+            {showWatchMenu && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="absolute left-0 mt-1.5 w-64 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xl z-50 overflow-hidden divide-y divide-slate-100 dark:divide-slate-800"
+              >
+                <button
+                  onClick={() => {
+                    setShowWatchMenu(false);
+                    if (IS_TAURI_RUNTIME) setShowTerminalWatchModal(true);
+                  }}
+                  disabled={!IS_TAURI_RUNTIME}
+                  title={!IS_TAURI_RUNTIME ? "Web版では利用できません（デスクトップアプリ版でのみ利用可能）" : undefined}
+                  className="w-full flex items-center space-x-2 px-3 py-2.5 text-left text-xs hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                >
+                  <Terminal className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+                  <span className="flex-1 text-slate-700 dark:text-slate-200">ターミナル監視（試験的機能）</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setShowWatchMenu(false);
+                    if (IS_TAURI_RUNTIME) setShowClipboardWatchModal(true);
+                  }}
+                  disabled={!IS_TAURI_RUNTIME}
+                  title={!IS_TAURI_RUNTIME ? "Web版では利用できません（デスクトップアプリ版でのみ利用可能）" : undefined}
+                  className="w-full flex items-center space-x-2 px-3 py-2.5 text-left text-xs hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                >
+                  {isClipboardWatching ? (
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                  ) : (
+                    <ClipboardPaste className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+                  )}
+                  <span className="flex-1 text-slate-700 dark:text-slate-200">
+                    {isClipboardWatching ? "クリップボード監視: 監視中" : "クリップボード監視（試験的機能）"}
+                  </span>
+                </button>
+                <button
+                  onClick={() => {
+                    setShowWatchMenu(false);
+                    if (IS_TAURI_RUNTIME) setShowLogFileWatchModal(true);
+                  }}
+                  disabled={!IS_TAURI_RUNTIME}
+                  title={!IS_TAURI_RUNTIME ? "Web版では利用できません（デスクトップアプリ版でのみ利用可能）" : undefined}
+                  className="w-full flex items-center space-x-2 px-3 py-2.5 text-left text-xs hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                >
+                  {isLogFileWatching ? (
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                  ) : (
+                    <FileText className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+                  )}
+                  <span className="flex-1 text-slate-700 dark:text-slate-200">
+                    {isLogFileWatching ? "ログファイル監視: 監視中" : "ログファイル監視（試験的機能）"}
+                  </span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="hidden sm:block w-px h-6 bg-slate-300 dark:bg-slate-700 mx-0.5" />
 
           {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定）。
               ネイティブのフォルダ選択ダイアログ・ファイルI/Oが必要なため、Web版では利用できない。 */}
@@ -1831,6 +1855,8 @@ export default function App() {
             </span>
           )}
 
+          <div className="hidden sm:block w-px h-6 bg-slate-300 dark:bg-slate-700 mx-0.5" />
+
           {/* 履歴モーダルボタン（見つけやすいよう強調表示） */}
           <button
             onClick={() => setShowHistoryModal(true)}
@@ -1856,6 +1882,8 @@ export default function App() {
             <BarChart3 className="w-4 h-4" />
             <span>振り返り</span>
           </button>
+
+          <div className="hidden sm:block w-px h-6 bg-slate-300 dark:bg-slate-700 mx-0.5" />
 
           {/* ライト / ダークモード切り替えボタン */}
           <button
@@ -2276,85 +2304,94 @@ export default function App() {
                         </h4>
                         <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
                           {analysis.fixType === "task"
-                            ? "上記の手順を実施した状態で同じ操作を再実行してください。エラーが解消していれば下のボタンで完了報告、まだ同じ（または別の）エラーが出る場合は、その新しいログを貼り付けて再解析できます。"
-                            : "修正を適用した状態で同じ操作を再実行してください。エラーが解消していれば下のボタンで完了報告、まだ同じ（または別の）エラーが出る場合は、その新しいログを貼り付けて再解析できます。"}
+                            ? "上記の手順を実施した状態で同じ操作を再実行し、結果に近いものを選んでください。"
+                            : "修正を適用した状態で同じ操作を再実行し、結果に近いものを選んでください。"}
                         </p>
 
-                        {/* 操作者自身に確認してもらう検証チェックリスト（自己申告の精度を上げるため、全項目チェックしないと完了報告できない） */}
-                        {verificationChecklist.length > 0 && (
-                          <div className="rounded-lg border border-sky-500/25 bg-white dark:bg-slate-950/60 divide-y divide-sky-500/10">
-                            <div className="px-3 py-2 flex items-center justify-between">
-                              <span className="text-[11px] font-semibold text-sky-700 dark:text-sky-300 uppercase tracking-wider flex items-center space-x-1.5">
-                                <ListChecks className="w-3.5 h-3.5" />
-                                <span>{analysis.fixType === "task" ? "実施確認リスト" : "確認チェックリスト"}</span>
-                              </span>
-                              <span className="text-[10px] text-slate-400 dark:text-slate-500">
-                                {checkedItems.filter(Boolean).length} / {verificationChecklist.length} 完了
-                              </span>
-                            </div>
-                            {verificationChecklist.map((item, idx) => (
+                        {/* 修正案の結果を3択で報告してもらう方式。以前は自動生成のチェックリストに
+                            全項目チェックしないと完了報告できない仕組みだったが、確認観点が形骸化し
+                            意味のある自己申告になっていなかったため、結果に応じた3択に置き換えた。 */}
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <button
+                            onClick={handleMarkResolved}
+                            className="text-xs px-3 py-2.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 font-semibold flex items-center justify-center space-x-1.5 transition cursor-pointer active:scale-95"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            <span>解決できた</span>
+                          </button>
+                          <button
+                            onClick={() => setResolutionChoice((prev) => (prev === "unresolved" ? null : "unresolved"))}
+                            className={`text-xs px-3 py-2.5 rounded-lg border font-semibold flex items-center justify-center space-x-1.5 transition cursor-pointer active:scale-95 ${
+                              resolutionChoice === "unresolved"
+                                ? "border-rose-500/50 bg-rose-500/15 text-rose-700 dark:text-rose-300"
+                                : "border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-900"
+                            }`}
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>解決できなかった</span>
+                          </button>
+                          <button
+                            onClick={() => setResolutionChoice((prev) => (prev === "different" ? null : "different"))}
+                            className={`text-xs px-3 py-2.5 rounded-lg border font-semibold flex items-center justify-center space-x-1.5 transition cursor-pointer active:scale-95 ${
+                              resolutionChoice === "different"
+                                ? "border-indigo-500/50 bg-indigo-500/15 text-indigo-700 dark:text-indigo-300"
+                                : "border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-900"
+                            }`}
+                          >
+                            <Wand2 className="w-3.5 h-3.5" />
+                            <span>違う方法で解決できた</span>
+                          </button>
+                        </div>
+
+                        {/* 「解決できなかった」選択時: 再実行後のログを貼り付けて再解析する（従来の検証フローと同じ） */}
+                        {resolutionChoice === "unresolved" && (
+                          <div className="space-y-2">
+                            <textarea
+                              value={verifyLogInput}
+                              onChange={(e) => setVerifyLogInput(e.target.value)}
+                              placeholder="再実行後に出力されたログを貼り付けてください"
+                              rows={3}
+                              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 p-2.5 font-mono text-xs text-slate-800 dark:text-slate-200 resize-none outline-none focus:border-sky-500/60 focus:ring-1 focus:ring-sky-500/40 transition placeholder:text-slate-400 dark:placeholder:text-slate-600"
+                            />
+                            <div className="flex items-center justify-end">
                               <button
-                                key={idx}
-                                type="button"
-                                onClick={() => toggleChecklistItem(idx)}
-                                className="w-full flex items-start space-x-2 px-3 py-2 text-left hover:bg-sky-500/5 transition cursor-pointer"
+                                onClick={handleVerifyFix}
+                                disabled={!verifyLogInput.trim() || isVerifying}
+                                className="text-xs px-3.5 py-2 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
                               >
-                                {checkedItems[idx] ? (
-                                  <CheckCircle2 className="w-4 h-4 text-emerald-500 dark:text-emerald-400 mt-0.5 shrink-0" />
+                                {isVerifying ? (
+                                  <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
                                 ) : (
-                                  <Circle className="w-4 h-4 text-slate-300 dark:text-slate-600 mt-0.5 shrink-0" />
+                                  <ShieldCheck className="w-3.5 h-3.5" />
                                 )}
-                                <span
-                                  className={`text-xs leading-relaxed ${
-                                    checkedItems[idx]
-                                      ? "text-slate-400 dark:text-slate-500 line-through"
-                                      : "text-slate-700 dark:text-slate-300"
-                                  }`}
-                                >
-                                  {item}
-                                </span>
+                                <span>{isVerifying ? "検証中..." : "ログを再解析して検証する"}</span>
                               </button>
-                            ))}
+                            </div>
                           </div>
                         )}
 
-                        <textarea
-                          value={verifyLogInput}
-                          onChange={(e) => setVerifyLogInput(e.target.value)}
-                          placeholder="再実行後に出力されたログがあれば貼り付けてください（エラーが解消していれば空欄のままでOKです）"
-                          rows={3}
-                          className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 p-2.5 font-mono text-xs text-slate-800 dark:text-slate-200 resize-none outline-none focus:border-sky-500/60 focus:ring-1 focus:ring-sky-500/40 transition placeholder:text-slate-400 dark:placeholder:text-slate-600"
-                        />
-
-                        <div className="flex items-center justify-end space-x-2">
-                          <button
-                            onClick={handleMarkResolved}
-                            disabled={verificationChecklist.length > 0 && !checkedItems.every(Boolean)}
-                            title={
-                              verificationChecklist.length > 0 && !checkedItems.every(Boolean)
-                                ? analysis.fixType === "task"
-                                  ? "実施確認リストの全項目にチェックを入れてください"
-                                  : "確認チェックリストの全項目にチェックを入れてください"
-                                : undefined
-                            }
-                            className="text-xs px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
-                          >
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            <span>エラーは解消した</span>
-                          </button>
-                          <button
-                            onClick={handleVerifyFix}
-                            disabled={!verifyLogInput.trim() || isVerifying}
-                            className="text-xs px-3.5 py-2 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
-                          >
-                            {isVerifying ? (
-                              <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-                            ) : (
-                              <ShieldCheck className="w-3.5 h-3.5" />
-                            )}
-                            <span>{isVerifying ? "検証中..." : "ログを再解析して検証する"}</span>
-                          </button>
-                        </div>
+                        {/* 「違う方法で解決できた」選択時: 実際に行った方法を記録してから完了報告する */}
+                        {resolutionChoice === "different" && (
+                          <div className="space-y-2">
+                            <textarea
+                              value={differentMethodInput}
+                              onChange={(e) => setDifferentMethodInput(e.target.value)}
+                              placeholder="どのように解決したか、実際に行った方法を記録しておきましょう（例:「バージョンを上げて解決した」等）"
+                              rows={3}
+                              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 p-2.5 text-xs text-slate-800 dark:text-slate-200 resize-none outline-none focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/40 transition placeholder:text-slate-400 dark:placeholder:text-slate-600"
+                            />
+                            <div className="flex items-center justify-end">
+                              <button
+                                onClick={handleMarkResolvedDifferently}
+                                disabled={!differentMethodInput.trim()}
+                                className="text-xs px-3.5 py-2 rounded-lg bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                <span>この内容で完了報告する</span>
+                              </button>
+                            </div>
+                          </div>
+                        )}
 
                         {verificationResult && (
                           <div
