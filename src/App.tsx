@@ -380,6 +380,8 @@ export default function App() {
   const [isApplying, setIsApplying] = useState<boolean>(false);
   const [isApplied, setIsApplied] = useState<boolean>(false);
   const [toast, setToast] = useState<{ message: string; type: "success" | "info" | "warning" } | null>(null);
+  const [toastCopied, setToastCopied] = useState<boolean>(false);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 自作の右クリックメニュー（Issue #3）。入力欄・テキスト選択上でのみ、
   // 「コピー/切り取り/貼り付け」だけの最小メニューを自前で表示する。
@@ -798,10 +800,30 @@ export default function App() {
   };
 
   const showToast = (message: string, type: "success" | "info" | "warning" = "success") => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastCopied(false);
     setToast({ message, type });
-    setTimeout(() => {
+    // warning（エラー・失敗系）は内容を読んで対処を検討する時間が必要なため長めに表示する
+    const autoDismissMs = type === "warning" ? 8000 : 4000;
+    toastTimerRef.current = setTimeout(() => {
       setToast(null);
-    }, 4000);
+    }, autoDismissMs);
+  };
+
+  const dismissToast = () => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast(null);
+  };
+
+  const copyToastMessage = async () => {
+    if (!toast) return;
+    try {
+      await navigator.clipboard.writeText(toast.message);
+      setToastCopied(true);
+      setTimeout(() => setToastCopied(false), 2000);
+    } catch {
+      // クリップボードAPIが使えない環境では静かに諦める（トースト自体は表示され続ける）
+    }
   };
 
   const saveApiKey = async () => {
@@ -1079,7 +1101,7 @@ export default function App() {
       setAnalysis(fallback);
       setHasResult(true);
       setActiveTab("cause");
-      showToast(`Gemini通信エラー (${(err as Error).message.slice(0, 40)}...)。ローカル解析を表示します`, "warning");
+      showToast(`Gemini通信エラー (${(err as Error).message.slice(0, 300)})。ローカル解析を表示します`, "warning");
     } finally {
       setIsAnalyzing(false);
     }
@@ -1233,7 +1255,7 @@ export default function App() {
       setRealApplyResult(null);
       showToast("バックアップをすべて削除しました", "info");
     } catch (err) {
-      showToast(`バックアップの削除に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`バックアップの削除に失敗しました: ${String(err).slice(0, 300)}`, "warning");
     } finally {
       setIsClearingBackups(false);
     }
@@ -1258,7 +1280,7 @@ export default function App() {
       // 実ファイルを書き換えたため、Git汚れ状態の表示も最新化する
       refreshGitDirtyStatus();
     } catch (err) {
-      showToast(`実ファイルへの適用に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`実ファイルへの適用に失敗しました: ${String(err).slice(0, 300)}`, "warning");
     } finally {
       setIsRealApplying(false);
     }
@@ -1279,7 +1301,7 @@ export default function App() {
       // 実ファイルを復元したため、Git汚れ状態の表示も最新化する
       refreshGitDirtyStatus();
     } catch (err) {
-      showToast(`ロールバックに失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`ロールバックに失敗しました: ${String(err).slice(0, 300)}`, "warning");
     } finally {
       setIsRollingBackReal(false);
     }
@@ -1302,7 +1324,7 @@ export default function App() {
       );
       setBackupHistory(list);
     } catch (err) {
-      showToast(`バックアップ履歴の取得に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`バックアップ履歴の取得に失敗しました: ${String(err).slice(0, 300)}`, "warning");
       setBackupHistory([]);
     } finally {
       setIsLoadingBackupHistory(false);
@@ -1437,7 +1459,7 @@ export default function App() {
       saveToHistory(recheck);
     } catch (err) {
       console.error(err);
-      showToast(`検証中にエラーが発生しました (${(err as Error).message.slice(0, 40)}...)`, "warning");
+      showToast(`検証中にエラーが発生しました (${(err as Error).message.slice(0, 300)})`, "warning");
     } finally {
       setIsVerifying(false);
     }
@@ -1510,7 +1532,7 @@ export default function App() {
       );
       if (saved) showToast(`履歴${history.length}件をJSONでエクスポートしました`, "success");
     } catch (err) {
-      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 300)}`, "warning");
     }
   };
 
@@ -1539,7 +1561,7 @@ export default function App() {
       const saved = await saveTextFile(`debug-buddy-history-${dateStr}.md`, lines.join("\n"), "text/markdown", "Markdown", ["md"]);
       if (saved) showToast(`履歴${history.length}件をMarkdownでエクスポートしました`, "success");
     } catch (err) {
-      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 300)}`, "warning");
     }
   };
 
@@ -2975,11 +2997,13 @@ export default function App() {
         </div>
       )}
 
-      {/* 6. トースト通知ポップアップ */}
+      {/* 6. トースト通知ポップアップ
+          エラー(warning)は内容を読んで対処を検討できるよう、表示時間を延ばし(showToast側)、
+          手動で閉じる「×」ボタンと、長い文言を報告・共有用にコピーできるボタンを付ける。 */}
       {toast && (
-        <div className="fixed bottom-6 right-6 z-50 animate-bounce">
+        <div className="fixed bottom-6 right-6 z-50 max-w-md animate-bounce">
           <div
-            className={`px-4 py-2.5 rounded-xl shadow-2xl text-xs font-medium flex items-center space-x-2 border backdrop-blur-md ${
+            className={`px-4 py-2.5 rounded-xl shadow-2xl text-xs font-medium flex items-start space-x-2 border backdrop-blur-md ${
               toast.type === "success"
                 ? "bg-white/95 dark:bg-slate-900/95 text-emerald-700 dark:text-emerald-300 border-emerald-500/40"
                 : toast.type === "warning"
@@ -2988,13 +3012,31 @@ export default function App() {
             }`}
           >
             {toast.type === "success" ? (
-              <CheckCircle2 className="w-4 h-4 text-emerald-500 dark:text-emerald-400 shrink-0" />
+              <CheckCircle2 className="w-4 h-4 mt-0.5 text-emerald-500 dark:text-emerald-400 shrink-0" />
             ) : toast.type === "warning" ? (
-              <AlertCircle className="w-4 h-4 text-amber-500 dark:text-amber-400 shrink-0" />
+              <AlertCircle className="w-4 h-4 mt-0.5 text-amber-500 dark:text-amber-400 shrink-0" />
             ) : (
-              <ExternalLink className="w-4 h-4 text-cyan-500 dark:text-cyan-400 shrink-0" />
+              <ExternalLink className="w-4 h-4 mt-0.5 text-cyan-500 dark:text-cyan-400 shrink-0" />
             )}
-            <span>{toast.message}</span>
+            <span className="whitespace-pre-wrap break-words">{toast.message}</span>
+            <div className="flex items-center space-x-1 shrink-0">
+              {toast.type === "warning" && (
+                <button
+                  onClick={copyToastMessage}
+                  title="エラー内容をコピー"
+                  className="p-1 rounded hover:bg-black/5 dark:hover:bg-white/10 transition cursor-pointer"
+                >
+                  {toastCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                </button>
+              )}
+              <button
+                onClick={dismissToast}
+                title="閉じる"
+                className="p-1 rounded hover:bg-black/5 dark:hover:bg-white/10 transition cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
       )}

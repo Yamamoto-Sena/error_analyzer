@@ -686,7 +686,52 @@ NODE_OPTIONS=--max-old-space-size=4096 npm run build`,
     };
   }
 
-  // 14. 汎用フォールバック（未知のエラーログ）
+  // 14. Rust panic（本体アプリ(src-tauri/)自体もRust製のため対応）
+  if (/thread\s+'[^']*'\s+panicked at\s+([^\s:]+):(\d+):(\d+)/i.test(log)) {
+    const panicMatch = log.match(/thread\s+'[^']*'\s+panicked at\s+([^\s:]+):(\d+):(\d+):?\s*\n?(.*)/i);
+    const panicFile = panicMatch ? panicMatch[1] : location.file;
+    const panicLine = panicMatch ? panicMatch[2] : location.line;
+    const panicMessage = panicMatch ? panicMatch[4].trim() : "";
+    const isUnwrapNone = /called `Option::unwrap\(\)` on a `None` value/i.test(log);
+    const isUnwrapErr = /called `Result::unwrap\(\)` on an `Err` value/i.test(log);
+    const isIndexOob = /index out of bounds/i.test(log);
+
+    return {
+      errorType: "Rust panic: 実行時パニック 🦀",
+      summary: panicMessage
+        ? `Rustのプログラムがpanicしました: ${panicMessage.slice(0, 100)}`
+        : `Rustのプログラムが ${panicFile}:${panicLine} でpanicしました。`,
+      rootCause: isUnwrapNone
+        ? "Option<T>型の値が None（値なし）だったにもかかわらず .unwrap() を呼び出したため、プログラムが強制終了（panic）しました。"
+        : isUnwrapErr
+        ? "Result<T, E>型の値が Err（エラー）だったにもかかわらず .unwrap() を呼び出したため、プログラムが強制終了（panic）しました。"
+        : isIndexOob
+        ? "配列・スライスの範囲外のインデックスにアクセスしたため、プログラムが強制終了（panic）しました。"
+        : "回復不能と判断された異常状態（アサーション失敗、明示的な panic!() 呼び出し等）により、プログラムが強制終了（panic）しました。",
+      filePath: panicFile,
+      lineNumber: `${panicLine}行目`,
+      diffCode: `--- a/${panicFile}
++++ b/${panicFile}
+@@ -${panicLine},3 +${panicLine},7 @@
+-value.unwrap()
++match value {
++    Some(v) => v,
++    None => {
++        // None/Errだった場合の代替処理をここに記述
++        return Err("値が取得できませんでした".into());
++    }
++};`,
+      learningTitle: "💡 学習ポイント: RustのOption<T>/Result<T, E>とpanic",
+      learningContent: "Rustには例外機構が無く、代わりに「値が無いかもしれない」ことを Option<T>（Some/None）、「失敗するかもしれない」ことを Result<T, E>（Ok/Err）という型で表現します。.unwrap() はNone/Errの場合にプログラムを即座にpanicさせる（強制終了する）ため、本番コードではmatch式や ?演算子、.unwrap_or_default() 等で安全に処理するのが基本です。",
+      preventionTips: [
+        ".unwrap() / .expect() は「絶対に失敗しない」ことが確実な場面（プロトタイプ・テストコード等）に限定して使う",
+        "本番コードでは match / if let / ?演算子でOption・Resultを明示的にハンドリングする",
+        "RUST_BACKTRACE=1 を設定して実行すると、panic発生箇所までの詳細なスタックトレースが得られる",
+      ],
+    };
+  }
+
+  // 15. 汎用フォールバック（未知のエラーログ）
   // App.tsxはログ欄・症状説明欄を両方入力すると、それぞれの内容を
   // 「【エラーログ / スタックトレース】」「【エラー内容・症状の説明（ユーザー記述）】」
   // というラベル行を先頭に付けて連結して渡してくる。このラベル行自体は実際の

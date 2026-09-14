@@ -180,6 +180,19 @@ FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaS
     expect(result.errorType).toContain("NullPointerException");
   });
 
+  it("Rust panic(unwrap on None)を検出する", () => {
+    const log = `thread 'main' panicked at src/main.rs:10:5:
+called \`Option::unwrap()\` on a \`None\` value
+note: run with \`RUST_BACKTRACE=1\` environment variable to display a backtrace`;
+
+    const result = analyzeErrorLog(log);
+
+    expect(result.errorType).toContain("Rust panic");
+    expect(result.filePath).toBe("src/main.rs");
+    expect(result.lineNumber).toBe("10行目");
+    expect(result.rootCause).toContain("None");
+  });
+
   it("JSON.parseの構文解析エラーを検出する", () => {
     const log = `SyntaxError: Unexpected token < in JSON at position 0`;
 
