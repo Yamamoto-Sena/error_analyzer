@@ -33,8 +33,6 @@ import {
   ShieldCheck,
   Search,
   MessageSquareText,
-  ListChecks,
-  Circle,
   ClipboardList,
   FolderOpen,
   Save,
@@ -45,14 +43,32 @@ import {
   Download,
   ClipboardPaste,
   Scissors,
+  Layers,
+  BarChart3,
+  FileText,
+  Wand2,
+  Eye,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
-import { analyzeErrorLog, AnalysisResult } from "./analyzer";
+import { analyzeErrorLog, isGenericFallbackResult, AnalysisResult, HistoryItem, TokenUsage } from "./analyzer";
+import { colorForErrorType } from "./historyStats";
 import { analyzeWithGemini, listAvailableModels } from "./gemini";
 import { AVAILABLE_MODELS, DEFAULT_MODEL, GeminiModelOption } from "./models";
+import {
+  DailyUsageState,
+  formatDailyUsageTooltip,
+  loadDailyUsage,
+  modelsWithQuotaExceededToday,
+  recordGeminiUsage,
+  totalTokensToday,
+} from "./usageTracker";
 import TerminalWatchModal from "./TerminalWatchModal";
+import ClipboardWatchModal from "./ClipboardWatchModal";
+import LogFileWatchModal from "./LogFileWatchModal";
 import ModelDiagnosticsModal from "./ModelDiagnosticsModal";
+import HistoryDashboardModal from "./HistoryDashboardModal";
+import FollowUpPanel, { FollowUpEntry } from "./FollowUpPanel";
 
 // プロジェクトのGit作業ツリーが汚れていないかの判定結果(Rust側 check_git_dirty の戻り値)
 interface GitDirtyStatus {
@@ -89,26 +105,6 @@ function describeUnapplicableReason(reason: string | null): string {
     default:
       return "このファイルは自動適用の対象外です。";
   }
-}
-
-// エラー種別ごとに一貫した色を割り当てるためのカラーパレット
-const HISTORY_COLOR_PALETTE = [
-  { text: "text-cyan-700 dark:text-cyan-300", bg: "bg-cyan-500/10", border: "border-cyan-500/25", bar: "bg-cyan-500" },
-  { text: "text-rose-700 dark:text-rose-300", bg: "bg-rose-500/10", border: "border-rose-500/25", bar: "bg-rose-500" },
-  { text: "text-amber-700 dark:text-amber-300", bg: "bg-amber-500/10", border: "border-amber-500/25", bar: "bg-amber-500" },
-  { text: "text-emerald-700 dark:text-emerald-300", bg: "bg-emerald-500/10", border: "border-emerald-500/25", bar: "bg-emerald-500" },
-  { text: "text-indigo-700 dark:text-indigo-300", bg: "bg-indigo-500/10", border: "border-indigo-500/25", bar: "bg-indigo-500" },
-  { text: "text-purple-700 dark:text-purple-300", bg: "bg-purple-500/10", border: "border-purple-500/25", bar: "bg-purple-500" },
-  { text: "text-teal-700 dark:text-teal-300", bg: "bg-teal-500/10", border: "border-teal-500/25", bar: "bg-teal-500" },
-  { text: "text-sky-700 dark:text-sky-300", bg: "bg-sky-500/10", border: "border-sky-500/25", bar: "bg-sky-500" },
-];
-
-function colorForErrorType(errorType: string) {
-  let hash = 0;
-  for (let i = 0; i < errorType.length; i++) {
-    hash = (hash * 31 + errorType.charCodeAt(i)) >>> 0;
-  }
-  return HISTORY_COLOR_PALETTE[hash % HISTORY_COLOR_PALETTE.length];
 }
 
 // 添付画像1件あたりの最大サイズ（4MB）
@@ -183,16 +179,6 @@ Traceback (most recent call last):
 AttributeError: 'NoneType' object has no attribute 'user_id'`,
 };
 
-interface HistoryItem {
-  id: string;
-  timestamp: string;
-  result: AnalysisResult;
-  /** 同一箇所（エラー種別+ファイルパス+行番号）の再発生を検知した回数。初回は1。 */
-  occurrenceCount: number;
-  /** ピン留めされているか。trueの場合、履歴の自動上限(MAX_HISTORY_ITEMS)による自動削除の対象外にする。 */
-  pinned: boolean;
-}
-
 // Unified Diff を追加(+)/削除(-)で色分け表示するサブコンポーネント
 function DiffView({ diffCode }: { diffCode: string }) {
   const lines = diffCode.split("\n");
@@ -232,25 +218,6 @@ function DiffView({ diffCode }: { diffCode: string }) {
   );
 }
 
-// 操作者自身に確認してもらう検証チェックリストを解析結果から生成する。
-// 「エラーは解消した」の自己申告だけに頼らず、具体的な確認観点を提示して精度を上げる。
-// コード修正（fixType: "code"）と手順対応（fixType: "task"）で文言を出し分ける。
-function buildVerificationChecklist(analysis: AnalysisResult): string[] {
-  const isTask = analysis.fixType === "task";
-  const items = [
-    isTask
-      ? `上記の手順（タスク）をすべて実施した`
-      : `修正を適用したコードで、エラーが発生していた操作・処理をもう一度実行した`,
-    `ターミナル/コンソール/ログに「${analysis.errorType}」と同じエラーが出力されていないことを確認した`,
-    isTask
-      ? `関連する機能（${analysis.filePath}）が正常に動作することを確認した`
-      : `修正対象のファイル（${analysis.filePath}）を含む周辺の機能が正常に動作することを確認した`,
-  ];
-  if (analysis.preventionTips.length > 0) {
-    items.push(`再発防止策「${analysis.preventionTips[0]}」を踏まえて動作確認した`);
-  }
-  return items;
-}
 
 // コードの差分ではなく、手順（コマンド実行・再起動・ケーブル抜き差し等）で解決するタイプの修正案を
 // 番号付きのタスクリストとして表示するサブコンポーネント
@@ -320,9 +287,15 @@ export default function App() {
     status: "resolved" | "still-failing" | "new-error";
     message: string;
   } | null>(null);
-  // 「エラーは解消した」ボタンを押す前に操作者自身へ確認してもらうチェックリスト
-  const [verificationChecklist, setVerificationChecklist] = useState<string[]>([]);
-  const [checkedItems, setCheckedItems] = useState<boolean[]>([]);
+  // 修正案で対応できたかの3択（未選択/解決できなかった＝再解析/違う方法で解決できた）。
+  // 以前は自動生成のチェックリスト全項目チェックを必須にしていたが、意味の薄い自己申告に
+  // なりがちだったため、結果に応じた3つの選択肢を選ぶ方式に変更した。
+  const [resolutionChoice, setResolutionChoice] = useState<"unresolved" | "different" | null>(null);
+  // 「違う方法で解決できた」選択時に、実際に行った方法を記録する自由記述欄
+  const [differentMethodInput, setDifferentMethodInput] = useState<string>("");
+  // 解析結果へのフォローアップ質問(Q&A)。非永続(履歴保存の対象外)で、analysisが
+  // 入れ替わるたびにクリアする（詳細はFollowUpPanel.tsxのコメント参照）。
+  const [followUpEntries, setFollowUpEntries] = useState<FollowUpEntry[]>([]);
 
   // APIキー管理
   const [apiKey, setApiKey] = useState<string>("");
@@ -334,11 +307,35 @@ export default function App() {
   // モデル一覧はmodels.tsのハードコードを初期値とし、APIキー設定時にGoogle側から
   // 動的取得できればそちらに差し替える（取得失敗時はハードコードのままフォールバック）。
   const [availableModels, setAvailableModels] = useState<GeminiModelOption[]>(AVAILABLE_MODELS);
-  // Gemini解析のトークン消費量（このセッションでの累計。ローカルに永続化する）
-  const [sessionTokenTotal, setSessionTokenTotal] = useState<number>(0);
+  // Gemini解析のトークン消費量。Google側の日次クォータ(RPD)がリセットされる太平洋時間(PT)の
+  // 深夜0時を境界として集計し、localStorageに永続化する（アプリを再起動しても本日分は
+  // 保持される＝「再起動したら0件に見えるが実際はまだ今日分を使い切っている」を防ぐ）。
+  const [dailyUsage, setDailyUsage] = useState<DailyUsageState>(() => loadDailyUsage());
+
+  // アプリを開いたまま太平洋時間の日付が変わった場合に備え、定期的に日次境界を再チェックする
+  // （新たな解析が実行されればその時点でも自動的に切り替わるため、これはあくまで保険）。
+  useEffect(() => {
+    const id = setInterval(() => {
+      setDailyUsage((prev) => {
+        const fresh = loadDailyUsage();
+        return fresh.periodKey !== prev.periodKey ? fresh : prev;
+      });
+    }, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
   // プロジェクトのGit作業ツリーが汚れていないかの判定結果(実ファイル適用前の注意喚起用)
   const [gitDirtyStatus, setGitDirtyStatus] = useState<GitDirtyStatus | null>(null);
   const [showTerminalWatchModal, setShowTerminalWatchModal] = useState<boolean>(false);
+  const [showClipboardWatchModal, setShowClipboardWatchModal] = useState<boolean>(false);
+  // クリップボード監視が実際に実行中かどうか。モーダルを閉じていてもヘッダーの
+  // ボタン上で分かるようにするため、モーダル内部の状態をここに引き上げている。
+  const [isClipboardWatching, setIsClipboardWatching] = useState<boolean>(false);
+  const [showLogFileWatchModal, setShowLogFileWatchModal] = useState<boolean>(false);
+  // ログファイル監視が実際に実行中かどうか（isClipboardWatchingと同じ理由で引き上げている）
+  const [isLogFileWatching, setIsLogFileWatching] = useState<boolean>(false);
+  // ヘッダーが混雑してきたため、ターミナル/クリップボード/ログファイル監視の3ボタンを
+  // 1つの「監視」ドロップダウンに集約している。その開閉状態。
+  const [showWatchMenu, setShowWatchMenu] = useState<boolean>(false);
   const [showModelDiagnosticsModal, setShowModelDiagnosticsModal] = useState<boolean>(false);
 
   // テーマ管理（ライト / ダーク）
@@ -356,6 +353,7 @@ export default function App() {
   // 履歴管理
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [showHistoryModal, setShowHistoryModal] = useState<boolean>(false);
+  const [showHistoryDashboardModal, setShowHistoryDashboardModal] = useState<boolean>(false);
   // 種類別ビューで明示的に開いた（展開した）エラー種別のグループ名を保持する。
   // 初期状態では空＝全グループが閉じており、まず「どんなエラーが起きているか」の
   // 一覧（種別名＋件数）だけが見える。クリックした種別だけが展開される。
@@ -369,6 +367,8 @@ export default function App() {
   const [isApplying, setIsApplying] = useState<boolean>(false);
   const [isApplied, setIsApplied] = useState<boolean>(false);
   const [toast, setToast] = useState<{ message: string; type: "success" | "info" | "warning" } | null>(null);
+  const [toastCopied, setToastCopied] = useState<boolean>(false);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 自作の右クリックメニュー（Issue #3）。入力欄・テキスト選択上でのみ、
   // 「コピー/切り取り/貼り付け」だけの最小メニューを自前で表示する。
@@ -469,6 +469,23 @@ export default function App() {
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [contextMenu]);
+
+  // 監視ドロップダウンメニュー表示中に、外側クリック・Escapeキーで閉じる（contextMenuと同じ仕組み）
+  useEffect(() => {
+    if (!showWatchMenu) return;
+    const close = () => setShowWatchMenu(false);
+    const closeOnEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [showWatchMenu]);
 
   // input/textareaはReactが管理する状態(value)と実際のDOM値がズレないよう、
   // Reactが上書きしているvalueのsetterを直接呼んでから input イベントを発火させる。
@@ -608,10 +625,11 @@ export default function App() {
       setTheme("light");
     }
 
-    const savedTokenTotal = Number(localStorage.getItem("debug_buddy_token_total") ?? "0");
-    if (Number.isFinite(savedTokenTotal) && savedTokenTotal > 0) {
-      setSessionTokenTotal(savedTokenTotal);
-    }
+    // トークン消費量表示は「真にこのセッション（アプリを起動してから今まで）」の
+    // 累計であることが分かりやすいよう、あえてlocalStorageへの永続化はしない
+    // （以前はlocalStorageに永続化していたため、表示上「セッション累計」と
+    // 案内しているのに実際は起動しても0に戻らず「いつからの累計か分からない」
+    // という分かりにくさがあった）。
   }, []);
 
   // APIキーが設定されている間、そのキーで実際に使えるGeminiモデル一覧を動的取得する。
@@ -678,19 +696,6 @@ export default function App() {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("debug_buddy_theme", theme);
   }, [theme]);
-
-  // 解析結果が変わるたび（新規解析・履歴読込・再検証）に検証チェックリストを作り直す。
-  // 「コードに適用する（プレビュー）」を押していなくても確認できるよう、isApplied には依存させない。
-  useEffect(() => {
-    if (analysis) {
-      const checklist = buildVerificationChecklist(analysis);
-      setVerificationChecklist(checklist);
-      setCheckedItems(new Array(checklist.length).fill(false));
-    } else {
-      setVerificationChecklist([]);
-      setCheckedItems([]);
-    }
-  }, [analysis]);
 
   // プロジェクトフォルダが選択されていて、かつコード修正(fixType!=="task")の場合のみ、
   // 「実ファイルへ安全に適用できるか」を裏で自動判定する（実際の書き込みは一切行わない読み取り専用の問い合わせ）。
@@ -786,10 +791,30 @@ export default function App() {
   };
 
   const showToast = (message: string, type: "success" | "info" | "warning" = "success") => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastCopied(false);
     setToast({ message, type });
-    setTimeout(() => {
+    // warning（エラー・失敗系）は内容を読んで対処を検討する時間が必要なため長めに表示する
+    const autoDismissMs = type === "warning" ? 8000 : 4000;
+    toastTimerRef.current = setTimeout(() => {
       setToast(null);
-    }, 4000);
+    }, autoDismissMs);
+  };
+
+  const dismissToast = () => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast(null);
+  };
+
+  const copyToastMessage = async () => {
+    if (!toast) return;
+    try {
+      await navigator.clipboard.writeText(toast.message);
+      setToastCopied(true);
+      setTimeout(() => setToastCopied(false), 2000);
+    } catch {
+      // クリップボードAPIが使えない環境では静かに諦める（トースト自体は表示され続ける）
+    }
   };
 
   const saveApiKey = async () => {
@@ -814,14 +839,17 @@ export default function App() {
 
   // ログ入力が別内容に置き換わる際、古い解析結果が新しい入力と矛盾したまま
   // 画面に残らないよう、解析結果関連stateを破棄する。
-  // （verificationChecklist/checkedItems/realApplyResult等は、analysisの変化に連動する
-  // 既存のuseEffectが自動的にクリアするため、ここでは触らない）
+  // （realApplyResult等は、analysisの変化に連動する既存のuseEffectが自動的にクリアするため、
+  // ここでは触らない）
   const clearAnalysisResult = () => {
     setHasResult(false);
     setAnalysis(null);
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
+    setResolutionChoice(null);
+    setDifferentMethodInput("");
+    setFollowUpEntries([]);
   };
 
   const handleSampleLoad = (key: keyof typeof SAMPLE_LOGS) => {
@@ -935,6 +963,19 @@ export default function App() {
     }
   };
 
+  // Gemini解析結果のトークン消費量を、Google側の日次クォータ境界(太平洋時間の深夜0時)に
+  // 揃えた集計へ加算する。新規解析(handleAnalyze)・検証時の再解析(handleVerifyFix)の
+  // どちらもGemini APIを実際に消費するため、両方からこの共通処理を呼ぶ
+  // （片方でしか呼ばないと、ヘッダーの「本日のトークン消費量」が実際より少なく表示され続ける）。
+  // AnalysisResultの構造的部分型として受け取る（FollowUpAnswer等、tokenUsage/modelUsed/
+  // quotaExceededModelsを同名で持つ型もそのまま渡せるようにするため）
+  const recordUsageForResult = (result: { modelUsed?: string; tokenUsage?: TokenUsage; quotaExceededModels?: string[] }) => {
+    if (!result.tokenUsage) return;
+    setDailyUsage(
+      recordGeminiUsage(result.modelUsed ?? selectedModel, result.tokenUsage.totalTokens, result.quotaExceededModels ?? [])
+    );
+  };
+
   // 解析実行（Gemini API または ローカル解析エンジンのハイブリッド）。
   // `overrideLog` が指定された場合（ターミナル監視モードからの自動解析）は、
   // logInputへの反映を待たずその文字列をそのまま解析対象にする(setState後の非同期タイミング問題を回避するため)。
@@ -963,6 +1004,9 @@ export default function App() {
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
+    setResolutionChoice(null);
+    setDifferentMethodInput("");
+    setFollowUpEntries([]);
 
     try {
       let result: AnalysisResult;
@@ -994,20 +1038,50 @@ export default function App() {
           showToast(`✨ ${result.modelUsed ?? selectedModelLabel} による高精度解析が完了しました！${maskNote}`, "success");
         }
 
-        // トークン消費量をセッション累計に加算して永続化する（画面表示用。要件定義書5.3対応）
-        if (result.tokenUsage) {
-          setSessionTokenTotal((prev) => {
-            const next = prev + result.tokenUsage!.totalTokens;
-            localStorage.setItem("debug_buddy_token_total", String(next));
-            return next;
-          });
-        }
+        recordUsageForResult(result);
       } else {
         // 2. ローカル解析エンジンでフォールバック（画像は読み取れないためテキストのみ）
         await new Promise((r) => setTimeout(r, 600));
-        result = analyzeErrorLog(combinedText);
+        // ログ欄・症状説明欄の両方に入力がある場合、まずログ欄だけで解析を試みる。
+        // 具体的なエラーシグネチャに一致すればそれを採用し、症状説明欄の内容とは
+        // 食い違っていてもログ欄側を優先する（既知パターンに一致しない場合のみ、
+        // 症状説明欄も含めた全文で解析し直す）。これにより「たまたま連結時に
+        // ログ欄が先に来るので優先される」という暗黙の挙動を、明示的な優先順位
+        // として仕様化している。
+        if (hasLog && hasDescription) {
+          const logOnlyResult = analyzeErrorLog(effectiveLog.trim());
+          const usedLogOnly = !isGenericFallbackResult(logOnlyResult);
+          result = usedLogOnly ? logOnlyResult : analyzeErrorLog(combinedText);
+          // ローカル解析エンジンは決定的なルールベースなので、Geminiと違い「実際にどちらを
+          // 使ったか」を自己申告ではなく、この分岐そのものから確実に説明できる。
+          result.inputPriorityNote = usedLogOnly
+            ? "エラーログ欄の内容から解析しました（症状説明欄は、ログ欄だけで既知のパターンに一致したため参照していません）"
+            : "エラーログ欄だけでは既知のパターンに一致しなかったため、症状説明欄の内容も含めて解析しました";
+        } else {
+          result = analyzeErrorLog(combinedText);
+        }
         result.modelUsed = "ローカル解析エンジン（ルールベース）";
-        showToast("エラー内容の動的解析が完了しました（※APIキーを設定するとGemini AI解析・画像解析が利用可能です）", "info");
+        if (hasImage) {
+          // ログ/症状説明欄にテキストがあるため上のブロック（!apiKey && hasImage && !hasLog）は
+          // 素通りしてここまで来ているが、ローカル解析エンジンは画像を一切読まないため、
+          // 添付した画像が黙って無視されていることを明示しないと「画像も見てくれているはず」と
+          // 誤解されるリスクがある（トーストは消えるため、優先順位の説明にも残す）。
+          const imageIgnoredNote = "添付した画像はローカル解析エンジンでは解析対象外のため使用していません";
+          result.inputPriorityNote = result.inputPriorityNote ? `${result.inputPriorityNote}。${imageIgnoredNote}` : imageIgnoredNote;
+          showToast(
+            "テキストのみで解析しました（添付した画像はローカル解析エンジンでは解析対象外です。画像も解析するにはGemini APIキーを設定してください）",
+            "warning"
+          );
+        } else {
+          showToast("エラー内容の動的解析が完了しました（※APIキーを設定するとGemini AI解析・画像解析が利用可能です）", "info");
+        }
+      }
+
+      // ログ・症状説明・画像のうち実際に入力されたのが1種類だけなら、優先順位を
+      // 説明する意味が無いため（Gemini側の自己申告ミスに対する保険も兼ねて）ここで確実に消す。
+      const providedSourceCount = [hasLog, hasDescription, hasImage].filter(Boolean).length;
+      if (providedSourceCount < 2) {
+        result.inputPriorityNote = undefined;
       }
 
       setAnalysis(result);
@@ -1022,7 +1096,7 @@ export default function App() {
       setAnalysis(fallback);
       setHasResult(true);
       setActiveTab("cause");
-      showToast(`Gemini通信エラー (${(err as Error).message.slice(0, 40)}...)。ローカル解析を表示します`, "warning");
+      showToast(`Gemini通信エラー (${(err as Error).message.slice(0, 300)})。ローカル解析を表示します`, "warning");
     } finally {
       setIsAnalyzing(false);
     }
@@ -1036,16 +1110,16 @@ export default function App() {
     showToast("入力内容をリセットしました", "info");
   };
 
-  // ターミナル監視モードがエラーらしき出力を検知した際に呼ばれる。
-  // autoAnalyze=false の場合はログ欄にセットするだけ(API呼び出しは行わず、ユーザー自身の
-  // 「エラーを解析する」クリックを待つ)。autoAnalyze=true はユーザーが明示的にオプトインした
-  // 場合のみで、そのまま解析まで自動実行する。
-  const handleTerminalWatchError = (capturedText: string, autoAnalyze: boolean) => {
+  // ターミナル監視モード／クリップボード監視モードが、エラーらしき内容を検知した際に呼ばれる
+  // 共通ハンドラ。autoAnalyze=false の場合はログ欄にセットするだけ(API呼び出しは行わず、
+  // ユーザー自身の「エラーを解析する」クリックを待つ)。autoAnalyze=true はユーザーが明示的に
+  // オプトインした場合のみで、そのまま解析まで自動実行する。
+  const handleWatchDetectedError = (sourceLabel: string, capturedText: string, autoAnalyze: boolean) => {
     if (!capturedText.trim()) {
-      // 検知はしたが、出力の取得タイミングの都合で内容を復元できなかった場合。
+      // 検知はしたが、内容の取得タイミングの都合で復元できなかった場合。
       // ログ欄を空文字で上書きして「セットしました」と誤認させるより、
       // 現在の入力内容を維持したまま正直に失敗を伝える方が安全。
-      showToast("エラーの可能性を検知しましたが、出力内容を取得できませんでした。お手数ですがターミナル監視モードの出力ログを直接コピーして貼り付けてください。", "warning");
+      showToast(`エラーの可能性を検知しましたが、内容を取得できませんでした。お手数ですが${sourceLabel}の内容を直接コピーして貼り付けてください。`, "warning");
       return;
     }
     setLogInput(capturedText);
@@ -1053,12 +1127,34 @@ export default function App() {
     setAttachedImage(null);
     clearAnalysisResult();
     if (autoAnalyze) {
-      showToast("ターミナル監視でエラーを検知したため、自動で解析します", "warning");
+      // ターミナル監視・クリップボード監視は同時に有効化できるため、両方が
+      // ほぼ同時にエラーを検知すると、ここが2重に呼ばれてhandleAnalyzeの
+      // 非同期処理が重複実行されうる（Gemini解析結果やトークン集計等の共有state
+      // を後勝ちで奪い合い、画面がどちらの結果か分からなくなる）。
+      // 既に解析中の場合は自動実行を見送り、ログ欄にセットするだけに留める
+      // （＝手動の「エラーを解析する」を待つ、autoAnalyze=falseと同じ扱い）。
+      if (isAnalyzing) {
+        showToast(
+          `${sourceLabel}でエラーを検知しましたが、他の解析が進行中のためログ欄にセットするだけに留めました。完了後に「エラーを解析する」を押してください`,
+          "warning"
+        );
+        return;
+      }
+      showToast(`${sourceLabel}でエラーを検知したため、自動で解析します`, "warning");
       void handleAnalyze(capturedText);
     } else {
-      showToast("ターミナル監視でエラーらしき出力を検知し、ログ欄にセットしました。「エラーを解析する」を押してください", "warning");
+      showToast(`${sourceLabel}でエラーらしき内容を検知し、ログ欄にセットしました。「エラーを解析する」を押してください`, "warning");
     }
   };
+
+  const handleTerminalWatchError = (capturedText: string, autoAnalyze: boolean) =>
+    handleWatchDetectedError("ターミナル監視", capturedText, autoAnalyze);
+
+  const handleClipboardWatchError = (capturedText: string, autoAnalyze: boolean) =>
+    handleWatchDetectedError("クリップボード監視", capturedText, autoAnalyze);
+
+  const handleLogFileWatchError = (capturedText: string, autoAnalyze: boolean) =>
+    handleWatchDetectedError("ログファイル監視", capturedText, autoAnalyze);
 
   // コピー機能
   const handleCopyDiff = async () => {
@@ -1087,6 +1183,8 @@ export default function App() {
       setIsApplied(false);
       setVerificationResult(null);
       setVerifyLogInput("");
+      setResolutionChoice(null);
+      setDifferentMethodInput("");
       showToast(`プレビューを取り消しました（${analysis.filePath} は変更されていません）`, "info");
       return;
     }
@@ -1096,6 +1194,8 @@ export default function App() {
       setIsApplying(false);
       setIsApplied(true);
       setVerificationResult(null);
+      setResolutionChoice(null);
+      setDifferentMethodInput("");
       showToast(
         `📝 ${analysis.filePath} への適用をプレビュー表示しました（※実ファイルは書き換えていません。反映するには上の差分を「差分をコピー」してご自身のエディタで適用してください）`,
         "info"
@@ -1154,7 +1254,7 @@ export default function App() {
       setRealApplyResult(null);
       showToast("バックアップをすべて削除しました", "info");
     } catch (err) {
-      showToast(`バックアップの削除に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`バックアップの削除に失敗しました: ${String(err).slice(0, 300)}`, "warning");
     } finally {
       setIsClearingBackups(false);
     }
@@ -1179,7 +1279,7 @@ export default function App() {
       // 実ファイルを書き換えたため、Git汚れ状態の表示も最新化する
       refreshGitDirtyStatus();
     } catch (err) {
-      showToast(`実ファイルへの適用に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`実ファイルへの適用に失敗しました: ${String(err).slice(0, 300)}`, "warning");
     } finally {
       setIsRealApplying(false);
     }
@@ -1200,7 +1300,7 @@ export default function App() {
       // 実ファイルを復元したため、Git汚れ状態の表示も最新化する
       refreshGitDirtyStatus();
     } catch (err) {
-      showToast(`ロールバックに失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`ロールバックに失敗しました: ${String(err).slice(0, 300)}`, "warning");
     } finally {
       setIsRollingBackReal(false);
     }
@@ -1223,7 +1323,7 @@ export default function App() {
       );
       setBackupHistory(list);
     } catch (err) {
-      showToast(`バックアップ履歴の取得に失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`バックアップ履歴の取得に失敗しました: ${String(err).slice(0, 300)}`, "warning");
       setBackupHistory([]);
     } finally {
       setIsLoadingBackupHistory(false);
@@ -1237,29 +1337,29 @@ export default function App() {
     if (next) void loadBackupHistory();
   };
 
-  // チェックリストの各項目のON/OFFを切り替える
-  const toggleChecklistItem = (index: number) => {
-    setCheckedItems((prev) => prev.map((checked, i) => (i === index ? !checked : checked)));
-  };
-
-  // 修正案が適用済みで、かつエラーが解消したことをユーザーが確認した場合
+  // 提示した修正案どおりでエラーが解消したことをユーザーが確認した場合
   const handleMarkResolved = () => {
     if (!analysis) return;
-    if (verificationChecklist.length > 0 && !checkedItems.every(Boolean)) {
-      showToast(
-        analysis.fixType === "task"
-          ? "すべての実施確認にチェックを入れてから完了報告してください"
-          : "すべての確認項目にチェックを入れてから完了報告してください",
-        "warning"
-      );
-      return;
-    }
     setVerificationResult({
       status: "resolved",
       message: "✅ 修正が正しく適用され、エラーは解消しました。お疲れ様でした！",
     });
+    setResolutionChoice(null);
     setVerifyLogInput("");
     showToast("🎉 エラーの解消を記録しました！", "success");
+  };
+
+  // 提示した修正案とは違う方法で自力解決した場合。今後の振り返りの参考になるよう、
+  // 実際に行った方法を自由記述で記録してから完了報告する。
+  const handleMarkResolvedDifferently = () => {
+    if (!analysis || !differentMethodInput.trim()) return;
+    setVerificationResult({
+      status: "resolved",
+      message: `✅ 提示した修正案とは違う方法で解決しました。記録: 「${differentMethodInput.trim()}」`,
+    });
+    setResolutionChoice(null);
+    setDifferentMethodInput("");
+    showToast("🎉 別の方法での解決を記録しました！", "success");
   };
 
   // 修正適用後に再実行して得られたログを再解析し、本当に直ったかを検証する。
@@ -1271,8 +1371,23 @@ export default function App() {
     try {
       let recheck: AnalysisResult;
       if (apiKey) {
-        recheck = await analyzeWithGemini(verifyLogInput, apiKey, selectedModel);
+        // 直前に提示した修正案（要約・根本原因・diffCode/taskSteps）をプロンプトへ含めることで、
+        // 「今回のログはその修正を適用した後に再実行して得られたもの」という前提をGeminiに
+        // 伝える。これが無いと、Geminiは初見のログとして解析し、既に試して効かなかった
+        // 修正案を気づかず繰り返し提案してしまう。
+        recheck = await analyzeWithGemini(verifyLogInput, apiKey, selectedModel, [], {
+          summary: analysis.summary,
+          rootCause: analysis.rootCause,
+          fixType: analysis.fixType,
+          diffCode: analysis.diffCode,
+          taskSteps: analysis.taskSteps,
+        });
+        recordUsageForResult(recheck);
       } else {
+        // ローカル解析エンジンは決定的なルールベースのパターンマッチであり、「直前の修正案が
+        // 効かなかった」という文脈を踏まえて提案を変えることはできない（同じログ種別には常に
+        // 同じ結果を返す）。そのため、実質的に前回と同じ修正案を繰り返しているケースを検知し、
+        // 下のメッセージでユーザーに正直に伝える（repeatedLocalFixNoteを参照）。
         recheck = analyzeErrorLog(verifyLogInput);
         recheck.modelUsed = "ローカル解析エンジン（ルールベース）";
       }
@@ -1284,11 +1399,39 @@ export default function App() {
       const normalize = (s: string) => s.trim().toLowerCase();
       const sameErrorType = normalize(recheck.errorType) === normalize(analysis.errorType);
       const sameFile = normalize(recheck.filePath) === normalize(analysis.filePath);
+      // ローカル解析エンジンの汎用フォールバックは、既知パターンに一致しなかった場合に常に
+      // 同じ固定のerrorType/filePathを返す。そのため、前回・今回とも汎用フォールバックだと
+      // 「errorTypeが一致した」というだけでは実際に同じ問題かどうか判定できない（無関係な
+      // 別のエラーが、たまたま両方とも未知パターンだっただけの可能性がある）。この場合は
+      // 誤って「同じエラーが継続している」と断定せず、判定できない旨を正直に伝える。
+      const bothGenericFallback = !apiKey && isGenericFallbackResult(analysis) && isGenericFallbackResult(recheck);
 
-      if (sameErrorType) {
+      if (bothGenericFallback) {
         setVerificationResult({
           status: "still-failing",
-          message: `⚠️ 同じ種類のエラー（${recheck.errorType}）がまだ発生しているようです。新しい根本原因と修正案に更新しました。下の「根本原因」「修正案 (Diff)」タブをご確認ください。`,
+          message:
+            "❓ このログはローカル解析エンジンの既知パターンに一致しなかったため、前回と同じ問題が続いているのか、別の未知のエラーなのかを自動判定できませんでした。下の「根本原因」タブの内容と実際のログを見比べてご確認いただくか、Gemini APIキーを設定するとより正確に判定できます。",
+        });
+        showToast("この内容ではローカル解析エンジンが同一性を判定できませんでした", "info");
+      } else if (sameErrorType) {
+        // ローカル解析エンジンは決定的なルールベースのため、直前の修正案が効かなかったという
+        // 文脈を考慮できず、実質的に同じdiffCode/taskStepsを繰り返し提示することがある。
+        // その場合は「新しい修正案」という表現が誤解を招くため、その旨を正直に付記する。
+        // ただし、汎用フォールバック（isGenericFallbackResult）はどんなログでもほぼ固定の
+        // diffCode/errorType/filePathを返すため、"内容が完全一致"という判定条件だけでは
+        // 「実際には無関係な別のエラーが、たまたま両方とも汎用フォールバックに落ちただけ」の
+        // ケースを「同じ修正案の再提示」と誤って断定してしまう。汎用フォールバックの場合は
+        // この注記自体を出さない。
+        const repeatedLocalFixNote =
+          !apiKey &&
+          !isGenericFallbackResult(recheck) &&
+          recheck.diffCode === analysis.diffCode &&
+          JSON.stringify(recheck.taskSteps ?? []) === JSON.stringify(analysis.taskSteps ?? [])
+            ? "（※ローカル解析エンジンは直前の修正案が効かなかったという情報を考慮できないため、前回と同じ内容を再提示しています。手動での深掘り、またはGemini APIキーの設定をご検討ください）"
+            : "";
+        setVerificationResult({
+          status: "still-failing",
+          message: `⚠️ 同じ種類のエラー（${recheck.errorType}）がまだ発生しているようです。新しい根本原因と修正案に更新しました。下の「根本原因」「修正案 (Diff)」タブをご確認ください。${repeatedLocalFixNote}`,
         });
         showToast("修正が不十分なようです。新しい修正案を表示します", "warning");
       } else if (sameFile) {
@@ -1311,10 +1454,13 @@ export default function App() {
       setActiveTab("cause");
       setIsApplied(false);
       setVerifyLogInput("");
+      setResolutionChoice(null);
+      setDifferentMethodInput("");
+      setFollowUpEntries([]);
       saveToHistory(recheck);
     } catch (err) {
       console.error(err);
-      showToast(`検証中にエラーが発生しました (${(err as Error).message.slice(0, 40)}...)`, "warning");
+      showToast(`検証中にエラーが発生しました (${(err as Error).message.slice(0, 300)})`, "warning");
     } finally {
       setIsVerifying(false);
     }
@@ -1328,6 +1474,9 @@ export default function App() {
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
+    setResolutionChoice(null);
+    setDifferentMethodInput("");
+    setFollowUpEntries([]);
     showToast(`履歴「${item.result.errorType}」を読み込みました`, "info");
   };
 
@@ -1386,7 +1535,7 @@ export default function App() {
       );
       if (saved) showToast(`履歴${history.length}件をJSONでエクスポートしました`, "success");
     } catch (err) {
-      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 300)}`, "warning");
     }
   };
 
@@ -1415,7 +1564,7 @@ export default function App() {
       const saved = await saveTextFile(`debug-buddy-history-${dateStr}.md`, lines.join("\n"), "text/markdown", "Markdown", ["md"]);
       if (saved) showToast(`履歴${history.length}件をMarkdownでエクスポートしました`, "success");
     } catch (err) {
-      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 100)}`, "warning");
+      showToast(`エクスポートに失敗しました: ${String(err).slice(0, 300)}`, "warning");
     }
   };
 
@@ -1503,9 +1652,6 @@ export default function App() {
               <span className="font-bold text-lg tracking-wider bg-gradient-to-r from-cyan-500 to-teal-500 dark:from-cyan-400 dark:to-teal-300 bg-clip-text text-transparent">
                 DEBUG BUDDY
               </span>
-              <span className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20">
-                Desktop v0.1.0
-              </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">AI-Powered Debugging & Error Log Analysis Assistant 🚀</p>
           </div>
@@ -1534,17 +1680,6 @@ export default function App() {
             </select>
           </div>
 
-          {/* モデル診断（プルダウンに出ているが実際には呼び出せないモデルを洗い出す） */}
-          <button
-            onClick={() => setShowModelDiagnosticsModal(true)}
-            disabled={!apiKey}
-            title={apiKey ? "一覧の各モデルへ実際にリクエストを送り、使えるか確認します" : "先にGemini APIキーを設定してください"}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
-          >
-            <Cpu className="w-3.5 h-3.5" />
-            <span>モデル診断</span>
-          </button>
-
           {/* Gemini API 設定ボタン */}
           <button
             onClick={() => setShowKeyModal(true)}
@@ -1559,32 +1694,112 @@ export default function App() {
             <span className="font-semibold">{apiKey ? "Active" : "APIキー設定"}</span>
           </button>
 
-          {/* Gemini解析のトークン消費量（セッション累計）。0件のうちは表示しない */}
-          {sessionTokenTotal > 0 && (
+          {/* Gemini解析のトークン消費量（本日分）。Google側の日次クォータ(RPD)がリセットされる
+              太平洋時間の深夜0時を境界に集計し、localStorageで永続化しているため、アプリを
+              再起動しても本日分の数値は保持される（0件のうちは表示しない）。
+              いずれかのモデルで本日、日次上限超過をGoogle側から実際に検知していればアンバー表示にする。 */}
+          {totalTokensToday(dailyUsage) > 0 && (
             <span
-              title="このセッションでGemini APIが消費した合計トークン数"
-              className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400"
+              title={formatDailyUsageTooltip(dailyUsage)}
+              className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border ${
+                modelsWithQuotaExceededToday(dailyUsage).length > 0
+                  ? "bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300"
+                  : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400"
+              }`}
             >
               <Coins className="w-3.5 h-3.5 shrink-0" />
-              <span>{sessionTokenTotal.toLocaleString()} tokens</span>
+              <span>{totalTokensToday(dailyUsage).toLocaleString()} tokens（本日）</span>
+              {modelsWithQuotaExceededToday(dailyUsage).length > 0 && (
+                <AlertTriangle className="w-3 h-3 shrink-0" />
+              )}
             </span>
           )}
 
-          {/* ターミナル監視モード（開発コマンドをアプリ内から実行し、出力をリアルタイム監視する）。
-              サブプロセス起動が必要なため、デスクトップアプリ版でのみ利用できる。 */}
-          <button
-            onClick={() => IS_TAURI_RUNTIME && setShowTerminalWatchModal(true)}
-            disabled={!IS_TAURI_RUNTIME}
-            title={
-              IS_TAURI_RUNTIME
-                ? "開発コマンドをアプリ内から実行し、出力を監視します（試験的機能）"
-                : "Web版では利用できません（デスクトップアプリ版でのみ利用可能）"
-            }
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-slate-100 dark:disabled:hover:bg-slate-800 disabled:hover:text-slate-600 dark:disabled:hover:text-slate-300 transition cursor-pointer"
-          >
-            <Terminal className="w-3.5 h-3.5" />
-            <span>ターミナル監視</span>
-          </button>
+          <div className="hidden sm:block w-px h-6 bg-slate-300 dark:bg-slate-700 mx-0.5" />
+
+          {/* 監視系メニュー: ターミナル監視・クリップボード監視・ログファイル監視をまとめる。
+              以前はヘッダーに3つ個別のボタンを並べており混雑していたため、1つのドロップダウンに
+              集約した。いずれかが実行中の場合は、集約ボタン自体に緑色＋点滅ドットを表示する
+              （ターミナル監視は実行中フラグをApp.tsxに引き上げていないため対象外）。 */}
+          <div className="relative">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowWatchMenu((prev) => !prev);
+              }}
+              title="ターミナル監視・クリップボード監視・ログファイル監視をまとめて開く"
+              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer ${
+                isClipboardWatching || isLogFileWatching
+                  ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
+                  : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700"
+              }`}
+            >
+              {(isClipboardWatching || isLogFileWatching) && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+              )}
+              <Eye className="w-3.5 h-3.5" />
+              <span>監視</span>
+              <ChevronDown className="w-3 h-3" />
+            </button>
+
+            {showWatchMenu && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="absolute left-0 mt-1.5 w-64 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xl z-50 overflow-hidden divide-y divide-slate-100 dark:divide-slate-800"
+              >
+                <button
+                  onClick={() => {
+                    setShowWatchMenu(false);
+                    if (IS_TAURI_RUNTIME) setShowTerminalWatchModal(true);
+                  }}
+                  disabled={!IS_TAURI_RUNTIME}
+                  title={!IS_TAURI_RUNTIME ? "Web版では利用できません（デスクトップアプリ版でのみ利用可能）" : undefined}
+                  className="w-full flex items-center space-x-2 px-3 py-2.5 text-left text-xs hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                >
+                  <Terminal className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+                  <span className="flex-1 text-slate-700 dark:text-slate-200">ターミナル監視（試験的機能）</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setShowWatchMenu(false);
+                    if (IS_TAURI_RUNTIME) setShowClipboardWatchModal(true);
+                  }}
+                  disabled={!IS_TAURI_RUNTIME}
+                  title={!IS_TAURI_RUNTIME ? "Web版では利用できません（デスクトップアプリ版でのみ利用可能）" : undefined}
+                  className="w-full flex items-center space-x-2 px-3 py-2.5 text-left text-xs hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                >
+                  {isClipboardWatching ? (
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                  ) : (
+                    <ClipboardPaste className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+                  )}
+                  <span className="flex-1 text-slate-700 dark:text-slate-200">
+                    {isClipboardWatching ? "クリップボード監視: 監視中" : "クリップボード監視（試験的機能）"}
+                  </span>
+                </button>
+                <button
+                  onClick={() => {
+                    setShowWatchMenu(false);
+                    if (IS_TAURI_RUNTIME) setShowLogFileWatchModal(true);
+                  }}
+                  disabled={!IS_TAURI_RUNTIME}
+                  title={!IS_TAURI_RUNTIME ? "Web版では利用できません（デスクトップアプリ版でのみ利用可能）" : undefined}
+                  className="w-full flex items-center space-x-2 px-3 py-2.5 text-left text-xs hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                >
+                  {isLogFileWatching ? (
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                  ) : (
+                    <FileText className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+                  )}
+                  <span className="flex-1 text-slate-700 dark:text-slate-200">
+                    {isLogFileWatching ? "ログファイル監視: 監視中" : "ログファイル監視（試験的機能）"}
+                  </span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="hidden sm:block w-px h-6 bg-slate-300 dark:bg-slate-700 mx-0.5" />
 
           {/* プロジェクトフォルダ選択（実ファイルへの適用機能を使うための前提設定）。
               ネイティブのフォルダ選択ダイアログ・ファイルI/Oが必要なため、Web版では利用できない。 */}
@@ -1640,6 +1855,8 @@ export default function App() {
             </span>
           )}
 
+          <div className="hidden sm:block w-px h-6 bg-slate-300 dark:bg-slate-700 mx-0.5" />
+
           {/* 履歴モーダルボタン（見つけやすいよう強調表示） */}
           <button
             onClick={() => setShowHistoryModal(true)}
@@ -1655,6 +1872,19 @@ export default function App() {
             )}
           </button>
 
+          {/* 振り返りダッシュボードボタン。history stateはWeb版でもlocalStorage経由で使えるため、
+              ターミナル/クリップボード監視ボタンと違いIS_TAURI_RUNTIMEによるゲートは不要。 */}
+          <button
+            onClick={() => setShowHistoryDashboardModal(true)}
+            title="解析履歴を集計した振り返りダッシュボードを開く"
+            className="flex items-center space-x-1.5 px-3.5 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/20 hover:border-emerald-500/60 transition cursor-pointer font-semibold shadow-sm"
+          >
+            <BarChart3 className="w-4 h-4" />
+            <span>振り返り</span>
+          </button>
+
+          <div className="hidden sm:block w-px h-6 bg-slate-300 dark:bg-slate-700 mx-0.5" />
+
           {/* ライト / ダークモード切り替えボタン */}
           <button
             onClick={toggleTheme}
@@ -1666,66 +1896,8 @@ export default function App() {
         </div>
       </header>
 
-      {/* 2. ウェルカム合言葉バナー */}
-      <div className="px-6 pt-5">
-        <div className="bg-gradient-to-r from-cyan-100/60 via-white to-indigo-100/60 dark:from-cyan-950/40 dark:via-slate-900/60 dark:to-indigo-950/40 border border-cyan-500/20 rounded-2xl p-4 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 shadow-sm">
-          <div className="flex items-center space-x-3.5">
-            <div className="p-2.5 rounded-xl bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20 shrink-0">
-              <Sparkles className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center space-x-2">
-                <span className="text-sm font-semibold text-slate-900 dark:text-white">👋 ようこそ、Debug Buddy へ！</span>
-                <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/20 font-medium">
-                  合言葉: 「エラーは成長のチャンス！」
-                </span>
-              </div>
-              <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
-                ログを貼り付けるだけで、AIが原因の解説・修正パッチ・学習メモを動的生成します。
-                {!apiKey && (
-                  <span className="text-cyan-600 dark:text-cyan-400 ml-1 cursor-pointer hover:underline" onClick={() => setShowKeyModal(true)}>
-                    （※APIキーを設定するとGemini AIが有効になります）
-                  </span>
-                )}
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center space-x-2 flex-wrap gap-y-2">
-            <span className="text-xs text-slate-500 dark:text-slate-400">サンプル:</span>
-            <button
-              onClick={() => handleSampleLoad("typeError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-cyan-700 dark:text-cyan-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
-            >
-              TypeError
-            </button>
-            <button
-              onClick={() => handleSampleLoad("syntaxError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-amber-700 dark:text-amber-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
-            >
-              SyntaxError
-            </button>
-            <button
-              onClick={() => handleSampleLoad("refError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-purple-700 dark:text-purple-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
-            >
-              ReferenceError
-            </button>
-            <button
-              onClick={() => handleSampleLoad("portError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-rose-600 dark:text-rose-400 border border-rose-500/30 transition cursor-pointer"
-            >
-              Port競合 (1420)
-            </button>
-            <button
-              onClick={() => handleSampleLoad("attributeError")}
-              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 transition cursor-pointer"
-            >
-              AttributeError (Python)
-            </button>
-          </div>
-        </div>
-      </div>
+      {/* 旧ウェルカム合言葉バナーは常設の装飾要素で場所を取るだけだったため撤去。
+          サンプルボタンは実際に使う場面（まだ解析結果が無い右側パネル）に移設した。 */}
 
       {/* 3. メインコンテンツ（2ペイン構成） */}
       <main className="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -1918,7 +2090,7 @@ export default function App() {
                 <div>
                   <p className="text-sm font-medium text-slate-600 dark:text-slate-300">まだ解析結果はありません</p>
                   <p className="text-xs text-slate-400 dark:text-slate-500 mt-1 max-w-sm">
-                    左側の入力欄に任意のエラーログをペーストするか、上部のサンプルボタンをクリックして「エラーを解析する」を実行してください。
+                    左側の入力欄に任意のエラーログをペーストするか、下のサンプルを試して「エラーを解析する」を実行してください。
                   </p>
                   {history.length > 0 && (
                     <button
@@ -1929,6 +2101,44 @@ export default function App() {
                       <span>過去の解析履歴を見る（{history.length}件）</span>
                     </button>
                   )}
+                </div>
+
+                {/* サンプルログ（旧ウェルカムバナーから移設）。解析結果が出た後は
+                    このパネル自体が非表示になるため、常設ヘッダーと違い自動的に隠れる。 */}
+                <div className="pt-1">
+                  <p className="text-[11px] text-slate-400 dark:text-slate-500 mb-1.5">サンプルを試す:</p>
+                  <div className="flex items-center justify-center flex-wrap gap-1.5">
+                    <button
+                      onClick={() => handleSampleLoad("typeError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-cyan-700 dark:text-cyan-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
+                    >
+                      TypeError
+                    </button>
+                    <button
+                      onClick={() => handleSampleLoad("syntaxError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-amber-700 dark:text-amber-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
+                    >
+                      SyntaxError
+                    </button>
+                    <button
+                      onClick={() => handleSampleLoad("refError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-purple-700 dark:text-purple-300 border border-slate-300 dark:border-slate-700 transition cursor-pointer"
+                    >
+                      ReferenceError
+                    </button>
+                    <button
+                      onClick={() => handleSampleLoad("portError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-rose-600 dark:text-rose-400 border border-rose-500/30 transition cursor-pointer"
+                    >
+                      Port競合 (1420)
+                    </button>
+                    <button
+                      onClick={() => handleSampleLoad("attributeError")}
+                      className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 transition cursor-pointer"
+                    >
+                      AttributeError (Python)
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : (
@@ -1956,6 +2166,23 @@ export default function App() {
 
                 {activeTab === "cause" && (
                   <div className="space-y-4">
+                    {/* ログ欄・症状説明欄・画像のうち2つ以上が入力された場合に、実際にどれを
+                        優先して解析したかを明示する（従来はrootCauseの文中に埋もれて分かり
+                        にくかったため、専用の見出し付きボックスとして先頭に出す）。 */}
+                    {analysis.inputPriorityNote && (
+                      <div className="p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/25 flex items-start space-x-2.5">
+                        <Layers className="w-4 h-4 text-indigo-600 dark:text-indigo-400 mt-0.5 shrink-0" />
+                        <div>
+                          <h4 className="text-[11px] font-semibold text-indigo-700 dark:text-indigo-300 uppercase tracking-wider">
+                            入力の優先順位について
+                          </h4>
+                          <p className="text-xs text-indigo-700/90 dark:text-indigo-200/90 mt-0.5 leading-relaxed">
+                            {analysis.inputPriorityNote}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 flex items-start space-x-3">
                       <AlertCircle className="w-5 h-5 text-rose-500 dark:text-rose-400 mt-0.5 shrink-0" />
                       <div>
@@ -2077,85 +2304,94 @@ export default function App() {
                         </h4>
                         <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
                           {analysis.fixType === "task"
-                            ? "上記の手順を実施した状態で同じ操作を再実行してください。エラーが解消していれば下のボタンで完了報告、まだ同じ（または別の）エラーが出る場合は、その新しいログを貼り付けて再解析できます。"
-                            : "修正を適用した状態で同じ操作を再実行してください。エラーが解消していれば下のボタンで完了報告、まだ同じ（または別の）エラーが出る場合は、その新しいログを貼り付けて再解析できます。"}
+                            ? "上記の手順を実施した状態で同じ操作を再実行し、結果に近いものを選んでください。"
+                            : "修正を適用した状態で同じ操作を再実行し、結果に近いものを選んでください。"}
                         </p>
 
-                        {/* 操作者自身に確認してもらう検証チェックリスト（自己申告の精度を上げるため、全項目チェックしないと完了報告できない） */}
-                        {verificationChecklist.length > 0 && (
-                          <div className="rounded-lg border border-sky-500/25 bg-white dark:bg-slate-950/60 divide-y divide-sky-500/10">
-                            <div className="px-3 py-2 flex items-center justify-between">
-                              <span className="text-[11px] font-semibold text-sky-700 dark:text-sky-300 uppercase tracking-wider flex items-center space-x-1.5">
-                                <ListChecks className="w-3.5 h-3.5" />
-                                <span>{analysis.fixType === "task" ? "実施確認リスト" : "確認チェックリスト"}</span>
-                              </span>
-                              <span className="text-[10px] text-slate-400 dark:text-slate-500">
-                                {checkedItems.filter(Boolean).length} / {verificationChecklist.length} 完了
-                              </span>
-                            </div>
-                            {verificationChecklist.map((item, idx) => (
+                        {/* 修正案の結果を3択で報告してもらう方式。以前は自動生成のチェックリストに
+                            全項目チェックしないと完了報告できない仕組みだったが、確認観点が形骸化し
+                            意味のある自己申告になっていなかったため、結果に応じた3択に置き換えた。 */}
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <button
+                            onClick={handleMarkResolved}
+                            className="text-xs px-3 py-2.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 font-semibold flex items-center justify-center space-x-1.5 transition cursor-pointer active:scale-95"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            <span>解決できた</span>
+                          </button>
+                          <button
+                            onClick={() => setResolutionChoice((prev) => (prev === "unresolved" ? null : "unresolved"))}
+                            className={`text-xs px-3 py-2.5 rounded-lg border font-semibold flex items-center justify-center space-x-1.5 transition cursor-pointer active:scale-95 ${
+                              resolutionChoice === "unresolved"
+                                ? "border-rose-500/50 bg-rose-500/15 text-rose-700 dark:text-rose-300"
+                                : "border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-900"
+                            }`}
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>解決できなかった</span>
+                          </button>
+                          <button
+                            onClick={() => setResolutionChoice((prev) => (prev === "different" ? null : "different"))}
+                            className={`text-xs px-3 py-2.5 rounded-lg border font-semibold flex items-center justify-center space-x-1.5 transition cursor-pointer active:scale-95 ${
+                              resolutionChoice === "different"
+                                ? "border-indigo-500/50 bg-indigo-500/15 text-indigo-700 dark:text-indigo-300"
+                                : "border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-900"
+                            }`}
+                          >
+                            <Wand2 className="w-3.5 h-3.5" />
+                            <span>違う方法で解決できた</span>
+                          </button>
+                        </div>
+
+                        {/* 「解決できなかった」選択時: 再実行後のログを貼り付けて再解析する（従来の検証フローと同じ） */}
+                        {resolutionChoice === "unresolved" && (
+                          <div className="space-y-2">
+                            <textarea
+                              value={verifyLogInput}
+                              onChange={(e) => setVerifyLogInput(e.target.value)}
+                              placeholder="再実行後に出力されたログを貼り付けてください"
+                              rows={3}
+                              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 p-2.5 font-mono text-xs text-slate-800 dark:text-slate-200 resize-none outline-none focus:border-sky-500/60 focus:ring-1 focus:ring-sky-500/40 transition placeholder:text-slate-400 dark:placeholder:text-slate-600"
+                            />
+                            <div className="flex items-center justify-end">
                               <button
-                                key={idx}
-                                type="button"
-                                onClick={() => toggleChecklistItem(idx)}
-                                className="w-full flex items-start space-x-2 px-3 py-2 text-left hover:bg-sky-500/5 transition cursor-pointer"
+                                onClick={handleVerifyFix}
+                                disabled={!verifyLogInput.trim() || isVerifying}
+                                className="text-xs px-3.5 py-2 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
                               >
-                                {checkedItems[idx] ? (
-                                  <CheckCircle2 className="w-4 h-4 text-emerald-500 dark:text-emerald-400 mt-0.5 shrink-0" />
+                                {isVerifying ? (
+                                  <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
                                 ) : (
-                                  <Circle className="w-4 h-4 text-slate-300 dark:text-slate-600 mt-0.5 shrink-0" />
+                                  <ShieldCheck className="w-3.5 h-3.5" />
                                 )}
-                                <span
-                                  className={`text-xs leading-relaxed ${
-                                    checkedItems[idx]
-                                      ? "text-slate-400 dark:text-slate-500 line-through"
-                                      : "text-slate-700 dark:text-slate-300"
-                                  }`}
-                                >
-                                  {item}
-                                </span>
+                                <span>{isVerifying ? "検証中..." : "ログを再解析して検証する"}</span>
                               </button>
-                            ))}
+                            </div>
                           </div>
                         )}
 
-                        <textarea
-                          value={verifyLogInput}
-                          onChange={(e) => setVerifyLogInput(e.target.value)}
-                          placeholder="再実行後に出力されたログがあれば貼り付けてください（エラーが解消していれば空欄のままでOKです）"
-                          rows={3}
-                          className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 p-2.5 font-mono text-xs text-slate-800 dark:text-slate-200 resize-none outline-none focus:border-sky-500/60 focus:ring-1 focus:ring-sky-500/40 transition placeholder:text-slate-400 dark:placeholder:text-slate-600"
-                        />
-
-                        <div className="flex items-center justify-end space-x-2">
-                          <button
-                            onClick={handleMarkResolved}
-                            disabled={verificationChecklist.length > 0 && !checkedItems.every(Boolean)}
-                            title={
-                              verificationChecklist.length > 0 && !checkedItems.every(Boolean)
-                                ? analysis.fixType === "task"
-                                  ? "実施確認リストの全項目にチェックを入れてください"
-                                  : "確認チェックリストの全項目にチェックを入れてください"
-                                : undefined
-                            }
-                            className="text-xs px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
-                          >
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            <span>エラーは解消した</span>
-                          </button>
-                          <button
-                            onClick={handleVerifyFix}
-                            disabled={!verifyLogInput.trim() || isVerifying}
-                            className="text-xs px-3.5 py-2 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
-                          >
-                            {isVerifying ? (
-                              <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-                            ) : (
-                              <ShieldCheck className="w-3.5 h-3.5" />
-                            )}
-                            <span>{isVerifying ? "検証中..." : "ログを再解析して検証する"}</span>
-                          </button>
-                        </div>
+                        {/* 「違う方法で解決できた」選択時: 実際に行った方法を記録してから完了報告する */}
+                        {resolutionChoice === "different" && (
+                          <div className="space-y-2">
+                            <textarea
+                              value={differentMethodInput}
+                              onChange={(e) => setDifferentMethodInput(e.target.value)}
+                              placeholder="どのように解決したか、実際に行った方法を記録しておきましょう（例:「バージョンを上げて解決した」等）"
+                              rows={3}
+                              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 p-2.5 text-xs text-slate-800 dark:text-slate-200 resize-none outline-none focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/40 transition placeholder:text-slate-400 dark:placeholder:text-slate-600"
+                            />
+                            <div className="flex items-center justify-end">
+                              <button
+                                onClick={handleMarkResolvedDifferently}
+                                disabled={!differentMethodInput.trim()}
+                                className="text-xs px-3.5 py-2 rounded-lg bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                <span>この内容で完了報告する</span>
+                              </button>
+                            </div>
+                          </div>
+                        )}
 
                         {verificationResult && (
                           <div
@@ -2171,6 +2407,20 @@ export default function App() {
                           </div>
                         )}
                     </div>
+
+                    {/* 解析結果へのフォローアップ質問。「なぜこの修正が必要か」等を深掘りできる。
+                        Gemini APIキー必須（未設定時はFollowUpPanel内で案内のみ表示）。 */}
+                    <FollowUpPanel
+                      analysis={analysis}
+                      apiKey={apiKey}
+                      selectedModel={selectedModel}
+                      entries={followUpEntries}
+                      onAsked={(entry, usage) => {
+                        setFollowUpEntries((prev) => [...prev, entry]);
+                        recordUsageForResult(usage);
+                      }}
+                      showToast={showToast}
+                    />
 
                     <div className="flex items-center justify-end space-x-2 pt-2">
                       <button
@@ -2477,6 +2727,23 @@ export default function App() {
               />
             </div>
 
+            {/* モデル診断（プルダウンに出ているが実際には呼び出せないモデルを洗い出す）。
+                頻繁に使う操作ではないため、常設のヘッダーボタンではなくAPIキー設定の中に置く。
+                キー設定済みのときだけ表示する（未設定では実行できないため）。 */}
+            {apiKey && (
+              <button
+                onClick={() => {
+                  setShowKeyModal(false);
+                  setShowModelDiagnosticsModal(true);
+                }}
+                title="一覧の各モデルへ実際にリクエストを送り、使えるか確認します"
+                className="w-full flex items-center justify-center space-x-1.5 px-3 py-2 rounded-lg border border-dashed border-slate-300 dark:border-slate-700 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+              >
+                <Cpu className="w-3.5 h-3.5" />
+                <span>登録済みモデルを診断する</span>
+              </button>
+            )}
+
             <div className="flex items-center justify-between pt-2">
               <a
                 href="https://aistudio.google.com/app/apikey"
@@ -2685,11 +2952,43 @@ export default function App() {
         showToast={showToast}
       />
 
+      {/* 5.6. クリップボード監視モード（試験的機能）。ターミナル監視モードと同様、閉じても
+          バックグラウンドでの監視自体は継続するため、show/hideはCSSのみで切り替え、
+          コンポーネント自体はアンマウントしない。 */}
+      <ClipboardWatchModal
+        open={showClipboardWatchModal}
+        onClose={() => setShowClipboardWatchModal(false)}
+        onDetectedError={handleClipboardWatchError}
+        showToast={showToast}
+        onRunningChange={setIsClipboardWatching}
+      />
+
+      {/* 5.7. ログファイル監視モード（試験的機能）。他の監視モードと同様、閉じても
+          バックグラウンドでの監視自体は継続するため、show/hideはCSSのみで切り替え、
+          コンポーネント自体はアンマウントしない。 */}
+      <LogFileWatchModal
+        open={showLogFileWatchModal}
+        onClose={() => setShowLogFileWatchModal(false)}
+        onDetectedError={handleLogFileWatchError}
+        showToast={showToast}
+        onRunningChange={setIsLogFileWatching}
+      />
+
       <ModelDiagnosticsModal
         open={showModelDiagnosticsModal}
         onClose={() => setShowModelDiagnosticsModal(false)}
         apiKey={apiKey}
         models={availableModels}
+      />
+
+      <HistoryDashboardModal
+        open={showHistoryDashboardModal}
+        onClose={() => setShowHistoryDashboardModal(false)}
+        history={history}
+        onSelectHistoryItem={(item) => {
+          handleSelectHistory(item);
+          setShowHistoryDashboardModal(false);
+        }}
       />
 
       {/* 右クリックメニュー（コピー/切り取り/貼り付けのみの自作メニュー。Issue #3） */}
@@ -2735,11 +3034,13 @@ export default function App() {
         </div>
       )}
 
-      {/* 6. トースト通知ポップアップ */}
+      {/* 6. トースト通知ポップアップ
+          エラー(warning)は内容を読んで対処を検討できるよう、表示時間を延ばし(showToast側)、
+          手動で閉じる「×」ボタンと、長い文言を報告・共有用にコピーできるボタンを付ける。 */}
       {toast && (
-        <div className="fixed bottom-6 right-6 z-50 animate-bounce">
+        <div className="fixed bottom-6 right-6 z-50 max-w-md animate-bounce">
           <div
-            className={`px-4 py-2.5 rounded-xl shadow-2xl text-xs font-medium flex items-center space-x-2 border backdrop-blur-md ${
+            className={`px-4 py-2.5 rounded-xl shadow-2xl text-xs font-medium flex items-start space-x-2 border backdrop-blur-md ${
               toast.type === "success"
                 ? "bg-white/95 dark:bg-slate-900/95 text-emerald-700 dark:text-emerald-300 border-emerald-500/40"
                 : toast.type === "warning"
@@ -2748,13 +3049,31 @@ export default function App() {
             }`}
           >
             {toast.type === "success" ? (
-              <CheckCircle2 className="w-4 h-4 text-emerald-500 dark:text-emerald-400 shrink-0" />
+              <CheckCircle2 className="w-4 h-4 mt-0.5 text-emerald-500 dark:text-emerald-400 shrink-0" />
             ) : toast.type === "warning" ? (
-              <AlertCircle className="w-4 h-4 text-amber-500 dark:text-amber-400 shrink-0" />
+              <AlertCircle className="w-4 h-4 mt-0.5 text-amber-500 dark:text-amber-400 shrink-0" />
             ) : (
-              <ExternalLink className="w-4 h-4 text-cyan-500 dark:text-cyan-400 shrink-0" />
+              <ExternalLink className="w-4 h-4 mt-0.5 text-cyan-500 dark:text-cyan-400 shrink-0" />
             )}
-            <span>{toast.message}</span>
+            <span className="whitespace-pre-wrap break-words">{toast.message}</span>
+            <div className="flex items-center space-x-1 shrink-0">
+              {toast.type === "warning" && (
+                <button
+                  onClick={copyToastMessage}
+                  title="エラー内容をコピー"
+                  className="p-1 rounded hover:bg-black/5 dark:hover:bg-white/10 transition cursor-pointer"
+                >
+                  {toastCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                </button>
+              )}
+              <button
+                onClick={dismissToast}
+                title="閉じる"
+                className="p-1 rounded hover:bg-black/5 dark:hover:bg-white/10 transition cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
       )}

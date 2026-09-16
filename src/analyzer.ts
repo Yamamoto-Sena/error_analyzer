@@ -27,6 +27,20 @@ export interface AnalysisResult {
   maskedSecretsCount?: number;
   /** Gemini解析時のトークン消費量（ローカル解析エンジン使用時は省略） */
   tokenUsage?: TokenUsage;
+  /** ログ欄・症状説明欄・画像のうち2つ以上が入力された場合に、実際にどれを主たる解析対象として
+   *  採用したか（優先順位判定の結果）を一言で説明したもの。入力が1種類のみの場合は省略。 */
+  inputPriorityNote?: string;
+}
+
+// 解析履歴1件分（App.tsxの解析履歴モーダル・historyStats.tsの振り返り集計の両方から参照する）
+export interface HistoryItem {
+  id: string;
+  timestamp: string;
+  result: AnalysisResult;
+  /** 同一箇所（エラー種別+ファイルパス+行番号）の再発生を検知した回数。初回は1。 */
+  occurrenceCount: number;
+  /** ピン留めされているか。trueの場合、履歴の自動上限(MAX_HISTORY_ITEMS)による自動削除の対象外にする。 */
+  pinned: boolean;
 }
 
 export interface TokenUsage {
@@ -180,6 +194,12 @@ function extractLocation(log: string): { file: string; line: string } {
 
   return { file: "設定・起動プロセス (vite.config.ts / src-tauri)", line: "1" };
 }
+
+// ローカル解析エンジンが、どの既知パターンにも一致せず汎用フォールバックへ
+// 落ちた場合に使うerrorType。App.tsx側で「ログ欄だけでは既知パターンに
+// 一致しなかったので、症状説明欄も含めて解析し直す」という優先順位判定
+// （isGenericFallbackResult）にも使う共通の目印。
+const GENERIC_FALLBACK_ERROR_TYPE = "Detected Runtime Exception / エラー";
 
 // 入力されたエラーログを動的に解析するエンジン（内部実装）
 function analyzeErrorLogCore(rawLog: string): AnalysisResult {
@@ -666,10 +686,65 @@ NODE_OPTIONS=--max-old-space-size=4096 npm run build`,
     };
   }
 
-  // 14. 汎用フォールバック（未知のエラーログ）
-  const firstLine = log.split("\n").find((l) => l.trim().length > 0) || "エラーが発生しました";
+  // 14. Rust panic（本体アプリ(src-tauri/)自体もRust製のため対応）
+  if (/thread\s+'[^']*'\s+panicked at\s+([^\s:]+):(\d+):(\d+)/i.test(log)) {
+    const panicMatch = log.match(/thread\s+'[^']*'\s+panicked at\s+([^\s:]+):(\d+):(\d+):?\s*\n?(.*)/i);
+    const panicFile = panicMatch ? panicMatch[1] : location.file;
+    const panicLine = panicMatch ? panicMatch[2] : location.line;
+    const panicMessage = panicMatch ? panicMatch[4].trim() : "";
+    const isUnwrapNone = /called `Option::unwrap\(\)` on a `None` value/i.test(log);
+    const isUnwrapErr = /called `Result::unwrap\(\)` on an `Err` value/i.test(log);
+    const isIndexOob = /index out of bounds/i.test(log);
+
+    return {
+      errorType: "Rust panic: 実行時パニック 🦀",
+      summary: panicMessage
+        ? `Rustのプログラムがpanicしました: ${panicMessage.slice(0, 100)}`
+        : `Rustのプログラムが ${panicFile}:${panicLine} でpanicしました。`,
+      rootCause: isUnwrapNone
+        ? "Option<T>型の値が None（値なし）だったにもかかわらず .unwrap() を呼び出したため、プログラムが強制終了（panic）しました。"
+        : isUnwrapErr
+        ? "Result<T, E>型の値が Err（エラー）だったにもかかわらず .unwrap() を呼び出したため、プログラムが強制終了（panic）しました。"
+        : isIndexOob
+        ? "配列・スライスの範囲外のインデックスにアクセスしたため、プログラムが強制終了（panic）しました。"
+        : "回復不能と判断された異常状態（アサーション失敗、明示的な panic!() 呼び出し等）により、プログラムが強制終了（panic）しました。",
+      filePath: panicFile,
+      lineNumber: `${panicLine}行目`,
+      diffCode: `--- a/${panicFile}
++++ b/${panicFile}
+@@ -${panicLine},3 +${panicLine},7 @@
+-value.unwrap()
++match value {
++    Some(v) => v,
++    None => {
++        // None/Errだった場合の代替処理をここに記述
++        return Err("値が取得できませんでした".into());
++    }
++};`,
+      learningTitle: "💡 学習ポイント: RustのOption<T>/Result<T, E>とpanic",
+      learningContent: "Rustには例外機構が無く、代わりに「値が無いかもしれない」ことを Option<T>（Some/None）、「失敗するかもしれない」ことを Result<T, E>（Ok/Err）という型で表現します。.unwrap() はNone/Errの場合にプログラムを即座にpanicさせる（強制終了する）ため、本番コードではmatch式や ?演算子、.unwrap_or_default() 等で安全に処理するのが基本です。",
+      preventionTips: [
+        ".unwrap() / .expect() は「絶対に失敗しない」ことが確実な場面（プロトタイプ・テストコード等）に限定して使う",
+        "本番コードでは match / if let / ?演算子でOption・Resultを明示的にハンドリングする",
+        "RUST_BACKTRACE=1 を設定して実行すると、panic発生箇所までの詳細なスタックトレースが得られる",
+      ],
+    };
+  }
+
+  // 15. 汎用フォールバック（未知のエラーログ）
+  // App.tsxはログ欄・症状説明欄を両方入力すると、それぞれの内容を
+  // 「【エラーログ / スタックトレース】」「【エラー内容・症状の説明（ユーザー記述）】」
+  // というラベル行を先頭に付けて連結して渡してくる。このラベル行自体は実際の
+  // エラー内容ではないため、「最初の非空行」としてそのまま拾ってしまうと
+  // 「検出されたエラー: 「【エラーログ / スタックトレース】」」という無意味な
+  // 表示になってしまう。行全体が【...】で囲まれただけの見出し行はスキップする。
+  const firstLine =
+    log.split("\n").find((l) => {
+      const trimmed = l.trim();
+      return trimmed.length > 0 && !/^【.*】$/.test(trimmed);
+    }) || "エラーが発生しました";
   return {
-    errorType: "Detected Runtime Exception / エラー",
+    errorType: GENERIC_FALLBACK_ERROR_TYPE,
     summary: `検出されたエラー: 「${firstLine.slice(0, 80)}」`,
     rootCause: `スタックトレースを解析した結果、${location.file} の ${location.line}行目付近の処理で例外がスローされています。`,
     filePath: location.file,
@@ -694,4 +769,132 @@ export function analyzeErrorLog(rawLog: string): AnalysisResult {
   const result = analyzeErrorLogCore(rawLog);
   result.officialDocLink = getOfficialDocLink(result.errorType, rawLog) ?? undefined;
   return result;
+}
+
+/**
+ * `analyzeErrorLog`の結果が、既知の具体的なパターンに一致せず汎用フォールバックへ
+ * 落ちたものかどうかを判定する。
+ *
+ * App.tsxはログ欄・症状説明欄を両方入力した場合、まずログ欄だけで解析を試み、
+ * これがtrue（＝ログ欄だけでは具体的な手がかりが得られなかった）の場合のみ、
+ * 症状説明欄も含めて解析し直す、という優先順位判定に使う。
+ * これにより「ログ欄に具体的なエラーシグネチャがあれば、症状説明欄の内容と
+ * 食い違っていてもログ欄側が優先される」という挙動を、暗黙の連結順序依存ではなく
+ * 明示的な仕様にしている。
+ */
+export function isGenericFallbackResult(result: AnalysisResult): boolean {
+  return result.errorType === GENERIC_FALLBACK_ERROR_TYPE;
+}
+
+// 「エラーらしいテキストか」を判定する高確度なキーワードのみに絞ったヒューリスティック。
+// 一般的な "error" という単語だけだと、正常系ログでも頻出し誤検知が多くなるため、
+// 単独の "error" は含めていない（下のGENERIC_KEYWORDS_PATTERNの方でカバーする）。
+// npmは v9系のどこかでエラー接頭辞を "npm ERR!"（旧）から "npm error"（新・小文字/感嘆符なし）
+// に変更しているため、両方を拾えるようにしている。
+// もともとターミナル監視モード（TerminalWatchModal.tsx）専用に定義されていたものを、
+// クリップボード監視モードとも共用できるようここへ切り出した。
+// Wingarc製品（Dr.Sum Server / MotionBoard等）のエラーコードは、例外なく
+// "8桁の16進数・先頭は8/9/aのいずれか"という統一フォーマットになっている
+// （実測: 公式マニュアル記載の712件のエラーコード全件がこの形式に一致）。
+// メッセージ本文の言い回しは「〜できません」「〜が不正です」等バラバラで
+// 汎用キーワードでは大半を拾いきれないが、コードの「形」自体を検知対象にすれば、
+// コードとメッセージが一緒に表示・コピーされる限り言い回しに関係なく拾える。
+// （UUIDの先頭セグメント等、まれに無関係な8桁16進数と偶然一致する可能性はあるが、
+// クリップボード監視はオプトイン機能であり誤検知時の実害も小さいため許容する）
+const WINGARC_ERROR_CODE_PATTERN = /\b[89a][0-9a-f]{7}\b/i;
+
+const HIGH_CONFIDENCE_SIGNAL_PATTERN = new RegExp(
+  [
+    "EADDRINUSE",
+    "Traceback \\(most recent call last\\)",
+    "Unhandled[ A-Za-z]*Rejection",
+    "FATAL ERROR",
+    "npm (?:ERR!|error)",
+    "error TS\\d{4,5}",
+    "Segmentation fault",
+    "panic:",
+    "Exception in thread",
+    "NullPointerException",
+    "CONFLICT \\(content\\)",
+    WINGARC_ERROR_CODE_PATTERN.source,
+  ].join("|"),
+  "i"
+);
+
+// クリップボード監視モードが対象にするのは、ターミナルの生ログではなく
+// MotionBoard・BigQuery（Google Cloud Console）等のアプリ/Webサービスが表示する
+// エラーダイアログ/メッセージの文面であるため、上記の高確度シグネチャに加えて、
+// より一般的なエラー関連キーワード（日英）も判定に含める。
+// BigQuery等のクラウドサービスのエラーは "Not found: Dataset ...", "Access Denied: ...",
+// "Exceeded rate limits", "Resources exceeded during query execution" のように、
+// 単語 "error" を含まない言い回しも多いため、それらも拾えるようにしている。
+// 「不正」は「不正な」ではなく素の形にしている。Wingarc製品（Dr.Sum Server/
+// MotionBoard）の公式マニュアル掲載の実エラーメッセージを検証したところ、
+// 「〜が不正です」「〜の内容が不正です」という言い回しが最も多く、
+// 「不正な」（連体形）では拾えていなかったため（Dr.Sum: 9件、MotionBoard: 11件、
+// 独立した2つのデータセットで同じ穴が再現）。
+const GENERIC_KEYWORDS_PATTERN =
+  /\b(error|exception|failed|failure|denied|forbidden|unauthorized|invalid|unrecognized|exceeded|not\s+found|quota|timeout|timed\s+out|duplicate|warning|stack trace)\b|エラー|失敗|例外|不正|拒否|権限がありません|許可されていません|超過|見つかりません|接続できません|失敗しました/i;
+
+// あまりに短い文字列（単語1つのコピー等）まで拾うと誤検知が増えるため、
+// クリップボード監視モードではこの文字数未満のテキストは判定対象から除外する。
+const MIN_CLIPBOARD_TEXT_LENGTH = 20;
+
+/**
+ * 見た目上は同じに見えても文字コード上は異なる表記ゆれを吸収するための正規化。
+ * - `normalize("NFKC")`: 全角英数字・全角スペース(U+3000)・半角カナ等を、対応する
+ *   半角/標準形に変換する（例: "８０００１００６" → "80001006"、全角スペース → 半角スペース）。
+ * - 続く空白の連続を1個の半角スペースに畳み込み、前後をtrimする（タブ・改行・NBSP・
+ *   スペースが連続していたり混在していても同一視できるようにするため）。
+ *
+ * MotionBoard等、コピー元によって全角数字・全角スペースが混じった文言をユーザーが
+ * 監視ワードとして手入力（またはコピペ）した際、実際のクリップボード内容と
+ * 見た目は同じでも文字コードが微妙に異なり一致しない、という報告への対処。
+ */
+function normalizeForMatching(s: string): string {
+  return s.normalize("NFKC").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * テキストが「エラーらしいか」を判定する。
+ * @param options.genericKeywords true の場合、高確度シグネチャに加えて汎用的なエラー関連
+ *   キーワード（日英）でも判定する（クリップボード監視モード向け）。false（既定）の場合は
+ *   ターミナル出力向けの高確度シグネチャのみで判定する（誤検知を避けたいターミナル監視モード向け）。
+ * @param options.minLength この文字数未満のテキストは、汎用キーワード判定(genericKeywords)
+ *   では常にfalseとして扱う（既定0=制限なし）。高確度シグネチャ（HIGH_CONFIDENCE_SIGNAL_PATTERN、
+ *   Wingarcエラーコードのような具体的な形を含む）は、それ自体の特異性で誤検知リスクが
+ *   低いとみなし、この文字数フィルタの対象外とする（"npm ERR!"や単体のエラーコードだけを
+ *   コピーした短い場合でも検知できるようにするため）。
+ */
+export function looksLikeErrorText(
+  text: string,
+  options: { genericKeywords?: boolean; minLength?: number } = {}
+): boolean {
+  const { genericKeywords = false, minLength = 0 } = options;
+  const normalized = normalizeForMatching(text);
+  if (HIGH_CONFIDENCE_SIGNAL_PATTERN.test(normalized)) return true;
+  if (normalized.length < minLength) return false;
+  return genericKeywords && GENERIC_KEYWORDS_PATTERN.test(normalized);
+}
+
+/** クリップボード監視モード向けの既定判定（汎用キーワード判定+短文除外を有効にしたもの） */
+export function looksLikeErrorTextFromClipboard(text: string): boolean {
+  return looksLikeErrorText(text, { genericKeywords: true, minLength: MIN_CLIPBOARD_TEXT_LENGTH });
+}
+
+/**
+ * ユーザーが登録したカスタム監視ワード（MotionBoard等、組み込みの英語キーワードには
+ * 引っかからない固有の言い回しをユーザー自身に追加してもらうためのもの）のいずれかを
+ * テキストが含むかを判定する。組み込みのlooksLikeErrorText系とは異なり、
+ * ユーザーが明示的に登録した文言との一致は誤検知リスクが低いとみなし、
+ * 文字数フィルタ（MIN_CLIPBOARD_TEXT_LENGTH）は適用しない。
+ * 大文字小文字は区別せず、全角/半角・空白の連続等の表記ゆれも`normalizeForMatching`で
+ * 吸収したうえで部分一致を見る。空文字列のキーワードは無視する。
+ */
+export function matchesCustomKeywords(text: string, keywords: string[]): boolean {
+  const haystack = normalizeForMatching(text).toLowerCase();
+  return keywords.some((kw) => {
+    const trimmed = normalizeForMatching(kw);
+    return trimmed !== "" && haystack.includes(trimmed.toLowerCase());
+  });
 }

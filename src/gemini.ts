@@ -8,29 +8,107 @@ export interface GeminiImagePart {
   data: string; // base64エンコード済み（"data:image/...;base64,"のプレフィックスは含まない）
 }
 
+// 「修正案を適用しても直らなかった」検証時に、直前に提示していた修正案の内容。
+// これを渡さないと、Geminiは「これは初見のログ」として解析してしまい、同じ修正案を
+// 気づかず繰り返し提案してしまう（＝ユーザーが既に試して効かなかった案を再提示する）リスクがある。
+export interface PreviousFixAttempt {
+  summary: string;
+  rootCause: string;
+  fixType?: "code" | "task";
+  diffCode?: string;
+  taskSteps?: string[];
+}
+
 // Gemini API を呼び出す関数
 export async function analyzeWithGemini(
   log: string,
   apiKey: string,
   modelName: string = "gemini-3.5-flash-lite",
-  images: GeminiImagePart[] = []
+  images: GeminiImagePart[] = [],
+  previousAttempt?: PreviousFixAttempt
 ): Promise<AnalysisResult> {
   const hasImages = images.length > 0;
   // 外部API（Gemini）へ送信する直前に、ログ内のAPIキー・トークン・パスワード・
   // メールアドレス・パブリックIP等の機密情報らしき文字列をマスクする。
   // ローカルの解析（analyzer.ts）やUI表示には影響しない、送信専用の処理。
-  const { sanitized: sanitizedLog, maskedCount } = maskSensitiveInfo(log);
+  const { sanitized: sanitizedLog, maskedCount: logMaskedCount } = maskSensitiveInfo(log);
+  // 検証（再解析）呼び出しの場合のみ、直前に提示した修正案をプロンプトへ含める。
+  // 「今回のログはその修正を適用した後に再実行して得られたもの」という前提を明示し、
+  // 単純な繰り返し提案を防ぐ。
+  // 注意: previousAttemptの各フィールドはGemini自身が前回生成した文章とはいえ、ログの引用や
+  // ユーザー環境固有の文字列をそのまま含んでいる可能性があるため、logと同様に送信前マスキング
+  // を通す（ここを素通りさせると「Geminiへの送信前に必ずマスクする」という前提が崩れる）。
+  let previousAttemptMaskedCount = 0;
+  const previousAttemptSection = previousAttempt
+    ? (() => {
+        const maskedSummary = maskSensitiveInfo(previousAttempt.summary);
+        const maskedRootCause = maskSensitiveInfo(previousAttempt.rootCause);
+        const maskedDiffCode = previousAttempt.diffCode ? maskSensitiveInfo(previousAttempt.diffCode) : undefined;
+        const maskedTaskSteps = (previousAttempt.taskSteps ?? []).map((step) => maskSensitiveInfo(step));
+        previousAttemptMaskedCount =
+          maskedSummary.maskedCount +
+          maskedRootCause.maskedCount +
+          (maskedDiffCode?.maskedCount ?? 0) +
+          maskedTaskSteps.reduce((sum, m) => sum + m.maskedCount, 0);
+        return `
+【直前に提示した修正案（検証のための参考情報）】
+このログは、以下の修正案を適用したうえで同じ操作を再実行して得られたものです。もし今回の
+ログが依然として同じ問題を示している場合、以下のいずれかが効かなかった・不十分だったことを
+意味します。単純に同じ内容を繰り返し提案せず、「なぜ効果が無かった可能性があるか」（差分が
+実際には正しく適用されていない可能性、副作用、根本原因の見立て自体が誤っていた可能性、等）
+も考慮したうえで、代替案または追加で必要な対応を提示してください。
+- 前回の要約: ${maskedSummary.sanitized}
+- 前回の根本原因: ${maskedRootCause.sanitized}
+- 前回の対応内容（${previousAttempt.fixType === "task" ? "手順" : "コード差分"}）: ${
+          previousAttempt.fixType === "task"
+            ? maskedTaskSteps.map((m) => m.sanitized).join(" / ") || "(記録なし)"
+            : maskedDiffCode?.sanitized || "(記録なし)"
+        }
+`;
+      })()
+    : "";
+  const maskedCount = logMaskedCount + previousAttemptMaskedCount;
   const prompt = `あなたは新人エンジニアを指導する親切で極めて優秀なシニアテックリードです。
 以下の情報（エラーログ・スタックトレース、および/またはユーザーが自分の言葉で書いた症状・状況の説明）を深く読み解き、新人エンジニアが根本から理解・再発防止できるように、必ず指定されたJSONフォーマットのみで回答してください。Markdownのバッククォート（\`\`\`json）も含めず、純粋なJSONオブジェクトのみを出力してください。
 明確な例外メッセージやスタックトレースがなく、ユーザーによる自然文の症状説明のみが与えられた場合でも、記述内容から最も可能性の高い原因・エラー種別を推測し、断定を避けつつも具体的な仮説として提示してください。
-
+${previousAttemptSection}
 【入力内容】
 ${sanitizedLog.trim() ? sanitizedLog : "(構造化されたログはありません。添付された画像や自然文の説明のみを参照して解析してください)"}
+
+【入力内容に「エラーログ / スタックトレース」「エラー内容・症状の説明（ユーザー記述）」
+「添付画像」のうち2つ以上が含まれている場合の判断手順】
+まず、それらが本当に「同じ1つの問題」について書かれたものなのか、それとも「互いに無関係な
+別々の問題」なのかを判定してください。この判定は非常に重要です。安易にすべてを1つの筋書きへ
+まとめようとしないでください。
+
+A. 同じ1つの問題についての、表現の違いや情報量の差（食い違いを含む）だと判断できる場合:
+   次の優先順位で統合して解析してください。
+   1. 「エラーログ / スタックトレース」（具体的な例外メッセージ・スタックトレース等、機械的に
+      出力された一次情報）を最優先とします。
+   2. 添付画像（エラー画面やターミナルのスクリーンショット）も同様に一次情報として扱い、ログが
+      無い場合やログの内容と整合する場合は積極的に参照してください。ログと画像の内容が食い違う
+      場合はログ側を優先してください。
+   3. 「エラー内容・症状の説明（ユーザー記述）」は、あくまでユーザー自身の解釈・補足情報として
+      参照し、ログ・画像と食い違う場合は最も優先度を下げてください。
+
+B. 明らかに別々の問題・話題について書かれている（例: ログは起動時のポート競合、症状説明欄は
+   まったく別の画面のUI不具合の話、など、同じ現象の言い換えとは考えられない）と判断できる場合:
+   優先度が最も高い情報源（ログ＞画像＞症状説明の順）**のみ**に基づいて解析し、優先度が低い
+   方の内容は rootCause・summary・diffCode・taskSteps・learningContent のどこにも一切
+   反映させないでください（無理に関連付けて1つの筋書きに捏造しないこと）。
+
+いずれの場合も、実際に2つ以上の入力があった場合は、出力JSONの"inputPriorityNote"に、実際に
+どれを主たる解析対象として採用したか・矛盾または無関係な内容があったかを必ず一言で明記して
+ください（例: 「エラーログの内容を優先し、症状説明欄は参考程度に留めました」「症状説明欄の
+内容とログの内容が一致していなかったため、ログを優先しています」「症状説明欄の内容はログ欄
+とは別の問題を指しているようだったため、解析には含めていません」「ログ・症状説明・画像の
+内容は一致していたため、すべてを統合して解析しました」）。
+入力が1種類しかない場合、"inputPriorityNote"は空文字列にしてください。
 ${
   hasImages
     ? `
 【添付画像について】
-このリクエストにはエラー画面やターミナルのスクリーンショット画像が添付されています。画像内に写っているエラーメッセージ・スタックトレースの文字を正確に読み取り、上記の内容と同様のルールで解析してください。テキストと画像の内容が両方存在する場合は、両者を統合して矛盾なく判断してください。
+このリクエストにはエラー画面やターミナルのスクリーンショット画像が添付されています。画像内に写っているエラーメッセージ・スタックトレースの文字を正確に読み取り、上記の優先順位に従って解析してください。
 `
     : ""
 }
@@ -75,9 +153,76 @@ ${
     "再発防止のための具体的なアドバイス1",
     "再発防止のための具体的なアドバイス2",
     "再発防止のための具体的なアドバイス3"
-  ]
+  ],
+  "inputPriorityNote": "ログ/症状説明/画像のうち2つ以上が入力されていた場合に、実際に何を優先して解析したか（無関係と判断して除外した情報源があればそれも）の一言説明。入力が1種類だけの場合は空文字列"
 }`;
 
+  const call = await callGeminiWithFallback(prompt, apiKey, modelName, images, (rawText) => JSON.parse(rawText));
+  const parsed = call.data;
+  const errorType = parsed.errorType || "Exception";
+
+  return {
+    errorType,
+    summary: parsed.summary || "エラーが検出されました。",
+    rootCause: parsed.rootCause || "詳細な原因を特定中。",
+    filePath: parsed.filePath || "src/index.ts",
+    lineNumber: parsed.lineNumber || "1行目",
+    diffCode: parsed.diffCode || "--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n- old\n+ new",
+    fixType: parsed.fixType === "task" ? "task" : "code",
+    taskSteps: Array.isArray(parsed.taskSteps) ? parsed.taskSteps.filter((s: unknown) => typeof s === "string" && s.trim()) : [],
+    learningTitle: parsed.learningTitle || "💡 学習ポイント",
+    learningContent: parsed.learningContent || "エラーハンドリングを適切に行いましょう。",
+    preventionTips: Array.isArray(parsed.preventionTips)
+      ? parsed.preventionTips
+      : ["入力値の検証を行う", "テストを実行する"],
+    // Googleが返す実際のモデルバージョン（取得できない場合は実際にリクエストしたモデル名で代用）
+    modelUsed: call.modelUsed,
+    // ユーザーが選択した本来のモデル名（modelUsedと食い違う＝自動フォールバックが発生した証拠）
+    modelRequested: call.modelRequested,
+    usedFallbackModel: call.usedFallbackModel,
+    quotaExceededModels: call.quotaExceededModels,
+    // 修正箇所に関連する公式ドキュメント（判別できた場合のみ）
+    officialDocLink: getOfficialDocLink(errorType, log) ?? undefined,
+    // 送信前にマスクした機密情報らしき箇所の件数（ユーザーへの透明性表示用）
+    maskedSecretsCount: maskedCount > 0 ? maskedCount : undefined,
+    tokenUsage: call.tokenUsage,
+    // ログ/症状説明/画像のうち何を優先して解析したかの説明（App.tsx側で、実際に
+    // 2つ以上の入力があった場合のみ表示する。1つしか無い場合はGemini側が空文字列
+    // を返す想定だが、念のためここでも空文字列はundefined扱いにする）
+    inputPriorityNote: typeof parsed.inputPriorityNote === "string" && parsed.inputPriorityNote.trim()
+      ? parsed.inputPriorityNote.trim()
+      : undefined,
+  };
+}
+
+// callGeminiWithFallbackが1回の成功応答について返す情報（呼び出し側の出力スキーマに依存しない共通部分）。
+interface GeminiCallResult<T> {
+  /** parseResponseコールバックが返した、呼び出し側ごとに異なるパース済みデータ */
+  data: T;
+  /** Googleが返す実際のモデルバージョン（取得できない場合は実際にリクエストしたモデル名で代用） */
+  modelUsed: string;
+  /** ユーザーが選択した本来のモデル名（modelUsedと食い違う＝自動フォールバックが発生した証拠） */
+  modelRequested: string;
+  usedFallbackModel: boolean;
+  /** RPD(1日あたりの上限)などのクォータ超過でスキップしたモデル名（発生時のみ） */
+  quotaExceededModels?: string[];
+  tokenUsage?: TokenUsage;
+}
+
+/**
+ * プロンプト・画像を受け取り、候補モデルへの逐次リトライ/フォールバックを行う共通処理。
+ * analyzeWithGemini・askFollowUpQuestion の両方から呼ばれる（150行規模のリトライ/フォールバック
+ * ロジックの重複を避けるために抽出したもの。抽出前の挙動を完全に維持するため、レスポンス本文の
+ * パース（parseResponse）も従来通りこのループの中で行い、パース失敗（不正なJSON等）も
+ * ネットワークエラーと同様に「次の候補モデルへフォールバック」の対象にしている）。
+ */
+async function callGeminiWithFallback<T>(
+  prompt: string,
+  apiKey: string,
+  modelName: string,
+  images: GeminiImagePart[],
+  parseResponse: (rawText: string) => T
+): Promise<GeminiCallResult<T>> {
   // Google AI Studio の公式有効モデル候補（指定モデルを最優先、次にsrc/models.tsで定義した
   // 現行の代表的モデルで自動試行。一覧はApp.tsxの表示用一覧と共通のファイルで一元管理している）
   const candidateModels = Array.from(new Set([modelName, ...FALLBACK_MODEL_IDS]));
@@ -188,10 +333,6 @@ ${
         throw new Error("Gemini からの応答が空でした。");
       }
 
-      // JSON パース
-      const cleanedText = text.trim().replace(/^```json\s*/i, "").replace(/\s*```$/i, "");
-      const parsed = JSON.parse(cleanedText);
-      const errorType = parsed.errorType || "Exception";
       // トークン消費量（画面表示・セッション累計用）。Geminiが返さない場合もあるため、
       // 3つとも揃って初めて意味のある数値として扱う（片方だけ欠けると誤解を招くため）。
       const usage = data.usageMetadata;
@@ -205,30 +346,19 @@ ${
               totalTokens: usage.totalTokenCount,
             }
           : undefined;
+
+      // レスポンス本文のパース。呼び出し側ごとに出力スキーマが異なるためparseResponseに委譲する。
+      // ここで例外が起きた場合（不正なJSON等）も、下のcatchで次の候補モデルへフォールバックする
+      // （抽出前の挙動と同じ）。
+      const cleanedText = text.trim().replace(/^```json\s*/i, "").replace(/\s*```$/i, "");
+      const parsedData = parseResponse(cleanedText);
+
       return {
-        errorType,
-        summary: parsed.summary || "エラーが検出されました。",
-        rootCause: parsed.rootCause || "詳細な原因を特定中。",
-        filePath: parsed.filePath || "src/index.ts",
-        lineNumber: parsed.lineNumber || "1行目",
-        diffCode: parsed.diffCode || "--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n- old\n+ new",
-        fixType: parsed.fixType === "task" ? "task" : "code",
-        taskSteps: Array.isArray(parsed.taskSteps) ? parsed.taskSteps.filter((s: unknown) => typeof s === "string" && s.trim()) : [],
-        learningTitle: parsed.learningTitle || "💡 学習ポイント",
-        learningContent: parsed.learningContent || "エラーハンドリングを適切に行いましょう。",
-        preventionTips: Array.isArray(parsed.preventionTips)
-          ? parsed.preventionTips
-          : ["入力値の検証を行う", "テストを実行する"],
-        // Googleが返す実際のモデルバージョン（取得できない場合は実際にリクエストしたモデル名で代用）
+        data: parsedData,
         modelUsed: data.modelVersion || model,
-        // ユーザーが選択した本来のモデル名（modelUsedと食い違う＝自動フォールバックが発生した証拠）
         modelRequested: modelName,
         usedFallbackModel: model !== modelName,
         quotaExceededModels: quotaExceededModels.length > 0 ? [...quotaExceededModels] : undefined,
-        // 修正箇所に関連する公式ドキュメント（判別できた場合のみ）
-        officialDocLink: getOfficialDocLink(errorType, log) ?? undefined,
-        // 送信前にマスクした機密情報らしき箇所の件数（ユーザーへの透明性表示用）
-        maskedSecretsCount: maskedCount > 0 ? maskedCount : undefined,
         tokenUsage,
       };
     } catch (err) {
@@ -238,6 +368,87 @@ ${
   }
 
   throw lastError || new Error("Gemini API で利用可能なモデルが見つかりませんでした (404)。APIキーの権限をご確認ください。");
+}
+
+// 解析結果に対する自由記述の追加質問（フォローアップ）用のコンテキスト。PreviousFixAttemptと
+// 似ているが、質問の対象を明確にするためerrorTypeを含める。
+export interface FollowUpContext {
+  errorType: string;
+  summary: string;
+  rootCause: string;
+  fixType?: "code" | "task";
+  diffCode?: string;
+  taskSteps?: string[];
+}
+
+export interface FollowUpAnswer {
+  answer: string;
+  modelUsed: string;
+  modelRequested: string;
+  usedFallbackModel: boolean;
+  quotaExceededModels?: string[];
+  tokenUsage?: TokenUsage;
+}
+
+/**
+ * 解析結果（rootCause/diffCode等）に対するユーザーの自由記述の追加質問にGeminiで回答する。
+ * ローカル解析エンジン（analyzer.ts）は決定的な正規表現マッチングのみで自然言語理解の能力を
+ * 持たないため、この関数はGemini APIキー必須（呼び出し側でapiKey未設定時はそもそも呼ばないこと。
+ * 詳細はFollowUpPanel.tsxのコメントを参照）。
+ *
+ * トークン消費対策として、この関数は「元の解析結果＋今回の質問」のみを送信し、過去のフォローアップ
+ * の往復履歴は含めない（呼び出し側のFollowUpPanel.tsxが往復履歴を溜めても、送信量は毎回ほぼ一定に
+ * なる）。
+ */
+export async function askFollowUpQuestion(
+  question: string,
+  apiKey: string,
+  modelName: string,
+  context: FollowUpContext
+): Promise<FollowUpAnswer> {
+  // 質問文・解析結果の各文字列フィールドも、ログ本文と同じくGeminiへの送信前マスキングを通す
+  // （sanitize.tsのmaskSensitiveInfoを再利用。ここを素通りさせると「Geminiへの送信前に必ず
+  // マスクする」という要件4.11の前提が崩れる）。
+  const maskedQuestion = maskSensitiveInfo(question);
+  const maskedSummary = maskSensitiveInfo(context.summary);
+  const maskedRootCause = maskSensitiveInfo(context.rootCause);
+  const maskedDiffCode = context.diffCode ? maskSensitiveInfo(context.diffCode) : undefined;
+  const maskedTaskSteps = (context.taskSteps ?? []).map((step) => maskSensitiveInfo(step));
+
+  const prompt = `あなたは新人エンジニアを指導する親切で優秀なシニアテックリードです。
+以下は、あるエラーに対して既に提示した解析結果です。この内容を踏まえて、ユーザーからの追加質問に
+日本語で簡潔かつ具体的に回答してください。必ず指定されたJSONフォーマットのみで回答し、Markdownの
+バッククォート（\`\`\`json）は含めないでください。
+
+【既に提示した解析結果】
+- エラー種別: ${context.errorType}
+- 要約: ${maskedSummary.sanitized}
+- 根本原因: ${maskedRootCause.sanitized}
+- 対応内容（${context.fixType === "task" ? "手順" : "コード差分"}）: ${
+    context.fixType === "task"
+      ? maskedTaskSteps.map((m) => m.sanitized).join(" / ") || "(記録なし)"
+      : maskedDiffCode?.sanitized || "(記録なし)"
+  }
+
+【ユーザーからの追加質問】
+${maskedQuestion.sanitized}
+
+【出力フォーマット(JSON)】
+{
+  "answer": "質問への回答本文（日本語、簡潔かつ具体的に）"
+}`;
+
+  const call = await callGeminiWithFallback(prompt, apiKey, modelName, [], (rawText) => JSON.parse(rawText) as { answer?: unknown });
+  const answer = typeof call.data.answer === "string" && call.data.answer.trim() ? call.data.answer.trim() : "回答を生成できませんでした。";
+
+  return {
+    answer,
+    modelUsed: call.modelUsed,
+    modelRequested: call.modelRequested,
+    usedFallbackModel: call.usedFallbackModel,
+    quotaExceededModels: call.quotaExceededModels,
+    tokenUsage: call.tokenUsage,
+  };
 }
 
 /**

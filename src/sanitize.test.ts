@@ -69,6 +69,65 @@ describe("maskSensitiveInfo", () => {
     expect(maskedCount).toBe(0);
   });
 
+  it("接頭辞のない裸のOpenAIスタイルのシークレットキーをマスクする", () => {
+    const { sanitized, maskedCount } = maskSensitiveInfo("設定値: sk-abcdEFGH12345678ijklmnop がログに出力されました");
+    expect(sanitized).not.toContain("sk-abcdEFGH12345678ijklmnop");
+    expect(sanitized).toContain("[MASKED_SECRET_KEY]");
+    expect(maskedCount).toBe(1);
+  });
+
+  it("GitHub Personal Access Tokenをマスクする", () => {
+    const { sanitized } = maskSensitiveInfo("ghp_1234567890abcdefghijklmnopqrstuvwxyz を使って認証しました");
+    expect(sanitized).toContain("[MASKED_GITHUB_TOKEN]");
+    expect(sanitized).not.toContain("ghp_1234567890abcdefghijklmnopqrstuvwxyz");
+  });
+
+  it("Google APIキーをマスクする", () => {
+    const { sanitized } = maskSensitiveInfo("AIzaSyD-1234567890abcdefghijklmnopqrstu を設定しました");
+    expect(sanitized).toContain("[MASKED_GOOGLE_API_KEY]");
+    expect(sanitized).not.toContain("AIzaSyD-1234567890abcdefghijklmnopqrstu");
+  });
+
+  it("Slackトークンをマスクする", () => {
+    const { sanitized } = maskSensitiveInfo("xoxb-1234567890-abcdefghijklmnop を通知に使っています");
+    expect(sanitized).toContain("[MASKED_SLACK_TOKEN]");
+    expect(sanitized).not.toContain("xoxb-1234567890-abcdefghijklmnop");
+  });
+
+  it("Stripeシークレットキーをマスクする", () => {
+    const { sanitized } = maskSensitiveInfo("sk_live_51H8xxxxxxxxxxxxxxxxxxxx で決済しました");
+    expect(sanitized).toContain("[MASKED_STRIPE_KEY]");
+    expect(sanitized).not.toContain("sk_live_51H8xxxxxxxxxxxxxxxxxxxx");
+  });
+
+  it("パブリックIPv6アドレス(完全展開形)をマスクする", () => {
+    const { sanitized } = maskSensitiveInfo("接続失敗: 2001:0db8:85a3:0000:0000:8a2e:0370:7334 に到達できません");
+    expect(sanitized).toContain("[MASKED_IPV6]");
+    expect(sanitized).not.toContain("2001:0db8:85a3:0000:0000:8a2e:0370:7334");
+  });
+
+  it("パブリックIPv6アドレス(圧縮形)をマスクする", () => {
+    const { sanitized } = maskSensitiveInfo("接続先: 2001:db8::8a2e:370:7334 に接続できません");
+    expect(sanitized).toContain("[MASKED_IPV6]");
+    expect(sanitized).not.toContain("2001:db8::8a2e:370:7334");
+  });
+
+  it("IPv6のループバック(::1)・リンクローカル(fe80::)・ユニークローカル(fc00::)は診断に必要な情報のため残す", () => {
+    const { sanitized, maskedCount } = maskSensitiveInfo(
+      "ECONNREFUSED ::1 / link-local fe80::1234 / unique-local fc00::abcd"
+    );
+    expect(sanitized).toContain("::1");
+    expect(sanitized).toContain("fe80::1234");
+    expect(sanitized).toContain("fc00::abcd");
+    expect(maskedCount).toBe(0);
+  });
+
+  it("時刻表記(HH:MM:SS)はIPv6と誤検知せずマスクしない", () => {
+    const { sanitized, maskedCount } = maskSensitiveInfo("14:23:05 にリクエストを受信しました");
+    expect(sanitized).toContain("14:23:05");
+    expect(maskedCount).toBe(0);
+  });
+
   it("機密情報が無いログはそのまま(件数0)で返す", () => {
     const log = "TypeError: Cannot read properties of undefined (reading 'map')\nat UserList (src/components/UserList.tsx:24:18)";
     const { sanitized, maskedCount } = maskSensitiveInfo(log);

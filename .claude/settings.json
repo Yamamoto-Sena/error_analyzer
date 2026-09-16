@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "disableBypassPermissionsMode": "disable",
+    "allow": [
+      "Bash(docker exec:*)",
+      "Bash(docker ps:*)",
+      "Bash(git stash:*)"
+    ],
+    "deny": [
+      "Bash(gh pr merge:*)",
+      "Edit(.env)",
+      "Edit(.env.*)",
+      "Read(.env)",
+      "Read(.env.*)"
+    ]
+  }
+}

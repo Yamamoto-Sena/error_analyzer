@@ -38,6 +38,24 @@ function isPrivateOrLoopbackIPv4(ip: string): boolean {
   return false;
 }
 
+// プライベート/ループバックIPv4と同じ理由で、IPv6のループバック・リンクローカル・
+// ユニークローカルアドレスも開発環境の診断に有用なためマスク対象から除外する。
+function isPrivateOrLoopbackIPv6(ip: string): boolean {
+  const normalized = ip.toLowerCase();
+  if (normalized === "::1" || normalized === "::" || normalized === "::0") return true; // ループバック/未指定
+  const firstGroup = normalized.split(":")[0];
+  if (!firstGroup) return false; // 先頭省略形（::xxxx等）は対象外とみなす
+  if (/^fe[89ab][0-9a-f]$/.test(firstGroup)) return true; // リンクローカル(fe80::/10)
+  if (/^f[cd][0-9a-f]{2}$/.test(firstGroup)) return true; // ユニークローカル(fc00::/7)
+  return false;
+}
+
+// IPv6アドレスの簡易マッチ。RFC完全準拠ではないが、"HH:MM:SS"のようなタイムスタンプとの
+// 誤検知を避けるため「省略なしの8グループ全て」か「"::"（連続コロン）による省略を含む」場合のみに
+// 絞っている（単一コロン区切りの数値列だけでは一致しない設計）。
+const IPV6_PATTERN =
+  /(?<![0-9a-fA-F:])(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?|:(?::[0-9a-fA-F]{1,4}){1,7})(?![0-9a-fA-F:])/g;
+
 const RULES: MaskRule[] = [
   {
     // PEM形式の秘密鍵ブロック全体（複数行）
@@ -50,6 +68,36 @@ const RULES: MaskRule[] = [
     name: "aws-access-key",
     pattern: /\bAKIA[0-9A-Z]{16}\b/g,
     replace: "[MASKED_AWS_ACCESS_KEY]",
+  },
+  {
+    // OpenAIスタイルの裸のシークレットキー（key=等の接頭辞が無くても検知する）
+    name: "openai-style-secret-key",
+    pattern: /\bsk-[A-Za-z0-9]{20,}\b/g,
+    replace: "[MASKED_SECRET_KEY]",
+  },
+  {
+    // GitHub Personal Access Token（ghp_/gho_/ghu_/ghs_/ghr_）
+    name: "github-token",
+    pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/g,
+    replace: "[MASKED_GITHUB_TOKEN]",
+  },
+  {
+    // Google APIキー
+    name: "google-api-key",
+    pattern: /\bAIzaSy[A-Za-z0-9_-]{33}\b/g,
+    replace: "[MASKED_GOOGLE_API_KEY]",
+  },
+  {
+    // Slackトークン（xoxb-/xoxp-/xoxa-/xoxr-/xoxs-）
+    name: "slack-token",
+    pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
+    replace: "[MASKED_SLACK_TOKEN]",
+  },
+  {
+    // Stripeシークレットキー（sk_live_/sk_test_）
+    name: "stripe-key",
+    pattern: /\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b/g,
+    replace: "[MASKED_STRIPE_KEY]",
   },
   {
     // JWT（ヘッダー.ペイロード.署名の3パート構成）
@@ -89,6 +137,12 @@ const RULES: MaskRule[] = [
     name: "public-ipv4",
     pattern: /\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/g,
     replace: (match: string) => (isPrivateOrLoopbackIPv4(match) ? match : "[MASKED_IP]"),
+  },
+  {
+    // パブリックIPv6アドレス（プライベート/ループバックは診断上有用なため除外）
+    name: "public-ipv6",
+    pattern: IPV6_PATTERN,
+    replace: (match: string) => (isPrivateOrLoopbackIPv6(match) ? match : "[MASKED_IPV6]"),
   },
 ];
 

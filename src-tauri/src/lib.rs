@@ -1,7 +1,14 @@
+// クリップボードのテキストを定期的に監視し、変化をフロントエンドへ配信する「クリップボード監視モード」。
+mod clipboard_watch;
+// バイト列→文字列デコードの共通処理（UTF-8優先→Shift-JISフォールバック）。
+// terminal_watch・log_file_watchの両方から使う。
+mod encoding_util;
 // 修正案(diff)を実ファイルへ安全に適用するための純粋ロジック（判定・パッチ計算のみ）。
 mod fix_apply;
 // プロジェクトフォルダのGit作業ツリーが汚れていないかを判定する（git CLIのラッパー）。
 mod git_status;
+// 指定したログファイルへの追記をポーリングで監視し、フロントエンドへ配信する「ログファイル監視モード」。
+mod log_file_watch;
 // Gemini APIキーをOSキーチェーンに保存・読み込みするための薄いラッパー。
 mod secret_store;
 // 開発コマンドをアプリ内から起動し、出力をリアルタイム配信する「ターミナル監視モード」。
@@ -575,6 +582,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             greet,
             save_api_key,
@@ -588,14 +596,23 @@ pub fn run() {
             list_backups_for_file,
             git_status::check_git_dirty,
             terminal_watch::start_terminal_watch,
-            terminal_watch::stop_terminal_watch
+            terminal_watch::stop_terminal_watch,
+            clipboard_watch::start_clipboard_watch,
+            clipboard_watch::stop_clipboard_watch,
+            clipboard_watch::is_clipboard_watch_running,
+            log_file_watch::start_log_file_watch,
+            log_file_watch::stop_log_file_watch,
+            log_file_watch::is_log_file_watch_running,
+            log_file_watch::pick_log_file
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
-            // アプリ終了時にターミナル監視モードのプロセスが残らないよう後始末する
+            // アプリ終了時に各監視モードのプロセス/スレッドが残らないよう後始末する
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 terminal_watch::kill_if_running();
+                clipboard_watch::stop_if_running();
+                log_file_watch::stop_if_running();
             }
         });
 }
