@@ -13,6 +13,9 @@ mod log_file_watch;
 mod secret_store;
 // 開発コマンドをアプリ内から起動し、出力をリアルタイム配信する「ターミナル監視モード」。
 mod terminal_watch;
+// クリップボード監視・ログファイル監視で共用する、停止フラグの単一スロットレジストリと
+// エラーログの重複抑制ヘルパー（terminal_watchはChild::kill()方式のため対象外）。
+mod watch_registry;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -597,6 +600,7 @@ pub fn run() {
             git_status::check_git_dirty,
             terminal_watch::start_terminal_watch,
             terminal_watch::stop_terminal_watch,
+            terminal_watch::is_terminal_watch_running,
             clipboard_watch::start_clipboard_watch,
             clipboard_watch::stop_clipboard_watch,
             clipboard_watch::is_clipboard_watch_running,

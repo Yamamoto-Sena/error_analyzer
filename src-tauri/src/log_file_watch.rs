@@ -26,28 +26,24 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::encoding_util::decode_bytes;
+use crate::watch_registry::{ErrorLogDedup, StopFlagRegistry};
 
 /// ログファイルを確認する間隔。ファイルI/O(metadata+open+read)はクリップボード読み取りより
 /// コストが高く、またログ監視はクリップボード監視ほどの即時性を要求しない（ユーザーが
 /// 数秒待てる用途）ため、clipboard_watch.rsの800msより長めの1000msにしている。
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
-struct LogFileWatchHandle {
-    stop_flag: Arc<AtomicBool>,
-}
+const LOCK_POISONED_MESSAGE: &str = "内部エラー: 監視状態のロックに失敗しました。";
+const ALREADY_RUNNING_MESSAGE: &str = "既に別のログファイルを監視中です。先に停止してください。";
 
-fn watch_state() -> &'static Mutex<Option<LogFileWatchHandle>> {
-    static STATE: OnceLock<Mutex<Option<LogFileWatchHandle>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(None))
-}
+static REGISTRY: StopFlagRegistry = StopFlagRegistry::new();
 
 #[derive(Clone, serde::Serialize)]
 struct LogFileLinePayload {
@@ -133,12 +129,7 @@ pub fn start_log_file_watch(app: AppHandle, path: String) -> Result<(), String> 
         return Err(format!("指定されたファイルが見つかりません: {path}"));
     }
 
-    let mut guard = watch_state()
-        .lock()
-        .map_err(|_| "内部エラー: 監視状態のロックに失敗しました。".to_string())?;
-    if guard.is_some() {
-        return Err("既に別のログファイルを監視中です。先に停止してください。".to_string());
-    }
+    let stop_flag = REGISTRY.try_start(LOCK_POISONED_MESSAGE, ALREADY_RUNNING_MESSAGE)?;
 
     let initial_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
     let initial_identity = file_identity(&file_path);
@@ -148,12 +139,6 @@ pub fn start_log_file_watch(app: AppHandle, path: String) -> Result<(), String> 
         initial_size
     );
 
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    *guard = Some(LogFileWatchHandle {
-        stop_flag: stop_flag.clone(),
-    });
-    drop(guard);
-
     std::thread::spawn(move || {
         let mut last_offset = initial_size;
         let mut last_size = initial_size;
@@ -162,7 +147,7 @@ pub fn start_log_file_watch(app: AppHandle, path: String) -> Result<(), String> 
         // 同じ内容のエラーを連続でログに出し続けてターミナルが埋まらないよう、
         // 直前に出力したエラーメッセージを覚えておき、変化があった時だけ再出力する
         // （clipboard_watch.rsと同じ配慮）。
-        let mut last_logged_error: Option<String> = None;
+        let mut last_logged_error = ErrorLogDedup::new();
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -180,15 +165,11 @@ pub fn start_log_file_watch(app: AppHandle, path: String) -> Result<(), String> 
                     // ことがあるが、監視自体を止める必要はないため、そのティックはスキップして
                     // 次回に回す（clipboard_watch.rsの「読み取り失敗時はそのティックをスキップ」
                     // という、ベストエフォートの方針を踏襲）。
-                    let message = e.to_string();
-                    if last_logged_error.as_deref() != Some(message.as_str()) {
-                        eprintln!("[log_file_watch] ファイルの読み取りに失敗しました: {message}");
-                        last_logged_error = Some(message);
-                    }
+                    last_logged_error.log_if_changed("log_file_watch", format!("ファイルの読み取りに失敗しました: {e}"));
                     continue;
                 }
             };
-            last_logged_error = None;
+            last_logged_error.clear();
 
             let cur_size = metadata.len();
             let cur_identity = file_identity(&file_path);
@@ -251,11 +232,7 @@ pub fn start_log_file_watch(app: AppHandle, path: String) -> Result<(), String> 
 /// ポーリングタイミングで自然に終了する。最大でも`POLL_INTERVAL`程度の遅延はある）。
 #[tauri::command]
 pub fn stop_log_file_watch() -> Result<(), String> {
-    let mut guard = watch_state()
-        .lock()
-        .map_err(|_| "内部エラー: 監視状態のロックに失敗しました。".to_string())?;
-    if let Some(handle) = guard.take() {
-        handle.stop_flag.store(true, Ordering::Relaxed);
+    if REGISTRY.stop(LOCK_POISONED_MESSAGE)? {
         eprintln!("[log_file_watch] 監視を停止しました");
     }
     Ok(())
@@ -266,16 +243,12 @@ pub fn stop_log_file_watch() -> Result<(), String> {
 /// と同じ役割）。
 #[tauri::command]
 pub fn is_log_file_watch_running() -> bool {
-    watch_state().lock().map(|g| g.is_some()).unwrap_or(false)
+    REGISTRY.is_running()
 }
 
 /// アプリ終了時に監視スレッドが残らないよう、ベストエフォートで後始末する。
 pub fn stop_if_running() {
-    if let Ok(mut guard) = watch_state().lock() {
-        if let Some(handle) = guard.take() {
-            handle.stop_flag.store(true, Ordering::Relaxed);
-        }
-    }
+    REGISTRY.stop_if_running();
 }
 
 /// 監視するログファイルをネイティブの「ファイルを開く」ダイアログで選ばせる。

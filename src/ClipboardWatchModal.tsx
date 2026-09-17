@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ClipboardPaste, X, Play, Square, AlertTriangle, CheckCircle2, Plus, FlaskConical } from "lucide-react";
-import { looksLikeErrorTextFromClipboard, matchesCustomKeywords } from "./analyzer";
+import { looksLikeErrorTextFromClipboard, matchesCustomKeywords, normalizeForMatching } from "./analyzer";
+import { useWatchConnection } from "./useWatchConnection";
 
 interface ClipboardWatchModalProps {
   open: boolean;
@@ -36,13 +36,15 @@ function loadCustomKeywords(): string[] {
 }
 
 export default function ClipboardWatchModal({ open, onClose, onDetectedError, showToast, onRunningChange }: ClipboardWatchModalProps) {
-  const [isRunning, setIsRunning] = useState<boolean>(false);
-  const [isSyncingState, setIsSyncingState] = useState<boolean>(true);
-  const [isStarting, setIsStarting] = useState<boolean>(false);
+  const { isRunning, isSyncingState, isStarting, startError, start, stop } = useWatchConnection({
+    startCommand: "start_clipboard_watch",
+    stopCommand: "stop_clipboard_watch",
+    isRunningCommand: "is_clipboard_watch_running",
+    onRunningChange,
+  });
   const [autoAnalyze, setAutoAnalyze] = useState<boolean>(
     () => localStorage.getItem("debug_buddy_clipboard_watch_auto_analyze") === "true"
   );
-  const [startError, setStartError] = useState<string | null>(null);
   // 直近に検知した内容（自動解析OFF時、バナーでプレビュー表示するために保持）
   const [detectedPreview, setDetectedPreview] = useState<string | null>(null);
   const detectedTextRef = useRef<string>("");
@@ -59,7 +61,16 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
   const [testInput, setTestInput] = useState<string>("");
   const testResult = useMemo(() => {
     if (!testInput.trim()) return null;
-    const matchedKeyword = customKeywords.find((kw) => matchesCustomKeywords(testInput, [kw]));
+    // matchesCustomKeywords(testInput, [kw])をキーワードごとに呼ぶと、testInput側の
+    // normalizeForMatching（NFKC正規化）が登録キーワード数分（最大MAX_CUSTOM_KEYWORDS件）
+    // 無駄に繰り返される。ここではtestInputの正規化を1回だけ行い、各キーワードとの
+    // 比較にはmatchesCustomKeywords自身の判定ロジック（正規化+小文字化して部分一致）を
+    // 展開した形で使い回す。
+    const normalizedInput = normalizeForMatching(testInput).toLowerCase();
+    const matchedKeyword = customKeywords.find((kw) => {
+      const trimmed = normalizeForMatching(kw);
+      return trimmed !== "" && normalizedInput.includes(trimmed.toLowerCase());
+    });
     if (matchedKeyword) return { detected: true, reason: `監視ワード「${matchedKeyword}」に一致` };
     if (looksLikeErrorTextFromClipboard(testInput)) return { detected: true, reason: "組み込みのエラー判定に一致" };
     return { detected: false, reason: null };
@@ -86,33 +97,6 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
     customKeywordsRef.current = customKeywords;
     localStorage.setItem(CUSTOM_KEYWORDS_STORAGE_KEY, JSON.stringify(customKeywords));
   }, [customKeywords]);
-
-  // 監視の実行状態をモーダルの外（ヘッダーボタン等）にも伝える
-  useEffect(() => {
-    onRunningChange?.(isRunning);
-  }, [isRunning, onRunningChange]);
-
-  // マウント時、実際にRust側で監視中かどうかを問い合わせて画面状態を補正する。
-  // これをしないと、開発中のリロードやアプリ再起動直後の画面表示は常に
-  // isRunning=falseから始まってしまい、「実際にはバックグラウンドで監視が
-  // 継続しているのに画面には『開始』ボタンしか出ない（＝停止ボタンが
-  // どこにも無い）」という食い違いが起きうる。
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const running = await invoke<boolean>("is_clipboard_watch_running");
-        if (!cancelled) setIsRunning(running);
-      } catch {
-        // Tauriアプリの外（ブラウザ単体プレビュー等）では常にfalse扱いのままでよい
-      } finally {
-        if (!cancelled) setIsSyncingState(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   // Tauriイベントの購読は、モーダルの開閉に関わらずマウント時に一度だけ行う
   // （ターミナル監視モードと同様、モーダルを閉じてもRust側の監視自体はバックグラウンドで
@@ -162,42 +146,21 @@ export default function ClipboardWatchModal({ open, onClose, onDetectedError, sh
   }, []);
 
   const handleStart = async () => {
-    setStartError(null);
-    setIsStarting(true);
     setDetectedPreview(null);
     detectedTextRef.current = "";
-    try {
-      await invoke("start_clipboard_watch");
-      setIsRunning(true);
+    const result = await start();
+    if (result === "started") {
       showToast("クリップボード監視を開始しました", "success");
-    } catch (err) {
+    } else if (result === "already-running") {
       // 画面側は「未実行」のつもりでも、実はRust側で既に監視中だった場合
-      // （開発中のリロード等で画面の状態だけがリセットされた場合に起こりうる）、
-      // ここで実際の状態を問い合わせて補正する。これをしないと、エラーメッセージで
-      // 「先に停止してください」と言われても、画面には停止ボタンが出ないままになる。
-      try {
-        const running = await invoke<boolean>("is_clipboard_watch_running");
-        setIsRunning(running);
-        if (running) {
-          showToast("クリップボード監視は既に開始されていました（画面表示を修正しました）", "info");
-        } else {
-          setStartError(String(err).slice(0, 200));
-        }
-      } catch {
-        setStartError(String(err).slice(0, 200));
-      }
-    } finally {
-      setIsStarting(false);
+      // （開発中のリロード等で画面の状態だけがリセットされた場合に起こりうる）。
+      showToast("クリップボード監視は既に開始されていました（画面表示を修正しました）", "info");
     }
   };
 
   const handleStop = async () => {
-    try {
-      await invoke("stop_clipboard_watch");
-      setIsRunning(false);
+    if (await stop()) {
       showToast("クリップボード監視を停止しました", "info");
-    } catch (err) {
-      setStartError(String(err).slice(0, 200));
     }
   };
 

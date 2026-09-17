@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { FileText, X, Play, Square, FolderOpen, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { looksLikeErrorText } from "./analyzer";
+import { useWatchConnection } from "./useWatchConnection";
 
 interface LogFileWatchModalProps {
   open: boolean;
@@ -27,13 +28,15 @@ const AUTO_ANALYZE_STORAGE_KEY = "debug_buddy_log_file_watch_auto_analyze";
 export default function LogFileWatchModal({ open, onClose, onDetectedError, showToast, onRunningChange }: LogFileWatchModalProps) {
   const [filePath, setFilePath] = useState<string>(() => localStorage.getItem(FILE_PATH_STORAGE_KEY) || "");
   const [isPickingFile, setIsPickingFile] = useState<boolean>(false);
-  const [isRunning, setIsRunning] = useState<boolean>(false);
-  const [isSyncingState, setIsSyncingState] = useState<boolean>(true);
-  const [isStarting, setIsStarting] = useState<boolean>(false);
+  const { isRunning, isSyncingState, isStarting, startError, start, stop } = useWatchConnection({
+    startCommand: "start_log_file_watch",
+    stopCommand: "stop_log_file_watch",
+    isRunningCommand: "is_log_file_watch_running",
+    onRunningChange,
+  });
   const [lines, setLines] = useState<string[]>([]);
   const [autoAnalyze, setAutoAnalyze] = useState<boolean>(() => localStorage.getItem(AUTO_ANALYZE_STORAGE_KEY) === "true");
   const [errorDetected, setErrorDetected] = useState<boolean>(false);
-  const [startError, setStartError] = useState<string | null>(null);
 
   // イベントリスナー内から常に最新の値を読めるようにするためのref
   // （useEffectは[]依存で一度しか登録しないため、stateを直接読むとクロージャが古くなる）
@@ -57,30 +60,6 @@ export default function LogFileWatchModal({ open, onClose, onDetectedError, show
   useEffect(() => {
     localStorage.setItem(FILE_PATH_STORAGE_KEY, filePath);
   }, [filePath]);
-
-  // 監視の実行状態をモーダルの外（ヘッダーボタン等）にも伝える
-  useEffect(() => {
-    onRunningChange?.(isRunning);
-  }, [isRunning, onRunningChange]);
-
-  // マウント時、実際にRust側で監視中かどうかを問い合わせて画面状態を補正する
-  // （クリップボード監視モードと同じ理由: 開発中のリロードやアプリ再起動直後の食い違い防止）。
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const running = await invoke<boolean>("is_log_file_watch_running");
-        if (!cancelled) setIsRunning(running);
-      } catch {
-        // Tauriアプリの外（ブラウザ単体プレビュー等）では常にfalse扱いのままでよい
-      } finally {
-        if (!cancelled) setIsSyncingState(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   // Tauriイベントの購読は、モーダルの開閉に関わらずマウント時に一度だけ行う
   // （ターミナル監視・クリップボード監視と同様、モーダルを閉じてもRust側の監視自体は
@@ -146,30 +125,23 @@ export default function LogFileWatchModal({ open, onClose, onDetectedError, show
 
   const handleStart = async () => {
     if (!filePath.trim()) return;
-    setStartError(null);
-    setIsStarting(true);
     setLines([]);
     rawLinesRef.current = [];
     hasTriggeredRef.current = false;
     setErrorDetected(false);
-    try {
-      await invoke("start_log_file_watch", { path: filePath });
-      setIsRunning(true);
+    const result = await start({ path: filePath });
+    if (result === "started") {
       showToast("ログファイル監視を開始しました（開始時点より前の内容は対象外です）", "success");
-    } catch (err) {
-      setStartError(String(err).slice(0, 200));
-    } finally {
-      setIsStarting(false);
+    } else if (result === "already-running") {
+      // 画面側は「未実行」のつもりでも、実はRust側で既に監視中だった場合
+      // （開発中のリロード等で画面の状態だけがリセットされた場合に起こりうる）。
+      showToast("ログファイル監視は既に開始されていました（画面表示を修正しました）", "info");
     }
   };
 
   const handleStop = async () => {
-    try {
-      await invoke("stop_log_file_watch");
-      setIsRunning(false);
+    if (await stop()) {
       showToast("ログファイル監視を停止しました", "info");
-    } catch (err) {
-      setStartError(String(err).slice(0, 200));
     }
   };
 

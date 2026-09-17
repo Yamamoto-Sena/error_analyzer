@@ -15,28 +15,25 @@
 //! - 子プロセスを監視するterminal_watch.rsと異なり、クリップボード監視には
 //!   「killすれば読み取りスレッドが自然に終了する」ような対象が存在しないため、
 //!   停止は`Arc<AtomicBool>`の停止フラグをポーリングループ側で確認する方式にしている。
-//! - 同時に監視できるのは1つまで（グローバルな`Mutex<Option<ClipboardWatchHandle>>`で管理、
-//!   terminal_watch.rsと同じ「二重起動不可」方針）。
+//! - 同時に監視できるのは1つまで（log_file_watch.rsと共用のwatch_registry::StopFlagRegistryで
+//!   管理、terminal_watch.rsと同じ「二重起動不可」方針）。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
+use crate::watch_registry::{ErrorLogDedup, StopFlagRegistry};
+
 /// クリップボードを確認する間隔。短すぎるとCPUを無駄に消費し、長すぎると
 /// 検知までの体感速度が悪くなるため、体感上ちょうど良いとされる800msにしている。
 const POLL_INTERVAL: Duration = Duration::from_millis(800);
 
-struct ClipboardWatchHandle {
-    stop_flag: Arc<AtomicBool>,
-}
+const LOCK_POISONED_MESSAGE: &str = "内部エラー: 監視状態のロックに失敗しました。";
+const ALREADY_RUNNING_MESSAGE: &str = "既にクリップボードを監視中です。先に停止してください。";
 
-fn watch_state() -> &'static Mutex<Option<ClipboardWatchHandle>> {
-    static STATE: OnceLock<Mutex<Option<ClipboardWatchHandle>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(None))
-}
+static REGISTRY: StopFlagRegistry = StopFlagRegistry::new();
 
 #[derive(Clone, serde::Serialize)]
 struct ClipboardTextPayload {
@@ -50,12 +47,7 @@ struct ClipboardTextPayload {
 /// （ユーザーが「今から」コピーする内容だけを検知対象にしたいため）。
 #[tauri::command]
 pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
-    let mut guard = watch_state()
-        .lock()
-        .map_err(|_| "内部エラー: 監視状態のロックに失敗しました。".to_string())?;
-    if guard.is_some() {
-        return Err("既にクリップボードを監視中です。先に停止してください。".to_string());
-    }
+    let stop_flag = REGISTRY.try_start(LOCK_POISONED_MESSAGE, ALREADY_RUNNING_MESSAGE)?;
 
     // 読み取り失敗（クリップボードが空、画像のみが入っている等）は「空文字」として扱う。
     // クリップボード監視はベストエフォートの機能であり、この時点でのエラーを
@@ -73,17 +65,11 @@ pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
     );
     let initial_text = initial_read.unwrap_or_default();
 
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    *guard = Some(ClipboardWatchHandle {
-        stop_flag: stop_flag.clone(),
-    });
-    drop(guard);
-
     std::thread::spawn(move || {
         let mut last_seen = initial_text;
         // 同じ内容のエラーを連続でログに出し続けてターミナルが埋まらないよう、
         // 直前に出力したエラーメッセージを覚えておき、変化があった時だけ再出力する。
-        let mut last_logged_error: Option<String> = None;
+        let mut last_logged_error = ErrorLogDedup::new();
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -98,15 +84,11 @@ pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
             // 監視自体を止める必要はないため、そのティックはスキップして次回に回す。
             let text = match app.clipboard().read_text() {
                 Ok(t) => {
-                    last_logged_error = None;
+                    last_logged_error.clear();
                     t
                 }
                 Err(e) => {
-                    let message = e.to_string();
-                    if last_logged_error.as_deref() != Some(message.as_str()) {
-                        eprintln!("[clipboard_watch] クリップボードの読み取りに失敗しました: {message}");
-                        last_logged_error = Some(message);
-                    }
+                    last_logged_error.log_if_changed("clipboard_watch", format!("クリップボードの読み取りに失敗しました: {e}"));
                     continue;
                 }
             };
@@ -142,11 +124,7 @@ pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
 /// 問題にならない）。
 #[tauri::command]
 pub fn stop_clipboard_watch() -> Result<(), String> {
-    let mut guard = watch_state()
-        .lock()
-        .map_err(|_| "内部エラー: 監視状態のロックに失敗しました。".to_string())?;
-    if let Some(handle) = guard.take() {
-        handle.stop_flag.store(true, Ordering::Relaxed);
+    if REGISTRY.stop(LOCK_POISONED_MESSAGE)? {
         eprintln!("[clipboard_watch] 監視を停止しました");
     }
     Ok(())
@@ -162,16 +140,12 @@ pub fn stop_clipboard_watch() -> Result<(), String> {
 /// 実態に合わせて補正するために使う。
 #[tauri::command]
 pub fn is_clipboard_watch_running() -> bool {
-    watch_state().lock().map(|g| g.is_some()).unwrap_or(false)
+    REGISTRY.is_running()
 }
 
 /// アプリ終了時に監視スレッドが残らないよう、ベストエフォートで後始末する。
 pub fn stop_if_running() {
-    if let Ok(mut guard) = watch_state().lock() {
-        if let Some(handle) = guard.take() {
-            handle.stop_flag.store(true, Ordering::Relaxed);
-        }
-    }
+    REGISTRY.stop_if_running();
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Terminal, X, Play, Square, FolderOpen, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { looksLikeErrorText } from "./analyzer";
+import { useWatchConnection } from "./useWatchConnection";
 
 interface TerminalWatchModalProps {
   open: boolean;
@@ -13,6 +13,9 @@ interface TerminalWatchModalProps {
   onDetectedError: (capturedText: string, autoAnalyze: boolean) => void;
   /** コマンド欄への複数行貼り付けを1行に自動変換した際の案内などに使うトースト表示 */
   showToast: (message: string, type?: "success" | "info" | "warning") => void;
+  /** 監視の実行状態が変化するたびに呼ばれる。ヘッダーボタン等、モーダルの外に
+   *  「今、監視中かどうか」を表示するために使う（モーダルを閉じていても分かるように）。 */
+  onRunningChange?: (isRunning: boolean) => void;
 }
 
 interface OutputLine {
@@ -34,17 +37,27 @@ export default function TerminalWatchModal({
   onPickProjectRoot,
   onDetectedError,
   showToast,
+  onRunningChange,
 }: TerminalWatchModalProps) {
   const [command, setCommand] = useState<string>(() => localStorage.getItem("debug_buddy_watch_command") || DEFAULT_COMMAND);
-  const [isRunning, setIsRunning] = useState<boolean>(false);
-  const [isStarting, setIsStarting] = useState<boolean>(false);
+  // 停止操作の実際の完了(isRunning=false)・終了コードの確定は、stop_terminal_watchの
+  // 呼び出し成功時点ではなく、リーダースレッドがEOFを検知して送るterminal-exitイベント
+  // 受信時に行う（killを要求してから子プロセスが実際に終了するまでラグがあるため）。
+  // そのためsetsRunningFalseOnStop: falseを指定し、isRunningの更新はこのモーダル自身が
+  // terminal-exitリスナー内で行う。
+  const { isRunning, setIsRunning, isSyncingState, isStarting, startError, start, stop } = useWatchConnection({
+    startCommand: "start_terminal_watch",
+    stopCommand: "stop_terminal_watch",
+    isRunningCommand: "is_terminal_watch_running",
+    onRunningChange,
+    setsRunningFalseOnStop: false,
+  });
   const [lines, setLines] = useState<OutputLine[]>([]);
   const [exitCode, setExitCode] = useState<number | null | undefined>(undefined); // undefined=未終了
   const [autoAnalyze, setAutoAnalyze] = useState<boolean>(
     () => localStorage.getItem("debug_buddy_watch_auto_analyze") === "true"
   );
   const [errorDetected, setErrorDetected] = useState<boolean>(false);
-  const [startError, setStartError] = useState<string | null>(null);
 
   // イベントリスナー内から常に最新の値を読めるようにするためのref
   // （useEffectは[]依存で一度しか登録しないため、stateを直接読むとクロージャが古くなる）
@@ -148,31 +161,19 @@ export default function TerminalWatchModal({
 
   const handleStart = async () => {
     if (!projectRoot || !command.trim()) return;
-    setStartError(null);
-    setIsStarting(true);
     setLines([]);
     rawLinesRef.current = [];
     hasTriggeredRef.current = false;
     setErrorDetected(false);
     setExitCode(undefined);
-    try {
-      await invoke("start_terminal_watch", { root: projectRoot, command });
-      setIsRunning(true);
-    } catch (err) {
-      setStartError(String(err).slice(0, 200));
-    } finally {
-      setIsStarting(false);
-    }
+    await start({ root: projectRoot, command });
   };
 
   const handleStop = async () => {
-    try {
-      await invoke("stop_terminal_watch");
-      // 実際の isRunning=false / exitCode設定は terminal-exit イベント受信時に行う
-      // （リーダースレッドがEOFを検知してから状態確定するまでに少しラグがあるため）
-    } catch (err) {
-      setStartError(String(err).slice(0, 200));
-    }
+    // 実際の isRunning=false / exitCode設定は terminal-exit イベント受信時に行う
+    // （リーダースレッドがEOFを検知してから状態確定するまでに少しラグがあるため、
+    // useWatchConnectionにはsetsRunningFalseOnStop: falseを指定している）。
+    await stop();
   };
 
   // コマンド欄は1行用の<input>のため、複数行のスニペットを貼り付けても
@@ -258,7 +259,14 @@ export default function TerminalWatchModal({
               placeholder="npm run dev"
               className="flex-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 font-mono text-xs text-slate-800 dark:text-slate-200 outline-none focus:border-cyan-500/60 focus:ring-1 focus:ring-cyan-500/40 disabled:opacity-60 transition"
             />
-            {isRunning ? (
+            {isSyncingState ? (
+              <button
+                disabled
+                className="shrink-0 text-xs px-3.5 py-2 rounded-lg bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 font-semibold flex items-center space-x-1.5 opacity-70"
+              >
+                <span>状態確認中...</span>
+              </button>
+            ) : isRunning ? (
               <button
                 onClick={handleStop}
                 className="shrink-0 text-xs px-3.5 py-2 rounded-lg bg-rose-500 hover:bg-rose-400 text-white font-semibold flex items-center space-x-1.5 transition cursor-pointer active:scale-95"
@@ -299,7 +307,9 @@ export default function TerminalWatchModal({
         <div className="flex items-center space-x-2 text-[11px] text-slate-400 dark:text-slate-500">
           <span className={`w-2 h-2 rounded-full shrink-0 ${isRunning ? "bg-emerald-500 animate-pulse" : "bg-slate-400 dark:bg-slate-600"}`} />
           <span>
-            {isRunning
+            {isSyncingState
+              ? "状態を確認しています..."
+              : isRunning
               ? "実行中..."
               : exitCode === undefined
               ? "未実行"

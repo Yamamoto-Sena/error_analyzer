@@ -362,6 +362,14 @@ describe("looksLikeErrorText (ターミナル監視モード向け・既定オ�
     expect(looksLikeErrorText("npm ERR! Missing script: \"start\"")).toBe(true);
     expect(looksLikeErrorText("[INFO] Build failed due to a warning in strict mode")).toBe(false);
   });
+
+  it("Wingarcエラーコード形式（8桁16進）はクリップボード監視限定の判定のため、既定では反応しない", () => {
+    // ビルドハッシュ・HMR id・UUIDの先頭セグメント等、Wingarcのエラーコードと同じ「形」を
+    // 偶然持つ文字列がターミナル/ログファイルの通常出力に現れて誤って自動解析が
+    // 発火することを防ぐ回帰テスト（元はHIGH_CONFIDENCE_SIGNAL_PATTERNに無条件で
+    // 含まれており、genericKeywordsの値に関わらず検知されてしまっていた）。
+    expect(looksLikeErrorText("main.a913b2c4.js built in 1.2s")).toBe(false);
+  });
 });
 
 describe("matchesCustomKeywords", () => {

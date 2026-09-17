@@ -801,6 +801,11 @@ export function isGenericFallbackResult(result: AnalysisResult): boolean {
 // コードとメッセージが一緒に表示・コピーされる限り言い回しに関係なく拾える。
 // （UUIDの先頭セグメント等、まれに無関係な8桁16進数と偶然一致する可能性はあるが、
 // クリップボード監視はオプトイン機能であり誤検知時の実害も小さいため許容する）
+// この許容判断はクリップボード監視限定の前提であるため、HIGH_CONFIDENCE_SIGNAL_PATTERN
+// （genericKeywordsの値に関わらず常に判定される）には含めず、looksLikeErrorText内で
+// genericKeywords=trueの場合のみ判定する別枠のパターンとして扱う。ターミナル監視・
+// ログファイル監視（genericKeywords=false）はビルドハッシュ等の8桁16進文字列を誤って
+// エラーとして検知するリスクがあるため、この判定の対象外にする。
 const WINGARC_ERROR_CODE_PATTERN = /\b[89a][0-9a-f]{7}\b/i;
 
 const HIGH_CONFIDENCE_SIGNAL_PATTERN = new RegExp(
@@ -816,7 +821,6 @@ const HIGH_CONFIDENCE_SIGNAL_PATTERN = new RegExp(
     "Exception in thread",
     "NullPointerException",
     "CONFLICT \\(content\\)",
-    WINGARC_ERROR_CODE_PATTERN.source,
   ].join("|"),
   "i"
 );
@@ -851,15 +855,17 @@ const MIN_CLIPBOARD_TEXT_LENGTH = 20;
  * 監視ワードとして手入力（またはコピペ）した際、実際のクリップボード内容と
  * 見た目は同じでも文字コードが微妙に異なり一致しない、という報告への対処。
  */
-function normalizeForMatching(s: string): string {
+export function normalizeForMatching(s: string): string {
   return s.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
 
 /**
  * テキストが「エラーらしいか」を判定する。
  * @param options.genericKeywords true の場合、高確度シグネチャに加えて汎用的なエラー関連
- *   キーワード（日英）でも判定する（クリップボード監視モード向け）。false（既定）の場合は
- *   ターミナル出力向けの高確度シグネチャのみで判定する（誤検知を避けたいターミナル監視モード向け）。
+ *   キーワード（日英）・Wingarcエラーコード形式でも判定する（クリップボード監視モード向け）。
+ *   false（既定）の場合はターミナル出力向けの高確度シグネチャのみで判定する（誤検知を
+ *   避けたいターミナル監視・ログファイル監視モード向け。ビルドハッシュ等の8桁16進文字列を
+ *   Wingarcエラーコードと誤検知しないよう、genericKeywords=falseの間はその判定を行わない）。
  * @param options.minLength この文字数未満のテキストは、汎用キーワード判定(genericKeywords)
  *   では常にfalseとして扱う（既定0=制限なし）。高確度シグネチャ（HIGH_CONFIDENCE_SIGNAL_PATTERN、
  *   Wingarcエラーコードのような具体的な形を含む）は、それ自体の特異性で誤検知リスクが
@@ -873,6 +879,7 @@ export function looksLikeErrorText(
   const { genericKeywords = false, minLength = 0 } = options;
   const normalized = normalizeForMatching(text);
   if (HIGH_CONFIDENCE_SIGNAL_PATTERN.test(normalized)) return true;
+  if (genericKeywords && WINGARC_ERROR_CODE_PATTERN.test(normalized)) return true;
   if (normalized.length < minLength) return false;
   return genericKeywords && GENERIC_KEYWORDS_PATTERN.test(normalized);
 }

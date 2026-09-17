@@ -174,6 +174,14 @@ pub fn stop_terminal_watch() -> Result<(), String> {
     Ok(())
 }
 
+/// 現在ターミナル監視（子プロセス）が実行中かどうかを返す。
+/// clipboard_watch::is_clipboard_watch_running / log_file_watch::is_log_file_watch_running
+/// と同じ役割（画面リロード直後の状態補正に使う）。
+#[tauri::command]
+pub fn is_terminal_watch_running() -> bool {
+    watch_state().lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
 /// アプリ終了時に監視中のプロセスが残らないよう、ベストエフォートで後始末する。
 pub fn kill_if_running() {
     if let Ok(mut guard) = watch_state().lock() {

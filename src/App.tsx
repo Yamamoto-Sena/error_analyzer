@@ -276,9 +276,17 @@ export default function App() {
   // ログが手元にない場合でも解析できるよう、自由記述の症状・状況説明を別枠で受け付ける
   const [descriptionInput, setDescriptionInput] = useState<string>("");
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
+  // isAnalyzing(state)と同期して更新するref。複数の監視モードがほぼ同時にエラーを
+  // 検知した際の二重解析防止ガード（handleWatchDetectedError）は、次の再描画まで
+  // 反映されないstateではなく、このrefを参照する（詳細はhandleWatchDetectedError内コメント）。
+  const isAnalyzingRef = useRef(false);
   const [activeTab, setActiveTab] = useState<"cause" | "diff" | "learn">("cause");
   const [hasResult, setHasResult] = useState<boolean>(false);
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  // analysisが「別の解析結果」に置き換わるたびにインクリメントする世代カウンタ。
+  // フォローアップ質問(FollowUpPanel)の非同期応答が、質問した時点と異なる解析結果に
+  // 紛れ込むのを防ぐガードに使う（詳細はFollowUpPanelのonAsked呼び出し箇所のコメント）。
+  const analysisVersionRef = useRef(0);
 
   // 修正案の検証（再実行後のログを検証し、未解消なら新たな修正案を提案する）
   const [verifyLogInput, setVerifyLogInput] = useState<string>("");
@@ -326,6 +334,8 @@ export default function App() {
   // プロジェクトのGit作業ツリーが汚れていないかの判定結果(実ファイル適用前の注意喚起用)
   const [gitDirtyStatus, setGitDirtyStatus] = useState<GitDirtyStatus | null>(null);
   const [showTerminalWatchModal, setShowTerminalWatchModal] = useState<boolean>(false);
+  // ターミナル監視が実際に実行中かどうか（isClipboardWatchingと同じ理由で引き上げている）
+  const [isTerminalWatching, setIsTerminalWatching] = useState<boolean>(false);
   const [showClipboardWatchModal, setShowClipboardWatchModal] = useState<boolean>(false);
   // クリップボード監視が実際に実行中かどうか。モーダルを閉じていてもヘッダーの
   // ボタン上で分かるようにするため、モーダル内部の状態をここに引き上げている。
@@ -841,15 +851,25 @@ export default function App() {
   // 画面に残らないよう、解析結果関連stateを破棄する。
   // （realApplyResult等は、analysisの変化に連動する既存のuseEffectが自動的にクリアするため、
   // ここでは触らない）
+  // resolutionChoice/differentMethodInput/followUpEntriesの3点セットは、解析結果が
+  // 別のものに置き換わる複数箇所（clearAnalysisResult自身に加え、handleAnalyze・
+  // handleVerifyFix・handleSelectHistory）で共通してリセットが必要なため、
+  // コピペによる漏れを防ぐためここに集約する。
+  // （handleApplyFixのundo/apply分岐は意図的にfollowUpEntriesをリセットしないため、
+  // ここには含めず個別のまま残している）
+  const resetFollowUpState = () => {
+    setResolutionChoice(null);
+    setDifferentMethodInput("");
+    setFollowUpEntries([]);
+  };
+
   const clearAnalysisResult = () => {
     setHasResult(false);
     setAnalysis(null);
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
-    setResolutionChoice(null);
-    setDifferentMethodInput("");
-    setFollowUpEntries([]);
+    resetFollowUpState();
   };
 
   const handleSampleLoad = (key: keyof typeof SAMPLE_LOGS) => {
@@ -1001,12 +1021,11 @@ export default function App() {
       .join("\n\n");
 
     setIsAnalyzing(true);
+    isAnalyzingRef.current = true;
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
-    setResolutionChoice(null);
-    setDifferentMethodInput("");
-    setFollowUpEntries([]);
+    resetFollowUpState();
 
     try {
       let result: AnalysisResult;
@@ -1085,6 +1104,7 @@ export default function App() {
       }
 
       setAnalysis(result);
+      analysisVersionRef.current += 1;
       setHasResult(true);
       setActiveTab("cause");
       saveToHistory(result);
@@ -1094,11 +1114,13 @@ export default function App() {
       const fallback = analyzeErrorLog(combinedText);
       fallback.modelUsed = "ローカル解析エンジン（フォールバック）";
       setAnalysis(fallback);
+      analysisVersionRef.current += 1;
       setHasResult(true);
       setActiveTab("cause");
       showToast(`Gemini通信エラー (${(err as Error).message.slice(0, 300)})。ローカル解析を表示します`, "warning");
     } finally {
       setIsAnalyzing(false);
+      isAnalyzingRef.current = false;
     }
   };
 
@@ -1133,7 +1155,12 @@ export default function App() {
       // を後勝ちで奪い合い、画面がどちらの結果か分からなくなる）。
       // 既に解析中の場合は自動実行を見送り、ログ欄にセットするだけに留める
       // （＝手動の「エラーを解析する」を待つ、autoAnalyze=falseと同じ扱い）。
-      if (isAnalyzing) {
+      // ガードにはisAnalyzing（state）ではなくisAnalyzingRef（ref）を使う。
+      // stateはsetIsAnalyzing(true)を呼んだ直後の再描画までは古い値のままのため、
+      // 同一tick内で2つの監視ソースがほぼ同時に発火すると両方がisAnalyzing===false
+      // を読んでしまいこのガードをすり抜ける。refは同期的に更新するため、この
+      // タイミング問題が起きない。
+      if (isAnalyzingRef.current) {
         showToast(
           `${sourceLabel}でエラーを検知しましたが、他の解析が進行中のためログ欄にセットするだけに留めました。完了後に「エラーを解析する」を押してください`,
           "warning"
@@ -1450,13 +1477,12 @@ export default function App() {
 
       // 検証で得られた最新の解析結果に更新し、履歴にも積み増す
       setAnalysis(recheck);
+      analysisVersionRef.current += 1;
       setHasResult(true);
       setActiveTab("cause");
       setIsApplied(false);
       setVerifyLogInput("");
-      setResolutionChoice(null);
-      setDifferentMethodInput("");
-      setFollowUpEntries([]);
+      resetFollowUpState();
       saveToHistory(recheck);
     } catch (err) {
       console.error(err);
@@ -1468,15 +1494,14 @@ export default function App() {
 
   const handleSelectHistory = (item: HistoryItem) => {
     setAnalysis(item.result);
+    analysisVersionRef.current += 1;
     setHasResult(true);
     setActiveTab("cause");
     setShowHistoryModal(false);
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
-    setResolutionChoice(null);
-    setDifferentMethodInput("");
-    setFollowUpEntries([]);
+    resetFollowUpState();
     showToast(`履歴「${item.result.errorType}」を読み込みました`, "info");
   };
 
@@ -1719,8 +1744,7 @@ export default function App() {
 
           {/* 監視系メニュー: ターミナル監視・クリップボード監視・ログファイル監視をまとめる。
               以前はヘッダーに3つ個別のボタンを並べており混雑していたため、1つのドロップダウンに
-              集約した。いずれかが実行中の場合は、集約ボタン自体に緑色＋点滅ドットを表示する
-              （ターミナル監視は実行中フラグをApp.tsxに引き上げていないため対象外）。 */}
+              集約した。いずれかが実行中の場合は、集約ボタン自体に緑色＋点滅ドットを表示する。 */}
           <div className="relative">
             <button
               onClick={(e) => {
@@ -1729,12 +1753,12 @@ export default function App() {
               }}
               title="ターミナル監視・クリップボード監視・ログファイル監視をまとめて開く"
               className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border transition cursor-pointer ${
-                isClipboardWatching || isLogFileWatching
+                isClipboardWatching || isLogFileWatching || isTerminalWatching
                   ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/20"
                   : "bg-slate-100 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-slate-700"
               }`}
             >
-              {(isClipboardWatching || isLogFileWatching) && (
+              {(isClipboardWatching || isLogFileWatching || isTerminalWatching) && (
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
               )}
               <Eye className="w-3.5 h-3.5" />
@@ -1756,8 +1780,14 @@ export default function App() {
                   title={!IS_TAURI_RUNTIME ? "Web版では利用できません（デスクトップアプリ版でのみ利用可能）" : undefined}
                   className="w-full flex items-center space-x-2 px-3 py-2.5 text-left text-xs hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
                 >
-                  <Terminal className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
-                  <span className="flex-1 text-slate-700 dark:text-slate-200">ターミナル監視（試験的機能）</span>
+                  {isTerminalWatching ? (
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                  ) : (
+                    <Terminal className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+                  )}
+                  <span className="flex-1 text-slate-700 dark:text-slate-200">
+                    {isTerminalWatching ? "ターミナル監視: 監視中" : "ターミナル監視（試験的機能）"}
+                  </span>
                 </button>
                 <button
                   onClick={() => {
@@ -2412,10 +2442,19 @@ export default function App() {
                         Gemini APIキー必須（未設定時はFollowUpPanel内で案内のみ表示）。 */}
                     <FollowUpPanel
                       analysis={analysis}
+                      analysisVersion={analysisVersionRef.current}
                       apiKey={apiKey}
                       selectedModel={selectedModel}
                       entries={followUpEntries}
-                      onAsked={(entry, usage) => {
+                      onAsked={(entry, usage, askedAtVersion) => {
+                        // 質問した時点から解析結果が別のものに切り替わっていたら
+                        // （回答を待つ間に履歴の別項目を開いた等）、この回答は今表示中の
+                        // 解析結果とは無関係なので追加しない（別の解析結果のQ&Aに
+                        // 紛れ込むのを防ぐ）。
+                        if (askedAtVersion !== analysisVersionRef.current) {
+                          showToast("解析結果が切り替わったため、この質問への回答は破棄されました", "info");
+                          return;
+                        }
                         setFollowUpEntries((prev) => [...prev, entry]);
                         recordUsageForResult(usage);
                       }}
@@ -2950,6 +2989,7 @@ export default function App() {
         onPickProjectRoot={handlePickProjectRoot}
         onDetectedError={handleTerminalWatchError}
         showToast={showToast}
+        onRunningChange={setIsTerminalWatching}
       />
 
       {/* 5.6. クリップボード監視モード（試験的機能）。ターミナル監視モードと同様、閉じても

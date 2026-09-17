@@ -13,12 +13,17 @@ export interface FollowUpEntry {
 
 interface FollowUpPanelProps {
   analysis: AnalysisResult;
+  /** 解析結果が別のものに切り替わるたびに親(App.tsx)がインクリメントする世代カウンタ。
+   *  質問した時点のこの値をonAskedへ引き渡すことで、回答が届いた時点で表示中の
+   *  解析結果と一致するかを親側で確認できるようにする（詳細はApp.tsxのonAsked実装参照）。 */
+  analysisVersion: number;
   apiKey: string;
   selectedModel: string;
   entries: FollowUpEntry[];
   onAsked: (
     entry: FollowUpEntry,
-    usage: { modelUsed?: string; tokenUsage?: TokenUsage; quotaExceededModels?: string[] }
+    usage: { modelUsed?: string; tokenUsage?: TokenUsage; quotaExceededModels?: string[] },
+    askedAtVersion: number
   ) => void;
   showToast: (message: string, type?: "success" | "info" | "warning") => void;
 }
@@ -35,7 +40,15 @@ const MAX_QUESTION_LENGTH = 500;
  * 応答を用意すると「理解していないのに回答しているように見える」誤った安心感を与えてしまう
  * （多層防御・誠実な失敗表示というこのアプリの設計哲学に反する）。
  */
-export default function FollowUpPanel({ analysis, apiKey, selectedModel, entries, onAsked, showToast }: FollowUpPanelProps) {
+export default function FollowUpPanel({
+  analysis,
+  analysisVersion,
+  apiKey,
+  selectedModel,
+  entries,
+  onAsked,
+  showToast,
+}: FollowUpPanelProps) {
   const [question, setQuestion] = useState("");
   const [isAsking, setIsAsking] = useState(false);
 
@@ -60,6 +73,9 @@ export default function FollowUpPanel({ analysis, apiKey, selectedModel, entries
   const handleAsk = async () => {
     const trimmed = question.trim();
     if (!trimmed || isAsking) return;
+    // 応答が届くまでの間にユーザーが別の解析結果に切り替える可能性があるため、
+    // 質問した時点のバージョンを捕捉しておき、onAsked経由で親に渡す。
+    const askedAtVersion = analysisVersion;
     setIsAsking(true);
     try {
       // トークン消費対策として、過去のフォローアップ往復(entries)はプロンプトに含めない。
@@ -80,11 +96,15 @@ export default function FollowUpPanel({ analysis, apiKey, selectedModel, entries
         modelUsed: result.modelUsed,
         usedFallbackModel: result.usedFallbackModel,
       };
-      onAsked(entry, {
-        modelUsed: result.modelUsed,
-        tokenUsage: result.tokenUsage,
-        quotaExceededModels: result.quotaExceededModels,
-      });
+      onAsked(
+        entry,
+        {
+          modelUsed: result.modelUsed,
+          tokenUsage: result.tokenUsage,
+          quotaExceededModels: result.quotaExceededModels,
+        },
+        askedAtVersion
+      );
       setQuestion("");
     } catch (err) {
       showToast(`質問への回答に失敗しました: ${(err as Error).message}`, "warning");
