@@ -20,11 +20,14 @@ interface FollowUpPanelProps {
   apiKey: string;
   selectedModel: string;
   entries: FollowUpEntry[];
+  /** 戻り値は、この回答が実際に採用され表示に追加されたかどうか。falseの場合
+   *  （質問した時点から表示中の解析結果が切り替わっていた等で破棄された場合）は、
+   *  ユーザーが次の質問をすでに入力し始めていた場合に備え、質問欄をクリアしない。 */
   onAsked: (
     entry: FollowUpEntry,
     usage: { modelUsed?: string; tokenUsage?: TokenUsage; quotaExceededModels?: string[] },
     askedAtVersion: number
-  ) => void;
+  ) => boolean;
   showToast: (message: string, type?: "success" | "info" | "warning") => void;
 }
 
@@ -96,7 +99,7 @@ export default function FollowUpPanel({
         modelUsed: result.modelUsed,
         usedFallbackModel: result.usedFallbackModel,
       };
-      onAsked(
+      const accepted = onAsked(
         entry,
         {
           modelUsed: result.modelUsed,
@@ -105,7 +108,9 @@ export default function FollowUpPanel({
         },
         askedAtVersion
       );
-      setQuestion("");
+      // 破棄された場合、ユーザーがその間に次の質問を入力し始めている可能性があるため
+      // 質問欄はクリアしない（せっかく入力した内容を無関係なタイミングで消さないため）。
+      if (accepted) setQuestion("");
     } catch (err) {
       showToast(`質問への回答に失敗しました: ${(err as Error).message}`, "warning");
     } finally {

@@ -30,7 +30,6 @@ use crate::watch_registry::{ErrorLogDedup, StopFlagRegistry};
 /// 検知までの体感速度が悪くなるため、体感上ちょうど良いとされる800msにしている。
 const POLL_INTERVAL: Duration = Duration::from_millis(800);
 
-const LOCK_POISONED_MESSAGE: &str = "内部エラー: 監視状態のロックに失敗しました。";
 const ALREADY_RUNNING_MESSAGE: &str = "既にクリップボードを監視中です。先に停止してください。";
 
 static REGISTRY: StopFlagRegistry = StopFlagRegistry::new();
@@ -47,7 +46,7 @@ struct ClipboardTextPayload {
 /// （ユーザーが「今から」コピーする内容だけを検知対象にしたいため）。
 #[tauri::command]
 pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
-    let stop_flag = REGISTRY.try_start(LOCK_POISONED_MESSAGE, ALREADY_RUNNING_MESSAGE)?;
+    let stop_flag = REGISTRY.try_start(ALREADY_RUNNING_MESSAGE)?;
 
     // 読み取り失敗（クリップボードが空、画像のみが入っている等）は「空文字」として扱う。
     // クリップボード監視はベストエフォートの機能であり、この時点でのエラーを
@@ -124,7 +123,7 @@ pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
 /// 問題にならない）。
 #[tauri::command]
 pub fn stop_clipboard_watch() -> Result<(), String> {
-    if REGISTRY.stop(LOCK_POISONED_MESSAGE)? {
+    if REGISTRY.stop()? {
         eprintln!("[clipboard_watch] 監視を停止しました");
     }
     Ok(())

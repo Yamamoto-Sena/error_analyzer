@@ -166,7 +166,13 @@ export default function TerminalWatchModal({
     hasTriggeredRef.current = false;
     setErrorDetected(false);
     setExitCode(undefined);
-    await start({ root: projectRoot, command });
+    const result = await start({ root: projectRoot, command });
+    if (result === "already-running") {
+      // 画面側は「未実行」のつもりでも、実はRust側で既に監視中だった場合
+      // （開発中のリロード等で画面の状態だけがリセットされた場合に起こりうる）。
+      // クリップボード監視・ログファイル監視と同様にここで明示する。
+      showToast("ターミナル監視は既に開始されていました（画面表示を修正しました）", "info");
+    }
   };
 
   const handleStop = async () => {

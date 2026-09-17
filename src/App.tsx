@@ -866,6 +866,12 @@ export default function App() {
   const clearAnalysisResult = () => {
     setHasResult(false);
     setAnalysis(null);
+    // analysisが「無し」に置き換わるのもanalysisの世代交代の一種のため、ここでも
+    // インクリメントする。これを忘れると、ここより前に投げたフォローアップ質問が
+    // 応答してきた際、analysisVersionRefが据え置きのままガードを素通りしてしまい、
+    // 既にクリア済みのはずのfollowUpEntriesに古い回答が紛れ込む
+    // （handleAnalyze/handleVerifyFix/handleSelectHistoryと同じ理由）。
+    analysisVersionRef.current += 1;
     setIsApplied(false);
     setVerificationResult(null);
     setVerifyLogInput("");
@@ -938,7 +944,9 @@ export default function App() {
   const handleAnalyzeShortcut = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
-      if (!isAnalyzing) void handleAnalyze();
+      // handleWatchDetectedErrorと同じ理由でisAnalyzing(state)ではなくisAnalyzingRef(ref)を
+      // 参照する（stateはsetIsAnalyzing(true)直後の再描画までは古い値のままのため）。
+      if (!isAnalyzingRef.current) void handleAnalyze();
     }
   };
 
@@ -2447,16 +2455,21 @@ export default function App() {
                       selectedModel={selectedModel}
                       entries={followUpEntries}
                       onAsked={(entry, usage, askedAtVersion) => {
+                        // 実際にGemini APIを呼んでトークンを消費した事実は、表示中の解析結果が
+                        // 切り替わっていても変わらないため、使用量の記録だけは常に行う
+                        // （そうしないと日次トークン使用量の表示が実際の消費より少なく見えてしまう）。
+                        recordUsageForResult(usage);
+
                         // 質問した時点から解析結果が別のものに切り替わっていたら
                         // （回答を待つ間に履歴の別項目を開いた等）、この回答は今表示中の
                         // 解析結果とは無関係なので追加しない（別の解析結果のQ&Aに
                         // 紛れ込むのを防ぐ）。
                         if (askedAtVersion !== analysisVersionRef.current) {
                           showToast("解析結果が切り替わったため、この質問への回答は破棄されました", "info");
-                          return;
+                          return false;
                         }
                         setFollowUpEntries((prev) => [...prev, entry]);
-                        recordUsageForResult(usage);
+                        return true;
                       }}
                       showToast={showToast}
                     />

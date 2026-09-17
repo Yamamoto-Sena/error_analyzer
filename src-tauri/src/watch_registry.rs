@@ -14,6 +14,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// ロック取得失敗（ポイズニング）時のエラー文言。clipboard_watch.rs/log_file_watch.rs
+/// 両方で元々バイト同一の文言だったため、呼び出し元ごとにパラメータで渡す必要がなく、
+/// ここに一元化する（「既に監視中です」という文言はモジュールごとに異なるため、
+/// そちらは引き続き呼び出し元から渡してもらう）。
+const LOCK_POISONED_MESSAGE: &str = "内部エラー: 監視状態のロックに失敗しました。";
+
 /// 「同時に1つまでしか監視できない」種類の監視状態（停止フラグのみ）を保持するレジストリ。
 pub struct StopFlagRegistry {
     slot: OnceLock<Mutex<Option<Arc<AtomicBool>>>>,
@@ -30,19 +36,14 @@ impl StopFlagRegistry {
         self.slot.get_or_init(|| Mutex::new(None))
     }
 
-    /// 新規監視の開始を試みる。ロック取得に失敗した場合は`lock_poisoned_message`を、
-    /// 既に監視中の場合は`already_running_message`をそのままエラーとして返す
-    /// （呼び出し元ごとに異なる既存の日本語エラー文言をそのまま維持するため、
-    /// 文言はここではなく呼び出し元から渡してもらう）。
-    pub fn try_start(
-        &self,
-        lock_poisoned_message: &str,
-        already_running_message: &str,
-    ) -> Result<Arc<AtomicBool>, String> {
+    /// 新規監視の開始を試みる。既に監視中の場合は`already_running_message`をそのまま
+    /// エラーとして返す（呼び出し元ごとに異なる既存の日本語エラー文言をそのまま
+    /// 維持するため、こちらのみ呼び出し元から渡してもらう）。
+    pub fn try_start(&self, already_running_message: &str) -> Result<Arc<AtomicBool>, String> {
         let mut guard = self
             .mutex()
             .lock()
-            .map_err(|_| lock_poisoned_message.to_string())?;
+            .map_err(|_| LOCK_POISONED_MESSAGE.to_string())?;
         if guard.is_some() {
             return Err(already_running_message.to_string());
         }
@@ -54,11 +55,11 @@ impl StopFlagRegistry {
     /// 監視を停止する。戻り値は「実際に停止処理を行ったか」（既に停止済みならfalse）。
     /// 呼び出し元が「何かを止めたときだけログを出す」という既存の挙動を維持できるように、
     /// この情報を返す。
-    pub fn stop(&self, lock_poisoned_message: &str) -> Result<bool, String> {
+    pub fn stop(&self) -> Result<bool, String> {
         let mut guard = self
             .mutex()
             .lock()
-            .map_err(|_| lock_poisoned_message.to_string())?;
+            .map_err(|_| LOCK_POISONED_MESSAGE.to_string())?;
         if let Some(flag) = guard.take() {
             flag.store(true, Ordering::Relaxed);
             Ok(true)
@@ -118,7 +119,7 @@ mod tests {
     #[test]
     fn try_start_succeeds_when_empty_and_returns_a_stop_flag() {
         let registry = StopFlagRegistry::new();
-        let flag = registry.try_start("lock poisoned", "already running").unwrap();
+        let flag = registry.try_start("already running").unwrap();
         assert!(!flag.load(Ordering::Relaxed));
         assert!(registry.is_running());
     }
@@ -126,16 +127,16 @@ mod tests {
     #[test]
     fn try_start_fails_with_the_given_message_when_already_running() {
         let registry = StopFlagRegistry::new();
-        registry.try_start("lock poisoned", "already running").unwrap();
-        let err = registry.try_start("lock poisoned", "already running").unwrap_err();
+        registry.try_start("already running").unwrap();
+        let err = registry.try_start("already running").unwrap_err();
         assert_eq!(err, "already running");
     }
 
     #[test]
     fn stop_sets_the_flag_and_clears_the_slot() {
         let registry = StopFlagRegistry::new();
-        let flag = registry.try_start("lock poisoned", "already running").unwrap();
-        let stopped = registry.stop("lock poisoned").unwrap();
+        let flag = registry.try_start("already running").unwrap();
+        let stopped = registry.stop().unwrap();
         assert!(stopped);
         assert!(flag.load(Ordering::Relaxed));
         assert!(!registry.is_running());
@@ -144,7 +145,7 @@ mod tests {
     #[test]
     fn stop_is_a_no_op_and_returns_false_when_nothing_is_running() {
         let registry = StopFlagRegistry::new();
-        let stopped = registry.stop("lock poisoned").unwrap();
+        let stopped = registry.stop().unwrap();
         assert!(!stopped);
     }
 
@@ -158,7 +159,7 @@ mod tests {
     #[test]
     fn stop_if_running_stops_an_active_watch() {
         let registry = StopFlagRegistry::new();
-        let flag = registry.try_start("lock poisoned", "already running").unwrap();
+        let flag = registry.try_start("already running").unwrap();
         registry.stop_if_running();
         assert!(flag.load(Ordering::Relaxed));
         assert!(!registry.is_running());

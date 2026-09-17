@@ -7,8 +7,8 @@ interface UseWatchConnectionOptions {
   startCommand: string;
   stopCommand: string;
   /** 実行状態を問い合わせるTauriコマンド名。マウント時の状態同期と、start失敗時の
-   *  「実は既にRust側で動いていた」の再確認（自己修復）に使う。省略時はどちらも行わない。 */
-  isRunningCommand?: string;
+   *  「実は既にRust側で動いていた」の再確認（自己修復）に使う。 */
+  isRunningCommand: string;
   /** 監視の実行状態が変化するたびに呼ばれる。ヘッダーボタン等、モーダルの外に
    *  「今、監視中かどうか」を表示するために使う（モーダルを閉じていても分かるように）。 */
   onRunningChange?: (isRunning: boolean) => void;
@@ -47,7 +47,7 @@ export function useWatchConnection({
   setsRunningFalseOnStop = true,
 }: UseWatchConnectionOptions): UseWatchConnectionResult {
   const [isRunning, setIsRunning] = useState<boolean>(false);
-  const [isSyncingState, setIsSyncingState] = useState<boolean>(!!isRunningCommand);
+  const [isSyncingState, setIsSyncingState] = useState<boolean>(true);
   const [isStarting, setIsStarting] = useState<boolean>(false);
   const [startError, setStartError] = useState<string | null>(null);
 
@@ -63,7 +63,6 @@ export function useWatchConnection({
   // isRunningCommandは各モーダルが呼び出し時に固定で渡す値であり、実行中に
   // 変わることは想定していないため、依存配列には含めずマウント時一度だけ実行する。
   useEffect(() => {
-    if (!isRunningCommand) return;
     let cancelled = false;
     (async () => {
       try {
@@ -92,14 +91,12 @@ export function useWatchConnection({
       // 画面側は「未実行」のつもりでも、実はRust側で既に監視中だった場合
       // （開発中のリロード等で画面の状態だけがリセットされた場合に起こりうる）、
       // ここで実際の状態を問い合わせて補正する。
-      if (isRunningCommand) {
-        try {
-          const running = await invoke<boolean>(isRunningCommand);
-          setIsRunning(running);
-          if (running) return "already-running";
-        } catch {
-          // 状態問い合わせ自体に失敗した場合は、下のsetStartErrorにフォールスルーする
-        }
+      try {
+        const running = await invoke<boolean>(isRunningCommand);
+        setIsRunning(running);
+        if (running) return "already-running";
+      } catch {
+        // 状態問い合わせ自体に失敗した場合は、下のsetStartErrorにフォールスルーする
       }
       setStartError(String(err).slice(0, 200));
       return "failed";

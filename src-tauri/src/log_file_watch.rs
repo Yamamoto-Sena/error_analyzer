@@ -40,7 +40,6 @@ use crate::watch_registry::{ErrorLogDedup, StopFlagRegistry};
 /// 数秒待てる用途）ため、clipboard_watch.rsの800msより長めの1000msにしている。
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
-const LOCK_POISONED_MESSAGE: &str = "内部エラー: 監視状態のロックに失敗しました。";
 const ALREADY_RUNNING_MESSAGE: &str = "既に別のログファイルを監視中です。先に停止してください。";
 
 static REGISTRY: StopFlagRegistry = StopFlagRegistry::new();
@@ -129,7 +128,7 @@ pub fn start_log_file_watch(app: AppHandle, path: String) -> Result<(), String> 
         return Err(format!("指定されたファイルが見つかりません: {path}"));
     }
 
-    let stop_flag = REGISTRY.try_start(LOCK_POISONED_MESSAGE, ALREADY_RUNNING_MESSAGE)?;
+    let stop_flag = REGISTRY.try_start(ALREADY_RUNNING_MESSAGE)?;
 
     let initial_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
     let initial_identity = file_identity(&file_path);
@@ -232,7 +231,7 @@ pub fn start_log_file_watch(app: AppHandle, path: String) -> Result<(), String> 
 /// ポーリングタイミングで自然に終了する。最大でも`POLL_INTERVAL`程度の遅延はある）。
 #[tauri::command]
 pub fn stop_log_file_watch() -> Result<(), String> {
-    if REGISTRY.stop(LOCK_POISONED_MESSAGE)? {
+    if REGISTRY.stop()? {
         eprintln!("[log_file_watch] 監視を停止しました");
     }
     Ok(())
