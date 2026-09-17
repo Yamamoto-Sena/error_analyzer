@@ -16,6 +16,21 @@ interface UseWatchConnectionOptions {
    *  ターミナル監視のように、実際の終了確定を別のイベント（terminal-exit）で
    *  受け取る場合はfalseを指定し、呼び出し側がそのイベントでsetIsRunningする。 */
   setsRunningFalseOnStop?: boolean;
+  /** trueの場合（既定）、マウント時に自動でisRunningCommandを問い合わせる。
+   *  falseの場合は自動実行せず、戻り値のsyncRunningState()を呼び出し側が
+   *  好きなタイミングで呼ぶ。
+   *
+   *  ターミナル監視のように「実行中フラグが、別途購読するTauriイベント
+   *  （terminal-exit）によっても外部から書き換わりうる」場合、この問い合わせを
+   *  マウント時に無条件で走らせると次の競合が起きうる: 問い合わせ結果
+   *  （true=実行中）が返ってきた直後にちょうどプロセスが終了し、かつ
+   *  terminal-exitの購読(listen)がまだ完了していないと、そのイベントを
+   *  取りこぼして「実行中」の表示のまま固着してしまう。そのため、そうした
+   *  イベント購読を持つ呼び出し側は`syncOnMount: false`を指定し、自分の
+   *  イベント購読が完了してからsyncRunningState()を呼ぶことで、問い合わせ時点で
+   *  「もし今動いていなければ、それはこのリスナーが既に検知しているはず」
+   *  という順序を保証できる。 */
+  syncOnMount?: boolean;
 }
 
 interface UseWatchConnectionResult {
@@ -28,6 +43,9 @@ interface UseWatchConnectionResult {
   setStartError: (value: string | null) => void;
   start: (invokeArgs?: Record<string, unknown>) => Promise<WatchStartResult>;
   stop: () => Promise<boolean>;
+  /** syncOnMount:falseを指定した場合に、実行状態を問い合わせ直すための関数。
+   *  syncOnMount:true（既定）の場合は呼ぶ必要がない（マウント時に自動実行されるため）。 */
+  syncRunningState: () => Promise<void>;
 }
 
 /**
@@ -45,6 +63,7 @@ export function useWatchConnection({
   isRunningCommand,
   onRunningChange,
   setsRunningFalseOnStop = true,
+  syncOnMount = true,
 }: UseWatchConnectionOptions): UseWatchConnectionResult {
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [isSyncingState, setIsSyncingState] = useState<boolean>(true);
@@ -56,27 +75,26 @@ export function useWatchConnection({
     onRunningChange?.(isRunning);
   }, [isRunning, onRunningChange]);
 
+  const syncRunningState = async () => {
+    try {
+      const running = await invoke<boolean>(isRunningCommand);
+      setIsRunning(running);
+    } catch {
+      // Tauriアプリの外（ブラウザ単体プレビュー等）では常にfalse扱いのままでよい
+    } finally {
+      setIsSyncingState(false);
+    }
+  };
+
   // マウント時、実際にRust側で監視中かどうかを問い合わせて画面状態を補正する。
   // これをしないと、開発中のリロードやアプリ再起動直後の画面表示は常に
   // isRunning=falseから始まってしまい、「実際にはバックグラウンドで監視が
   // 継続しているのに画面には『開始』ボタンしか出ない」という食い違いが起きうる。
-  // isRunningCommandは各モーダルが呼び出し時に固定で渡す値であり、実行中に
-  // 変わることは想定していないため、依存配列には含めずマウント時一度だけ実行する。
+  // syncOnMount:falseの場合は呼び出し側が任意のタイミングでsyncRunningStateを
+  // 呼ぶため、ここでは何もしない（理由はsyncOnMountのdocコメント参照）。
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const running = await invoke<boolean>(isRunningCommand);
-        if (!cancelled) setIsRunning(running);
-      } catch {
-        // Tauriアプリの外（ブラウザ単体プレビュー等）では常にfalse扱いのままでよい
-      } finally {
-        if (!cancelled) setIsSyncingState(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    if (!syncOnMount) return;
+    void syncRunningState();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -116,5 +134,5 @@ export function useWatchConnection({
     }
   };
 
-  return { isRunning, setIsRunning, isSyncingState, isStarting, startError, setStartError, start, stop };
+  return { isRunning, setIsRunning, isSyncingState, isStarting, startError, setStartError, start, stop, syncRunningState };
 }

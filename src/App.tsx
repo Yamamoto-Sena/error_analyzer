@@ -1401,6 +1401,10 @@ export default function App() {
   // 未解消（同じエラー）なら新しい根本原因・修正案を、別のエラーなら新規解析として提示する。
   const handleVerifyFix = async () => {
     if (!analysis || !verifyLogInput.trim()) return;
+    // 検証の完了(Gemini呼び出し)を待つ間に、ユーザーが別の解析結果に切り替える
+    // 可能性があるため、開始時点のバージョンを捕捉しておく（詳細は下の判定箇所の
+    // コメント参照。FollowUpPanelのonAskedと同じ理由のガード）。
+    const startedAtVersion = analysisVersionRef.current;
     setIsVerifying(true);
 
     try {
@@ -1425,6 +1429,16 @@ export default function App() {
         // 下のメッセージでユーザーに正直に伝える（repeatedLocalFixNoteを参照）。
         recheck = analyzeErrorLog(verifyLogInput);
         recheck.modelUsed = "ローカル解析エンジン（ルールベース）";
+      }
+
+      // 検証中に表示中の解析結果が別のものへ切り替わっていたら（履歴の別項目を開いた、
+      // 新しい解析を実行した等）、この検証結果はもはや無関係なので画面には反映しない
+      // （FollowUpPanelのonAskedと同じ理由のガード）。トークン消費の記録
+      // (recordUsageForResult)は既に行った後なので、ここでは表示・履歴保存だけを
+      // スキップする。
+      if (startedAtVersion !== analysisVersionRef.current) {
+        showToast("検証中に解析結果が切り替わったため、この検証結果は破棄されました", "info");
+        return;
       }
 
       // エラー種別・対象ファイルが一致するかで「同じ問題が再発しているか」を簡易判定。

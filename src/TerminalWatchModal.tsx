@@ -45,12 +45,19 @@ export default function TerminalWatchModal({
   // 受信時に行う（killを要求してから子プロセスが実際に終了するまでラグがあるため）。
   // そのためsetsRunningFalseOnStop: falseを指定し、isRunningの更新はこのモーダル自身が
   // terminal-exitリスナー内で行う。
-  const { isRunning, setIsRunning, isSyncingState, isStarting, startError, start, stop } = useWatchConnection({
+  // また、実行中状態のマウント時問い合わせ(syncRunningState)は自動実行せず
+  // (syncOnMount: false)、下のterminal-exitリスナーの購読が完了してから明示的に
+  // 呼び出す。自動実行のまま両者を並行させると、問い合わせが「実行中」を返した
+  // 直後にちょうどプロセスが終了した場合、terminal-exitの購読がまだ間に合わず
+  // イベントを取りこぼし、「実行中」の表示のまま固着してしまう競合がありうるため
+  // （詳細はuseWatchConnectionのsyncOnMountのdocコメント参照）。
+  const { isRunning, setIsRunning, isSyncingState, isStarting, startError, start, stop, syncRunningState } = useWatchConnection({
     startCommand: "start_terminal_watch",
     stopCommand: "stop_terminal_watch",
     isRunningCommand: "is_terminal_watch_running",
     onRunningChange,
     setsRunningFalseOnStop: false,
+    syncOnMount: false,
   });
   const [lines, setLines] = useState<OutputLine[]>([]);
   const [exitCode, setExitCode] = useState<number | null | undefined>(undefined); // undefined=未終了
@@ -136,6 +143,11 @@ export default function TerminalWatchModal({
       } catch {
         // Tauriアプリの外（ブラウザ単体プレビュー等）では @tauri-apps/api のイベントAPIが
         // 使えないため、静かに諦める（ターミナル監視機能自体が使えないだけで、他の画面には影響させない）
+      } finally {
+        // terminal-exitの購読が完了して（または、Tauri外で購読自体を諦めて）から
+        // 実行中状態を問い合わせる。useWatchConnectionのsyncOnMount:falseと対になる
+        // 呼び出し（詳細はそちらのdocコメント参照）。
+        if (!cancelled) void syncRunningState();
       }
     })();
 
