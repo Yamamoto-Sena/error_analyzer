@@ -64,6 +64,48 @@ describe("recordGeminiUsage", () => {
   });
 });
 
+// アプリを長時間起動しっぱなしで使い続ける（クリップボード監視等の常駐機能や、
+// 1日を通した繰り返し解析）運用を想定し、大量に呼び出し続けてもlocalStorageへの
+// 読み書きが壊れず、累積値が正しく積み上がり続けることを確認する耐久テスト。
+describe("recordGeminiUsage の繰り返し耐性（耐久テスト）", () => {
+  it("同一モデルへ大量に記録し続けても、requestCount/tokenTotalが取りこぼしなく正確に積算される", () => {
+    const storage = createInMemoryStorage();
+    const now = new Date("2024-06-01T12:00:00Z");
+    const ITERATIONS = 1000;
+
+    let state = loadDailyUsage(now, storage);
+    for (let i = 0; i < ITERATIONS; i++) {
+      state = recordGeminiUsage("gemini-3.5-flash-lite", 10, [], now, storage);
+    }
+
+    expect(state.byModel["gemini-3.5-flash-lite"].requestCount).toBe(ITERATIONS);
+    expect(state.byModel["gemini-3.5-flash-lite"].tokenTotal).toBe(ITERATIONS * 10);
+
+    // 都度storageへ永続化された内容も、メモリ上のstateと一致していること
+    // （長時間稼働中にlocalStorageの読み書きだけが裏でズレていく事態がないか確認）
+    const reloaded = loadDailyUsage(now, storage);
+    expect(reloaded.byModel["gemini-3.5-flash-lite"]).toEqual(state.byModel["gemini-3.5-flash-lite"]);
+  });
+
+  it("複数モデルへの大量の記録が混在しても、モデルごとの集計が互いに汚染されない", () => {
+    const storage = createInMemoryStorage();
+    const now = new Date("2024-06-01T12:00:00Z");
+    const models = ["model-a", "model-b", "model-c"];
+    const ITERATIONS = 300;
+
+    let state = loadDailyUsage(now, storage);
+    for (let i = 0; i < ITERATIONS; i++) {
+      const model = models[i % models.length];
+      state = recordGeminiUsage(model, 5, [], now, storage);
+    }
+
+    for (const model of models) {
+      expect(state.byModel[model].requestCount).toBe(ITERATIONS / models.length);
+      expect(state.byModel[model].tokenTotal).toBe((ITERATIONS / models.length) * 5);
+    }
+  });
+});
+
 describe("totalTokensToday / modelsWithQuotaExceededToday", () => {
   it("全モデル合算のトークン数と、超過検知モデルの一覧を返す", () => {
     const storage = createInMemoryStorage();

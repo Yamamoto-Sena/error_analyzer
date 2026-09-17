@@ -209,4 +209,107 @@ mod tests {
             "書き込んだ内容と読み取った内容が一致しません（他のクリップボード管理ソフトが介在している可能性があります）"
         );
     }
+
+    /// 耐久テスト（手動実行専用）: クリップボード監視をアプリ起動中ずっと有効にしておく
+    /// 運用を想定し、start_clipboard_watch内のポーリングループが行っている
+    /// 「読み取り→前回値と比較→変化のみ検知」という処理を、書き込みスレッドとは
+    /// 独立したタイミングでポーリングし続けるスレッドに対して大量回数繰り返しても、
+    /// 変化の取りこぼしが起きないことを確認する。
+    ///
+    /// 本番のstart_clipboard_watchと同じく、書き込み（＝ユーザーのコピー操作）と
+    /// ポーリング（読み取りスレッド）を別スレッド・別タイミングで動かす構成にしている
+    /// （書き込み直後にその場で読み返すだけでは、本番で起こりうる「ポーリング間隔をまたいだ
+    /// 取りこぼし」を再現できないため）。書き込み間隔(WRITE_INTERVAL)はポーリング間隔
+    /// (POLL_INTERVAL_FOR_TEST)より十分長くし、各変化が少なくとも1回はポーリングに
+    /// 観測される時間的余裕を与えている（ユーザーが次にコピーするまでの間隔は、本番の
+    /// POLL_INTERVAL=800msより十分長いのが通常のユースケースであるのと同じ前提）。
+    ///
+    /// 通常の`cargo test`では実行しない(`#[ignore]`)。理由: arboard_can_read_back_written_text
+    /// と同様、実際にOSのクリップボードを書き換える副作用があり、無人/ヘッドレス環境では
+    /// 失敗しうるため。
+    ///
+    /// 注意: `arboard::Clipboard`のインスタンスを複数スレッドから同時に生成・操作すると、
+    /// OS側のクリップボードAPI（Windowsでは特に）がスレッド間の同時アクセスを想定しておらず、
+    /// プロセスクラッシュ（ヒープ破損）を起こすことを確認済みのため、Clipboardインスタンスは
+    /// 1つだけ生成して`Mutex`越しに共有し、読み取り/書き込みの排他制御はRust側で行う。
+    /// スレッドを分けているのは、書き込みタイミングと読み取り(ポーリング)タイミングを
+    /// 独立させ、書き込み直後にその場で読み返すだけでは再現できない「ポーリング間隔をまたいだ
+    /// 取りこぼし」を検証するためであり、OSクリップボードへの同時アクセスを狙ったものではない。
+    /// 手動で実行する場合は次のコマンドを使う:
+    ///   cargo test --package tauri-app -- --ignored clipboard_polling_loop_detects_many_rapid_changes
+    #[test]
+    #[ignore]
+    fn clipboard_polling_loop_detects_many_rapid_changes_without_missing_any() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const CHANGES: usize = 200;
+        const POLL_INTERVAL_FOR_TEST: std::time::Duration = std::time::Duration::from_millis(20);
+        const WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let detected = Arc::new(Mutex::new(Vec::<String>::new()));
+        let clipboard = Arc::new(Mutex::new(
+            arboard::Clipboard::new().expect("この端末でのクリップボード初期化に失敗しました"),
+        ));
+        // 読み取りスレッドが基準値(last_seen)を確定させる前に書き込みスレッドが最初の
+        // 変化を書き込んでしまうと、その変化が「基準値」として扱われて検知されず、
+        // 常に1件だけ取りこぼしたように見える競合が起きる。それを避けるため、
+        // 基準値の確定が完了するまで書き込み開始を待ち合わせる。
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+
+        // 読み取りスレッド: start_clipboard_watchの本体ループと同じ
+        // 「一定間隔でポーリングし、前回値と異なれば検知する」処理を、書き込み側とは
+        // 独立したタイミングで回し続ける。
+        let reader_stop = stop.clone();
+        let reader_detected = detected.clone();
+        let reader_clipboard = clipboard.clone();
+        let reader = std::thread::spawn(move || {
+            let mut last_seen = reader_clipboard.lock().unwrap().get_text().unwrap_or_default();
+            let _ = ready_tx.send(());
+            loop {
+                if reader_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL_FOR_TEST);
+                let text = reader_clipboard.lock().unwrap().get_text().unwrap_or_default();
+                if text != last_seen {
+                    last_seen = text.clone();
+                    reader_detected.lock().unwrap().push(text);
+                }
+            }
+        });
+
+        ready_rx.recv().expect("読み取りスレッドの起動待機に失敗しました");
+
+        // 書き込みスレッド（このテスト自身）: 読み取りスレッドとは非同期に、
+        // 一定間隔でクリップボードへ書き込み続ける。
+        let mut expected = Vec::with_capacity(CHANGES);
+        for i in 0..CHANGES {
+            let text = format!("debug-buddy-durability-probe-{i}");
+            clipboard
+                .lock()
+                .unwrap()
+                .set_text(text.clone())
+                .expect("クリップボードへの書き込みに失敗しました");
+            expected.push(text);
+            std::thread::sleep(WRITE_INTERVAL);
+        }
+        // 最後の書き込みを読み取りスレッドが拾いきる猶予を与えてから停止する
+        std::thread::sleep(POLL_INTERVAL_FOR_TEST * 5);
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("読み取りスレッドの終了待機に失敗しました");
+
+        let detected = Arc::try_unwrap(detected)
+            .expect("読み取りスレッドの終了後もdetectedの参照が残っています")
+            .into_inner()
+            .expect("detectedのロックが汚染されています");
+        assert_eq!(
+            detected, expected,
+            "書き込みスレッドとは独立にポーリングしていた読み取りスレッドが、\
+             一部の変化を取りこぼしたか、順序が入れ替わりました（{}/{}件を検知）",
+            detected.len(),
+            expected.len()
+        );
+    }
 }

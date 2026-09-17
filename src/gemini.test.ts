@@ -202,6 +202,64 @@ describe("analyzeWithGemini", () => {
   });
 });
 
+// クリップボード監視・ターミナル監視・ログファイル監視のようにアプリを長時間起動しっぱなしに
+// する運用を想定し、この関数が「連続で大量に呼ばれ続けても状態が汚染されない・
+// タイマーやAbortControllerがリークしない」ことを検証する耐久テスト。
+describe("analyzeWithGemini の繰り返し耐性（耐久テスト）", () => {
+  it("大量に連続呼び出ししても、毎回独立して正しい結果を返す(前回呼び出しの状態を引きずらない)", async () => {
+    const ITERATIONS = 200;
+    // successResponse()はResponseインスタンスを1回しか読めないため、呼び出しごとに
+    // 新しいインスタンスを生成する(既存の失敗系テストと同じ手当て)
+    const fetchMock = vi.fn().mockImplementation(async () => successResponse("gemini-3.5-flash-lite-001"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (let i = 0; i < ITERATIONS; i++) {
+      const result = await analyzeWithGemini(`log ${i}`, "FAKE_KEY", "gemini-3.5-flash-lite");
+      expect(result.errorType).toBe("TypeError");
+      expect(result.usedFallbackModel).toBe(false);
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(ITERATIONS);
+  });
+
+  it("成功/フォールバック/最終失敗が入り混じって連続しても、都度エラーの取りこぼしなく完結する", async () => {
+    const ITERATIONS = 60;
+    let call = 0;
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      call++;
+      // 3パターンを順番に繰り返し、直前の呼び出し結果が次回に影響しないことを確認する
+      const pattern = call % 3;
+      if (pattern === 1) return new Response("not found", { status: 404 }); // 1st: 404→フォールバック成功
+      if (pattern === 2) return successResponse("gemini-3.8-flash-002"); // 2nd: そのモデルで成功
+      return successResponse("gemini-3.5-flash-lite-001"); // 3rd: 通常成功
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (let i = 0; i < ITERATIONS; i++) {
+      const result = await analyzeWithGemini(`log ${i}`, "FAKE_KEY", "gemini-3.5-flash-lite");
+      expect(result.errorType).toBe("TypeError");
+    }
+  });
+
+  it("タイムアウト用タイマー(AbortController)が呼び出しごとに確実にクリアされ、繰り返してもタイマーが蓄積しない", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn().mockImplementation(async () => successResponse("gemini-3.5-flash-lite-001"));
+      vi.stubGlobal("fetch", fetchMock);
+
+      for (let i = 0; i < 50; i++) {
+        await analyzeWithGemini(`log ${i}`, "FAKE_KEY", "gemini-3.5-flash-lite");
+      }
+
+      // FETCH_TIMEOUT_MS用のsetTimeoutがfinallyでclearTimeoutされていれば、
+      // ループ終了後にpendingタイマーは残らないはず
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 function followUpSuccessResponse(modelVersion: string, answer = "回答テキストです") {
   return jsonResponse(200, {
     modelVersion,

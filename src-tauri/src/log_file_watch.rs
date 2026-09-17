@@ -353,6 +353,49 @@ mod tests {
         assert_eq!(lines, vec!["foo".to_string(), "bar".to_string()]);
     }
 
+    /// 耐久テスト: ログファイル監視をアプリ起動中ずっと有効にしておく運用を想定し、
+    /// ポーリングのたびに呼ばれるextract_complete_linesを大量回数呼び出し続けても、
+    /// (a) pendingバッファが際限なく肥大化しない（改行が来るたびに解放される）、
+    /// (b) 行の取りこぼし・重複が起きない、ことを確認する。
+    #[test]
+    fn extract_complete_lines_stays_bounded_over_many_polling_ticks() {
+        let mut pending = String::new();
+        let mut total_lines = 0usize;
+        const TICKS: usize = 5000;
+
+        for i in 0..TICKS {
+            // 1ティックごとに1行ずつ追記されるログを模擬する
+            let chunk = format!("line-{i}\n");
+            let lines = extract_complete_lines(&mut pending, &chunk);
+            assert_eq!(lines, vec![format!("line-{i}")]);
+            total_lines += lines.len();
+            // 改行で終わるチャンクを渡し続けている限り、pendingは常に空に戻るはず
+            // （=延々とメモリを溜め込んでいかない）
+            assert!(pending.is_empty(), "pendingが解放されていません（tick={i}）: {pending:?}");
+        }
+
+        assert_eq!(total_lines, TICKS);
+    }
+
+    /// 耐久テスト: 改行がなかなか来ない（=1行が異常に長い、または壊れた出力が続く）
+    /// 状況が続いても、そのままpendingが処理落ちせず持ち越され、最終的に改行が来た
+    /// 時点で正しく1行として確定することを確認する。
+    #[test]
+    fn extract_complete_lines_carries_over_long_unterminated_fragment_across_many_ticks() {
+        let mut pending = String::new();
+        const TICKS: usize = 2000;
+
+        for i in 0..TICKS {
+            let lines = extract_complete_lines(&mut pending, &format!("chunk-{i}-"));
+            assert!(lines.is_empty(), "改行が無いのに行が確定してしまいました（tick={i}）");
+        }
+        assert!(!pending.is_empty());
+
+        let lines = extract_complete_lines(&mut pending, "\n");
+        assert_eq!(lines.len(), 1);
+        assert!(pending.is_empty());
+    }
+
     /// 実際のファイル追記を検知できるかの手動実行専用テスト（terminal_watch.rsやり方に倣い、
     /// ファイルI/Oと実時間の待機を伴うため通常の`cargo test`では実行しない）。
     /// 手動で実行する場合は次のコマンドを使う:

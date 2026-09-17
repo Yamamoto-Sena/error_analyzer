@@ -111,6 +111,18 @@ pub fn start_terminal_watch(app: AppHandle, root: String, command: String) -> Re
     Ok(())
 }
 
+/// 末尾の改行(\n、および\r\nの場合は\rも)を取り除く（`BufRead::lines()`相当の挙動）。
+/// I/Oを伴わない純粋関数として切り出し、大量行の連続処理に対する耐久テストを
+/// アプリ/子プロセスを起動せずに実行できるようにしている。
+fn strip_line_ending(buf: &mut Vec<u8>) {
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+}
+
 fn spawn_reader_thread<R: std::io::Read + Send + 'static>(
     app: AppHandle,
     reader: R,
@@ -128,13 +140,7 @@ fn spawn_reader_thread<R: std::io::Read + Send + 'static>(
             if read == 0 {
                 break; // EOF
             }
-            // 末尾の改行(\n、および\r\nの場合は\rも)を取り除く（BufRead::lines()相当の挙動）
-            if buf.last() == Some(&b'\n') {
-                buf.pop();
-                if buf.last() == Some(&b'\r') {
-                    buf.pop();
-                }
-            }
+            strip_line_ending(&mut buf);
             let line = decode_bytes(&buf);
             let _ = app.emit("terminal-output", TerminalOutputPayload { stream, line });
         }
@@ -174,6 +180,76 @@ pub fn kill_if_running() {
         if let Some(child) = guard.as_mut() {
             let _ = child.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_line_ending_removes_lf_and_crlf() {
+        let mut lf = b"hello\n".to_vec();
+        strip_line_ending(&mut lf);
+        assert_eq!(lf, b"hello");
+
+        let mut crlf = b"hello\r\n".to_vec();
+        strip_line_ending(&mut crlf);
+        assert_eq!(crlf, b"hello");
+
+        let mut none = b"hello".to_vec();
+        strip_line_ending(&mut none);
+        assert_eq!(none, b"hello");
+    }
+
+    /// `LINE_COUNT`行を一気に標準出力へ出すシェルコマンド文字列を組み立てる。
+    /// build_shell_command自体がOSごとにシェルを切り替える（Windows: cmd, それ以外: sh）ため、
+    /// 渡すコマンド文字列側もそれぞれのシェル構文に合わせる必要がある。
+    #[cfg(windows)]
+    fn flood_output_command(line_count: usize) -> String {
+        format!("for /L %i in (1,1,{line_count}) do @echo line-%i")
+    }
+    #[cfg(not(windows))]
+    fn flood_output_command(line_count: usize) -> String {
+        format!("i=1; while [ \"$i\" -le {line_count} ]; do echo \"line-$i\"; i=$((i + 1)); done")
+    }
+
+    /// 耐久テスト（手動実行専用）: 実際に子プロセスを起動し、大量行を一気に出力させた
+    /// 場合でも、リーダースレッドがOSパイプのブロッキングでデッドロックせず、
+    /// 全行を取りこぼしなく読み切れることを確認する。
+    /// 通常の`cargo test`では実行しない（実プロセス起動・実時間I/Oを伴うため）。
+    /// 手動で実行する場合は次のコマンドを使う:
+    ///   cargo test --package tauri-app -- --ignored terminal_reader_thread_survives_a_flood_of_output
+    #[test]
+    #[ignore]
+    fn terminal_reader_thread_survives_a_flood_of_output() {
+        const LINE_COUNT: usize = 20_000;
+
+        let mut cmd = build_shell_command(&flood_output_command(LINE_COUNT));
+        cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+        configure_no_window(&mut cmd);
+
+        let mut child = cmd.spawn().expect("テスト用コマンドの起動に失敗しました");
+        let stdout = child.stdout.take().expect("stdoutの取得に失敗しました");
+
+        let mut buffered = BufReader::new(stdout);
+        let mut lines_read = 0usize;
+        loop {
+            let mut buf: Vec<u8> = Vec::new();
+            let read = buffered.read_until(b'\n', &mut buf).expect("読み取りに失敗しました");
+            if read == 0 {
+                break;
+            }
+            strip_line_ending(&mut buf);
+            if buf.is_empty() {
+                continue;
+            }
+            lines_read += 1;
+        }
+
+        let status = child.wait().expect("プロセスの終了待機に失敗しました");
+        assert!(status.success(), "テスト用コマンドが異常終了しました: {status:?}");
+        assert_eq!(lines_read, LINE_COUNT, "大量出力の一部が取りこぼされました");
     }
 }
 
