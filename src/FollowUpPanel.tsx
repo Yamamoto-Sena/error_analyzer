@@ -108,9 +108,14 @@ export default function FollowUpPanel({
         },
         askedAtVersion
       );
-      // 破棄された場合、ユーザーがその間に次の質問を入力し始めている可能性があるため
-      // 質問欄はクリアしない（せっかく入力した内容を無関係なタイミングで消さないため）。
-      if (accepted) setQuestion("");
+      // 採用された場合は当然クリアする。破棄された場合でも、質問欄がまだ
+      // 送信時のテキストのままなら（＝ユーザーがその後何も入力していないなら）、
+      // 無関係な解析結果に対して古い質問を誤って再送信されるより、クリアして
+      // しまう方が安全。逆に、破棄された間にユーザーが既に次の質問の入力を
+      // 始めていた場合は、その入力を消さないよう手を付けない。setQuestionの
+      // 関数形を使うことで、このasync処理が開始された時点のクロージャではなく
+      // 「今まさに画面にある最新の質問欄の内容」と比較できる。
+      setQuestion((current) => (accepted || current === trimmed ? "" : current));
     } catch (err) {
       showToast(`質問への回答に失敗しました: ${(err as Error).message}`, "warning");
     } finally {

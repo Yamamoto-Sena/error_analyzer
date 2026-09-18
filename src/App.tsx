@@ -1508,7 +1508,11 @@ export default function App() {
       saveToHistory(recheck);
     } catch (err) {
       console.error(err);
-      showToast(`検証中にエラーが発生しました (${(err as Error).message.slice(0, 300)})`, "warning");
+      // 検証中に表示中の解析結果が既に切り替わっていた場合、ユーザーは今の画面とは
+      // 無関係なこの失敗に興味がない（上の正常系と同じくstartedAtVersionで判定）。
+      if (startedAtVersion === analysisVersionRef.current) {
+        showToast(`検証中にエラーが発生しました (${(err as Error).message.slice(0, 300)})`, "warning");
+      }
     } finally {
       setIsVerifying(false);
     }
